@@ -61,6 +61,9 @@ export function LiveChat({
     e.preventDefault();
     const q = input.trim();
     if (!q || busy) return;
+    // Prior turns (before this question) give the assistant conversational
+    // context for follow-ups. Capture from state before we append the new one.
+    const history = messages.slice(-8).map((m) => ({ role: m.role, content: m.text }));
     setInput("");
     setError(null);
     setMessages((m) => [...m, { role: "user", text: q }]);
@@ -69,7 +72,7 @@ export function LiveChat({
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, slideIndex, slideLabel, name, question: q }),
+        body: JSON.stringify({ slug, slideIndex, slideLabel, name, question: q, history }),
       });
       if (res.status === 503) {
         setError("The AI chat isn't configured yet (no API key). Ask the presenter.");

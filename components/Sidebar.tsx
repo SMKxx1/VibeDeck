@@ -47,6 +47,11 @@ export function Sidebar({
   const send = async () => {
     const q = input.trim();
     if (!q || busy) return;
+    // Prior user/assistant turns give the assistant context for follow-ups.
+    const history = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .slice(-8)
+      .map((m) => ({ role: m.role, content: m.text }));
     push({ role: "user", text: q });
     setInput("");
     setBusy(true);
@@ -58,7 +63,7 @@ export function Sidebar({
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, question: q, slug: deck.slug, slideIndex, password: pw }),
+        body: JSON.stringify({ name, question: q, slug: deck.slug, slideIndex, password: pw, history }),
       });
 
       if (res.status === 401) {
