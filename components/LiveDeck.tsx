@@ -383,6 +383,28 @@ export function LiveDeck({
   const openConsole = () =>
     window.open(`/d/${slug}/presenter`, "presenter-console", "width=1320,height=880");
 
+  // Log out. Presenters have a server session cookie → clear it and return to
+  // the login gate. Viewers only have a locally-stored name → drop it and return
+  // to the name gate so they can re-join (or hand off to someone else).
+  const logout = useCallback(async () => {
+    if (role === "presenter") {
+      try {
+        await fetch("/api/logout", { method: "POST" });
+      } catch {
+        /* ignore — navigate away regardless */
+      }
+      window.location.href = "/login";
+      return;
+    }
+    try {
+      localStorage.removeItem(NAME_KEY);
+    } catch {
+      /* ignore */
+    }
+    setName(null);
+    setShowGate(true);
+  }, [role]);
+
   return (
     <div ref={stageRef} style={{ position: "fixed", inset: 0, background: "#ECEAE3", display: "flex" }}>
       <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
@@ -448,6 +470,7 @@ export function LiveDeck({
               </Link>
             </>
           )}
+          <LogoutButton role={role} onClick={logout} />
         </div>
       </div>
 
@@ -525,6 +548,19 @@ function FullscreenButton({ active, onClick }: { active: boolean; onClick: () =>
       }}
     >
       {active ? "✕" : "⛶"}
+    </button>
+  );
+}
+
+function LogoutButton({ role, onClick }: { role: Role; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label="Log out"
+      title={role === "presenter" ? "End your presenter session" : "Leave and clear your name"}
+      style={{ ...glassChip(), cursor: "pointer" }}
+    >
+      Log out
     </button>
   );
 }
