@@ -14,13 +14,14 @@
 //             current slide. A presenter panel shows notes, the next slide, a
 //             timer, and how far viewers are unlocked.
 //
-// State is shared through /api/session (Upstash-backed) so it works across
+// State is shared through /api/session (Redis-backed) so it works across
 // devices, not just one browser.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { LiveChat } from "./LiveChat";
 import { createSyncChannel, type SyncChannel } from "@/lib/sync";
+import { useFullscreen } from "@/lib/useFullscreen";
 
 const POLL_MS = Number(process.env.NEXT_PUBLIC_SESSION_POLL_MS) || 2000;
 // Back off when there's nothing to sync so an idle or backgrounded tab doesn't
@@ -60,6 +61,8 @@ export function LiveDeck({
   title: string;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const { isFullscreen, toggle } = useFullscreen();
 
   const [name, setName] = useState<string | null>(null);
   const [showGate, setShowGate] = useState(role === "viewer");
@@ -381,7 +384,7 @@ export function LiveDeck({
     window.open(`/d/${slug}/presenter`, "presenter-console", "width=1320,height=880");
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "#ECEAE3", display: "flex" }}>
+    <div ref={stageRef} style={{ position: "fixed", inset: 0, background: "#ECEAE3", display: "flex" }}>
       <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
         <iframe
           ref={iframeRef}
@@ -410,6 +413,7 @@ export function LiveDeck({
             pointerEvents: role === "presenter" && !controlsShown ? "none" : "auto",
           }}
         >
+          <FullscreenButton active={isFullscreen} onClick={() => void toggle(stageRef.current)} />
           {role === "viewer" ? (
             <>
               {session.live ? (
@@ -501,6 +505,28 @@ function pill(bg: string, fg: string): React.CSSProperties {
     whiteSpace: "nowrap",
     boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
   };
+}
+
+function FullscreenButton({ active, onClick }: { active: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={active}
+      aria-label={active ? "Exit fullscreen" : "Enter fullscreen"}
+      title={active ? "Exit fullscreen" : "Fullscreen"}
+      style={{
+        ...glassChip(),
+        width: 34,
+        padding: 0,
+        justifyContent: "center",
+        cursor: "pointer",
+        fontSize: 15,
+        lineHeight: 1,
+      }}
+    >
+      {active ? "✕" : "⛶"}
+    </button>
+  );
 }
 
 function FollowToggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
