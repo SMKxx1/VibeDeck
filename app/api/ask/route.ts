@@ -7,6 +7,7 @@ import {
   contextForSlide,
   fullContextText,
 } from "@/lib/decks/build-host-website-context";
+import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
 
 // The chat's serverless function (slide-system-rules.md §9). The browser never
 // sees the OpenRouter key. We ground the model in the CURRENT slide + the whole
@@ -102,8 +103,12 @@ export async function POST(req: Request) {
     total = deck.slideCount ?? buildHostWebsiteContext.length;
     const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
     const cur = contextForSlide(idx);
-    currentText = cur ? `${cur.label}\n${cur.text}` : "(unknown slide)";
-    fullText = fullContextText();
+    // DB-first grounding: prefer the presenter-edited context in Postgres, fall
+    // back to the static module when the DB is unavailable. Byte-identical to
+    // the static output while the rows still hold the seeded values.
+    const slideText = (await getSlideContextText(slug, idx)) ?? (cur?.text ?? "");
+    currentText = cur ? `${cur.label}\n${slideText}` : "(unknown slide)";
+    fullText = (await getFullContextText(slug)) ?? fullContextText();
   } else {
     total = deck.slides.length;
     const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
