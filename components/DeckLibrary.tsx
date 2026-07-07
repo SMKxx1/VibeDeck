@@ -188,9 +188,51 @@ function CardNoise() {
   );
 }
 
-// A bento card — links to /d/<slug> when real, decorative otherwise.
+// A frosted "Edit notes & AI" pill anchored to a card. Rendered as a SIBLING of
+// the card's <Link> (never nested inside it — nested anchors are invalid HTML)
+// and links to the presenter-only editor.
+function EditPill({ href }: { href: string }) {
+  return (
+    <Link
+      href={href}
+      className="lm-edit"
+      title="Edit speaker notes & AI context"
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        position: "absolute",
+        bottom: 10,
+        right: 10,
+        zIndex: 2,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        height: 26,
+        padding: "0 10px",
+        borderRadius: 9,
+        background: "rgba(30,28,26,0.34)",
+        border: "1px solid rgba(255,255,255,0.35)",
+        backdropFilter: "blur(8px)",
+        WebkitBackdropFilter: "blur(8px)",
+        color: "rgba(255,255,255,0.95)",
+        fontSize: 11.5,
+        fontWeight: 500,
+        textDecoration: "none",
+        whiteSpace: "nowrap",
+      }}
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+      </svg>
+      Edit notes &amp; AI
+    </Link>
+  );
+}
+
+// A bento card — links to /d/<slug> when real, decorative otherwise. Real cards
+// also get an EditPill overlay linking to the editor.
 function BentoCard(props: {
   href?: string;
+  editHref?: string;
   gridColumn: string;
   gridRow: string;
   background: string;
@@ -198,11 +240,11 @@ function BentoCard(props: {
   radius?: number;
   children: React.ReactNode;
 }) {
-  const { href, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
-  const style: React.CSSProperties = {
-    gridColumn,
-    gridRow,
+  const { href, editHref, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+  const cardStyle: React.CSSProperties = {
     position: "relative",
+    width: "100%",
+    height: "100%",
     borderRadius: radius,
     overflow: "hidden",
     display: "flex",
@@ -214,14 +256,20 @@ function BentoCard(props: {
     color: "inherit",
     transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
   };
-  if (href) {
-    return (
-      <Link href={href} style={style} className="lm-card">
-        {children}
-      </Link>
-    );
-  }
-  return <div style={style}>{children}</div>;
+  const card = href ? (
+    <Link href={href} style={cardStyle} className="lm-card">
+      {children}
+    </Link>
+  ) : (
+    <div style={cardStyle}>{children}</div>
+  );
+  // Wrap in a positioned grid item so the EditPill can sit on top as a sibling.
+  return (
+    <div style={{ gridColumn, gridRow, position: "relative" }}>
+      {card}
+      {editHref && <EditPill href={editHref} />}
+    </div>
+  );
 }
 
 // ---- main -------------------------------------------------------------------
@@ -439,6 +487,7 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
       <style>{`
         .lm-card:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(60,55,45,0.55) !important; }
         .lm-new:hover { background: rgba(255,255,255,0.6) !important; }
+        .lm-edit:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
       `}</style>
     </div>
   );
@@ -623,6 +672,10 @@ function isSample(i: Item): i is SampleDeck & { sample: true } {
 function hrefOf(i: Item): string | undefined {
   return !isSample(i) && (i as DeckCard).slug ? `/d/${(i as DeckCard).slug}` : undefined;
 }
+// The presenter-only editor link for a real deck (undefined for sample cards).
+function editHrefOf(i: Item): string | undefined {
+  return !isSample(i) && (i as DeckCard).slug ? `/dashboard/edit/${(i as DeckCard).slug}` : undefined;
+}
 function shortDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return "";
@@ -649,6 +702,7 @@ function FeaturedCard({ item }: { item: Item }) {
   return (
     <BentoCard
       href={hrefOf(item)}
+      editHref={editHrefOf(item)}
       gridColumn="span 2"
       gridRow="span 2"
       radius={24}
@@ -677,6 +731,7 @@ function WideGreenCard({ item }: { item: Item }) {
   return (
     <BentoCard
       href={hrefOf(item)}
+      editHref={editHrefOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 18% 20%, #B7CE9E 0%, transparent 55%),radial-gradient(110% 130% at 88% 85%, #9DBE93 0%, transparent 55%),radial-gradient(120% 120% at 60% 0%, #C9D5A3 0%, transparent 50%),linear-gradient(160deg,#A8C291,#93B488)"
@@ -697,6 +752,7 @@ function TallGoldCard({ item }: { item: Item }) {
   return (
     <BentoCard
       href={hrefOf(item)}
+      editHref={editHrefOf(item)}
       gridColumn="span 1"
       gridRow="span 2"
       background="radial-gradient(100% 110% at 22% 14%, #D8C57E 0%, transparent 55%),radial-gradient(120% 120% at 82% 88%, #A8B87E 0%, transparent 55%),linear-gradient(160deg,#C9B873,#B4B47C)"
@@ -721,6 +777,7 @@ function SmallCoralCard({ item }: { item: Item }) {
   return (
     <BentoCard
       href={hrefOf(item)}
+      editHref={editHrefOf(item)}
       gridColumn="span 1"
       gridRow="span 1"
       background="radial-gradient(100% 120% at 18% 12%, #E9A07C 0%, transparent 55%),radial-gradient(120% 120% at 92% 96%, #93A8C6 0%, transparent 60%),linear-gradient(150deg,#E0A487,#A6A9C0)"
@@ -739,6 +796,7 @@ function WideLimeCard({ item }: { item: Item }) {
   return (
     <BentoCard
       href={hrefOf(item)}
+      editHref={editHrefOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 16% 18%, #C6D88A 0%, transparent 55%),radial-gradient(120% 130% at 86% 84%, #9BC07E 0%, transparent 55%),linear-gradient(150deg,#AEC97F,#BBD06E)"

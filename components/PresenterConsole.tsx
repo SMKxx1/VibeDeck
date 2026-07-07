@@ -39,6 +39,10 @@ export function PresenterConsole({
 
   const [deck, setDeck] = useState<DeckState>({ index: 0, total: 0, label: "", nextLabel: "", notes: "" });
   const [session, setSession] = useState<SessionState>({ index: 0, max: 0, live: false });
+  // Presenter-edited speaker notes from the DB (index → notes). Fetched once;
+  // preferred over the embed deck's own bridge notes when non-empty. If the DB
+  // is unavailable the fetch fails silently and we keep the bridge notes.
+  const [dbNotes, setDbNotes] = useState<Record<number, string>>({});
 
   const sessionRef = useRef(session);
   sessionRef.current = session;
@@ -174,6 +178,29 @@ export function PresenterConsole({
     return () => window.clearInterval(id);
   }, [post]);
 
+  // Load presenter-edited notes from the DB once (presenter is authenticated on
+  // this page). Failure is silent — we simply keep the embed deck's own notes.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch(`/api/admin/slides?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { slides?: { index: number; speakerNotes: string }[] };
+        const map: Record<number, string> = {};
+        for (const s of data.slides ?? []) map[s.index] = s.speakerNotes ?? "";
+        if (alive) setDbNotes(map);
+      } catch {
+        /* DB unavailable — keep bridge notes */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [slug]);
+
   // Boot-race: keep asking the main deck for its state until we have it.
   useEffect(() => {
     if (deck.total > 0) return;
@@ -184,6 +211,11 @@ export function PresenterConsole({
 
   const atStart = deck.index <= 0;
   const atEnd = deck.total > 0 && deck.index >= deck.total - 1;
+
+  // Prefer the presenter-edited DB note for the current slide when non-empty;
+  // otherwise fall back to the note the embed deck sent over the bridge.
+  const dbNote = dbNotes[deck.index];
+  const noteText = dbNote && dbNote.trim() ? dbNote : deck.notes;
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "#22201F", color: "#F4F2EC", fontFamily: '"Outfit", system-ui, sans-serif', display: "flex", flexDirection: "column" }}>
@@ -248,8 +280,8 @@ export function PresenterConsole({
             )}
           </div>
           <Label>Notes</Label>
-          <div style={{ flex: 1, minHeight: 0, overflow: "auto", borderRadius: 12, padding: "14px 16px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", fontSize: 15, lineHeight: 1.6, color: "#E7E4DC" }}>
-            {deck.notes || <span style={{ color: "#7A7770" }}>No notes for this slide.</span>}
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", borderRadius: 12, padding: "14px 16px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", fontSize: 15, lineHeight: 1.6, color: "#E7E4DC", whiteSpace: "pre-wrap" }}>
+            {noteText || <span style={{ color: "#7A7770" }}>No notes for this slide.</span>}
           </div>
         </div>
       </div>
