@@ -1,0 +1,121 @@
+// Forward-only schema migration runner (server-only), split out of slides-store
+// so lib/db.ts stays a pure connection layer and slides-store keeps owning DATA
+// (seeding), not DDL.
+//
+// WHY A RUNNER AT ALL: the old `CREATE TABLE IF NOT EXISTS` block silently
+// no-ops on an already-existing table, so a later change like `ADD COLUMN` would
+// never run against a live DB. Tracked, ordered, forward-only migrations fix
+// that: each runs exactly once and is recorded in `schema_migrations`.
+//
+// CRITICAL LIVE-DB CONSTRAINT: local dev and Railway production point at the SAME
+// physical Postgres, and `decks`/`deck_slides` already exist there with real,
+// presenter-edited rows. Migration 001 therefore reproduces the EXACT current
+// DDL verbatim under `IF NOT EXISTS`, so adopting the pre-existing schema as the
+// baseline touches zero rows. Re-running the whole runner is a genuine no-op.
+
+import type { Pool, PoolClient } from "pg";
+
+// A migration runs its DDL through the ONE dedicated client that holds the
+// advisory lock (see runMigrations) — never via pool.query(), because advisory
+// locks are connection-scoped and a pooled query could land on a different
+// client that doesn't hold the lock. `up` may issue multiple statements / guards
+// / backfills, which is why it's a function, not a raw {id, sql} string.
+export type Migration = { id: string; up(client: PoolClient): Promise<void> };
+
+// Fixed 64-bit advisory-lock key, documented as derived from
+// hashtext('vibedeck:migrations') but hardcoded so it can never drift between
+// deploys. Two concurrent booters (e.g. a local run + a prod boot against the
+// shared DB) serialize on this key: the second blocks, then finds every
+// migration already applied and no-ops.
+const LOCK_KEY = 4242000001n;
+
+// 001_baseline: adopt the pre-existing production schema into version control.
+// These two statements are the EXACT DDL the old ensureSchema() ran, verbatim.
+// Because the tables already exist in the shared DB, both are no-ops — but the
+// runner still records ('001_baseline') so the live schema is registered as the
+// applied baseline WITHOUT writing a single row. `IF NOT EXISTS` is kept HERE
+// ONLY because 001 must tolerate the tables pre-existing; every future migration
+// is unconditional, forward-only DDL.
+const migration001: Migration = {
+  id: "001_baseline",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS decks (
+        slug TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        date TEXT,
+        description TEXT,
+        embed_url TEXT,
+        slide_count INTEGER,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS deck_slides (
+        deck_slug TEXT NOT NULL REFERENCES decks(slug) ON DELETE CASCADE,
+        slide_index INTEGER NOT NULL,
+        label TEXT,
+        speaker_notes TEXT NOT NULL DEFAULT '',
+        ai_context TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (deck_slug, slide_index)
+      )
+    `);
+  },
+};
+
+// Ordered migration list. Order is array order; ids are also lexically sortable
+// as a defense. Append new migrations here — never edit or reorder applied ones.
+export const MIGRATIONS: Migration[] = [migration001];
+
+// Bootstrap DDL for the tracking table itself — the one irreducible statement we
+// must run every boot before we can consult it. Safe to re-run. `checksum` is
+// nullable and advisory only (drift detection); the baseline's checksum is
+// meaningless against pre-existing tables, so a mismatch only ever warns.
+async function ensureMigrationsTable(client: PoolClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id          TEXT PRIMARY KEY,
+      applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      checksum    TEXT
+    )
+  `);
+}
+
+// Apply every not-yet-applied migration, in order, under a session-level
+// advisory lock held on a single dedicated client.
+//
+// SESSION lock (pg_advisory_lock), NOT transaction lock (pg_advisory_xact_lock):
+// each migration commits independently, so a later failure can't roll back an
+// earlier good migration that was already recorded. An xact lock would force all
+// pending migrations into one surrounding transaction (all-or-nothing); a
+// session lock spans multiple statements/transactions on the one client and is
+// released explicitly in finally. `client.release()` in the outer finally
+// guarantees the connection returns to the pool — and, if unlock somehow failed,
+// the session-scoped lock drops when the session ends — even if a migration
+// throws.
+export async function runMigrations(pool: Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock($1)", [LOCK_KEY.toString()]);
+    await ensureMigrationsTable(client);
+
+    const res = await client.query<{ id: string }>("SELECT id FROM schema_migrations");
+    const applied = new Set(res.rows.map((r) => r.id));
+
+    for (const m of MIGRATIONS) {
+      if (applied.has(m.id)) continue;
+      await m.up(client);
+      await client.query(
+        "INSERT INTO schema_migrations (id, checksum) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        [m.id, null],
+      );
+    }
+  } finally {
+    try {
+      await client.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY.toString()]);
+    } finally {
+      client.release();
+    }
+  }
+}

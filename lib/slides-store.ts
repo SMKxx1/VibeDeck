@@ -10,7 +10,9 @@
 // Seeding is insert-only (ON CONFLICT DO NOTHING) so a redeploy never clobbers a
 // presenter's later edits.
 
+import type { Pool } from "pg";
 import { getPool, isDbReachable, query } from "./db";
+import { runMigrations } from "./migrations";
 import { buildHostWebsiteSeed, type DeckSeed } from "./decks/build-host-website-seed";
 
 export interface SlideMeta {
@@ -30,10 +32,37 @@ function seedFor(slug: string): DeckSeed | undefined {
 
 let schemaPromise: Promise<void> | null = null;
 
+// Seed each known deck. This is DATA, not schema, and deliberately runs on EVERY
+// boot (after migrations) rather than being baked into a one-time migration: the
+// INSERT...ON CONFLICT DO NOTHING is inherently re-runnable and the SEEDS array
+// is expected to grow (a newly-added deck must populate on the next boot). Only
+// missing rows are ever filled — a presenter's later edits are never overwritten
+// on redeploy. Logic is unchanged from the old ensureSchema().
+async function seedDecks(pool: Pool): Promise<void> {
+  for (const seed of SEEDS) {
+    await pool.query(
+      `INSERT INTO decks (slug, title, date, description, embed_url, slide_count)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (slug) DO NOTHING`,
+      [seed.slug, seed.title, seed.date, seed.description, seed.embedUrl, seed.slideCount],
+    );
+    for (const s of seed.slides) {
+      await pool.query(
+        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (deck_slug, slide_index) DO NOTHING`,
+        [seed.slug, s.index, s.label, s.speakerNotes, s.aiContext],
+      );
+    }
+  }
+}
+
 /**
- * Create the tables (idempotent) and seed initial rows once per process.
- * Resolves WITHOUT throwing when there's no DB or any error occurs — callers
- * that follow this with a read/write simply take the fallback path.
+ * Run schema migrations (versioned, advisory-locked, forward-only — from
+ * lib/migrations.ts) then seed initial rows, once per process. Resolves WITHOUT
+ * throwing when there's no DB or any error occurs — callers that follow this
+ * with a read/write simply take the fallback path. Memoized so the advisory lock
+ * is taken at most once per process.
  */
 export function ensureSchema(): Promise<void> {
   if (!schemaPromise) {
@@ -41,47 +70,8 @@ export function ensureSchema(): Promise<void> {
       const pool = await getPool();
       if (!pool) return; // no DATABASE_URL / pg missing — nothing to do
       try {
-        await pool.query(`
-          CREATE TABLE IF NOT EXISTS decks (
-            slug TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            date TEXT,
-            description TEXT,
-            embed_url TEXT,
-            slide_count INTEGER,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-          )
-        `);
-        await pool.query(`
-          CREATE TABLE IF NOT EXISTS deck_slides (
-            deck_slug TEXT NOT NULL REFERENCES decks(slug) ON DELETE CASCADE,
-            slide_index INTEGER NOT NULL,
-            label TEXT,
-            speaker_notes TEXT NOT NULL DEFAULT '',
-            ai_context TEXT NOT NULL DEFAULT '',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (deck_slug, slide_index)
-          )
-        `);
-        // Seed each known deck. ON CONFLICT DO NOTHING means we only ever fill
-        // in missing rows — a presenter's later edits are never overwritten on
-        // redeploy.
-        for (const seed of SEEDS) {
-          await pool.query(
-            `INSERT INTO decks (slug, title, date, description, embed_url, slide_count)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (slug) DO NOTHING`,
-            [seed.slug, seed.title, seed.date, seed.description, seed.embedUrl, seed.slideCount],
-          );
-          for (const s of seed.slides) {
-            await pool.query(
-              `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (deck_slug, slide_index) DO NOTHING`,
-              [seed.slug, s.index, s.label, s.speakerNotes, s.aiContext],
-            );
-          }
-        }
+        await runMigrations(pool); // DDL: versioned + advisory-locked
+        await seedDecks(pool); // DATA: idempotent insert-only seed
       } catch (err) {
         // Log once, then degrade: reads/writes will fall back on their own.
         console.error("[slides-store] ensureSchema failed — using static fallback:", err);

@@ -35,9 +35,18 @@ export function checkPresenterCredentials(username: string, password: string): b
   return username === u && okPw;
 }
 
-/** Mint a signed session token: base64url(payload).signature */
+// The payload carries an explicit schema version `v` so the token shape can grow
+// without touching the 8 boolean gates that call verifySessionToken: the
+// discriminator lives inside the signed token, not in the function signature.
+// `v: 1` is the shape this change mints. Tokens minted before versioning had no
+// `v` field at all — we treat "missing v" as implicit legacy version 0 and apply
+// the exact old claims rule, so presenters logged in across the deploy keep their
+// session until it ages out (<=12h). A future `v: 2` (e.g. adding userId) becomes
+// a new `case` here plus a widened claims type — not a rewrite of any caller.
+
+/** Mint a signed session token: base64url(payload).signature — payload is v:1. */
 export function createSessionToken(): string {
-  const payload = b64url(JSON.stringify({ role: "presenter", iat: Date.now() }));
+  const payload = b64url(JSON.stringify({ v: 1, role: "presenter", iat: Date.now() }));
   return `${payload}.${sign(payload)}`;
 }
 
@@ -48,19 +57,31 @@ export function verifySessionToken(token: string | undefined | null): boolean {
   if (dot <= 0) return false;
   const payload = token.slice(0, dot);
   const sig = token.slice(dot + 1);
+  // Signature check is unchanged and runs FIRST: legacy and new tokens are both
+  // cryptographically bound before we ever inspect claims. We only teach the
+  // claims validator two shapes; we do not weaken the crypto layer.
   const expected = sign(payload);
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
   try {
     const data = JSON.parse(Buffer.from(payload, "base64url").toString()) as {
+      v?: number;
       role?: string;
       iat?: number;
     };
-    if (data.role !== "presenter") return false;
-    if (typeof data.iat !== "number") return false;
-    if (Date.now() - data.iat > MAX_AGE_SECONDS * 1000) return false;
-    return true;
+    // Shared claims rule (identical to the pre-versioning logic).
+    const claimsOk =
+      data.role === "presenter" &&
+      typeof data.iat === "number" &&
+      Date.now() - data.iat <= MAX_AGE_SECONDS * 1000;
+    switch (data.v) {
+      case undefined: // implicit legacy version 0 — no `v` was ever written before this change
+      case 1:
+        return claimsOk;
+      default: // any version this build doesn't understand (future v, or garbage)
+        return false;
+    }
   } catch {
     return false;
   }
