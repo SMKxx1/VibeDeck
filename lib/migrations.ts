@@ -64,9 +64,41 @@ const migration001: Migration = {
   },
 };
 
+// 002_publish_status: add the three-state publish model to `decks`.
+//
+// DELIBERATELY DATA-FREE. Migrations run BEFORE seedDecks()/ensureDeckRows() in
+// the boot sequence (see lib/slides-store.ts ensureSchema()), so on a genuinely
+// fresh DB the `decks` table has ZERO rows when this runs — any UPDATE to pick a
+// "main" deck here would silently no-op and the workshop deck would later default
+// to whatever the column DEFAULT is. So this migration ONLY shapes the schema;
+// choosing the initial main deck is done AFTER seeding by ensureMainSet().
+//
+// DEFAULT 'normal' (not 'unpublished') preserves today's behavior exactly: every
+// registry deck is currently publicly viewable with no gate, so anything not
+// explicitly set otherwise must stay viewable. A future upload feature can insert
+// new decks as 'unpublished' at creation time; the column default serves the
+// existing/backfill case, not that one.
+//
+// The partial unique index on the constant expression `(true)` WHERE
+// publish_status='main' enforces AT MOST ONE main deck at the database level:
+// every "main" row indexes the identical key `true`, so a second one violates
+// uniqueness (Postgres 23505). This is the atomic backstop behind setPublishStatus.
+const migration002: Migration = {
+  id: "002_publish_status",
+  async up(client) {
+    await client.query(`
+      ALTER TABLE decks ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'normal'
+        CHECK (publish_status IN ('main','normal','unpublished'))
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX one_main ON decks ((true)) WHERE publish_status = 'main'
+    `);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
-export const MIGRATIONS: Migration[] = [migration001];
+export const MIGRATIONS: Migration[] = [migration001, migration002];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
 // must run every boot before we can consult it. Safe to re-run. `checksum` is

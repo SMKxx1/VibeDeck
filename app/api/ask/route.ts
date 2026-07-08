@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import { getDeck } from "@/lib/decks";
 import { deckToText, slideToText } from "@/lib/deckUtils";
 import { checkRateLimit, recordTokens } from "@/lib/kv";
+import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { isDeckViewable } from "@/lib/publish-store";
 import {
   buildHostWebsiteContext,
   contextForSlide,
@@ -83,6 +86,19 @@ export async function POST(req: Request) {
 
   const deck = getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
+
+  // PUBLISH GATE — this is the real content-exfiltration path: everything below
+  // builds grounding context from the deck and sends it to the model, so the
+  // check MUST happen here, before any context is assembled. A non-presenter must
+  // not be able to chat against an unpublished deck. Return the EXACT SAME
+  // "unknown_deck" 404 as a missing deck above — never a distinguishable error —
+  // so an attacker probing for hidden slugs can't tell "doesn't exist" apart from
+  // "exists but hidden".
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  const isPresenter = verifySessionToken(token);
+  if (!(await isDeckViewable(slug, isPresenter))) {
+    return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
+  }
 
   const rl = await checkRateLimit(name);
   if (!rl.allowed) {
