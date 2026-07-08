@@ -40,11 +40,31 @@ export async function POST(req: Request) {
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
   // Only slugs that actually exist in the registry can be published — otherwise
   // a typo would create/flip a status row for a deck that renders nowhere.
-  if (!getDeck(slug)) return NextResponse.json({ error: "unknown_deck" }, { status: 400 });
+  const deck = getDeck(slug);
+  if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 400 });
 
   const status = (body.status ?? "").toString();
   if (!VALID.includes(status as PublishStatus)) {
     return NextResponse.json({ error: "bad_status" }, { status: 400 });
+  }
+
+  // Guard the "/"-invariant at the true boundary. "/" renders the main deck ONLY
+  // through an iframe on Deck.embedUrl (app/page.tsx: `!deck.embedUrl` → "No
+  // presentation is live right now"). A canonical React Slide[] deck has no
+  // embedUrl, so marking one 'main' would succeed here yet leave "/" blank with
+  // no hint why — exactly the gap a presenter hit. Refuse it instead. The
+  // dashboard also disables the control, but a direct POST (curl) bypasses that,
+  // so this server check is what actually holds. 'normal'/'unpublished' need no
+  // embedUrl (they render via the React engine at /d/<slug>), so only gate 'main'.
+  if (status === "main" && !deck.embedUrl) {
+    return NextResponse.json(
+      {
+        error: "not_embeddable",
+        message:
+          "Only self-contained HTML decks (with an embedUrl) can be shown on the home page ( / ).",
+      },
+      { status: 400 },
+    );
   }
 
   const result = await setPublishStatus(slug, status as PublishStatus);

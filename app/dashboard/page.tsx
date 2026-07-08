@@ -25,6 +25,9 @@ export default async function DashboardPage() {
     description: d.description ?? "",
     slideCount: d.slideCount ?? d.slides.length,
     publishStatus: statusMap[d.slug] ?? ("normal" as const),
+    // Threaded so the publish control can disable "Live" for decks "/" can't
+    // render — only self-contained HTML decks (with an embedUrl) go there.
+    embedUrl: d.embedUrl,
   }));
   return <DeckLibrary decks={decks} />;
 }
