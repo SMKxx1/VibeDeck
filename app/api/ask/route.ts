@@ -84,7 +84,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "password_required" }, { status: 401 });
   }
 
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
 
   // PUBLISH GATE — this is the real content-exfiltration path: everything below
@@ -115,7 +115,18 @@ export async function POST(req: Request) {
   let total: number;
   let currentText: string;
   let fullText: string;
-  if (deck.embedUrl) {
+  if (deck.kind === "uploaded") {
+    // Uploaded decks ground ONLY on their OWN deck_slides rows — there is NO
+    // fallback to buildHostWebsiteContext/fullContextText(). That static context
+    // is the one workshop deck's material and would silently contaminate an
+    // uploaded deck's answers. Empty grounding text is the correct state for a
+    // freshly-uploaded deck with no AI context authored yet: the model just
+    // answers generically instead of leaking a different deck's content.
+    total = deck.slideCount ?? 0;
+    const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
+    currentText = (await getSlideContextText(slug, idx)) ?? "";
+    fullText = (await getFullContextText(slug)) ?? "";
+  } else if (deck.embedUrl) {
     total = deck.slideCount ?? buildHostWebsiteContext.length;
     const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
     const cur = contextForSlide(idx);

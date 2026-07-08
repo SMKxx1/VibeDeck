@@ -9,7 +9,7 @@
 // chosen by ensureMainSet() in the boot sequence (lib/slides-store.ts).
 
 import { getPool, isDbReachable, query } from "./db";
-import { ensureSchema } from "./slides-store";
+import { ensureSchema } from "./schema";
 
 export type PublishStatus = "main" | "normal" | "unpublished";
 

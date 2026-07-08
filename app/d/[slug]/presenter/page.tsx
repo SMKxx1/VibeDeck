@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { getDeck } from "@/lib/decks";
 import { PresenterView } from "@/components/PresenterView";
 import { PresenterConsole } from "@/components/PresenterConsole";
+import { UploadedDeckFrame } from "@/components/UploadedDeckFrame";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 
 // Rendered on-demand (never statically baked): the live (embed) deck reads the
@@ -30,7 +31,7 @@ export async function generateMetadata({
   if (!presenter) {
     return { title: "Presenter", robots: { index: false, follow: false } };
   }
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   return {
     title: deck ? `${deck.title} — Presenter` : "Presenter",
     robots: { index: false, follow: false },
@@ -52,8 +53,13 @@ export default async function PresenterPage({
   if (!verifySessionToken(token)) redirect("/login");
 
   const { slug } = await params;
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   if (!deck) notFound();
+
+  // Uploaded decks have no live-presenter sync in Phase 1 — they're self-contained
+  // artifacts, so the presenter route just renders the same sandboxed frame (no
+  // notes/next-slide console). Check before the embedUrl branch below.
+  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} />;
 
   // The live deck's presenter view is the dedicated console.
   if (deck.embedUrl) {

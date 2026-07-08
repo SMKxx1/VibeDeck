@@ -10,11 +10,13 @@
 // Seeding is insert-only (ON CONFLICT DO NOTHING) so a redeploy never clobbers a
 // presenter's later edits.
 
-import type { Pool } from "pg";
-import { getPool, isDbReachable, query } from "./db";
-import { runMigrations } from "./migrations";
-import { buildHostWebsiteSeed, type DeckSeed } from "./decks/build-host-website-seed";
-import { listDecks } from "./decks";
+import { isDbReachable, query } from "./db";
+import { ensureSchema, SEEDS } from "./schema";
+
+// ensureSchema (the DB boot sequence) and SEEDS both moved to lib/schema.ts to
+// break an import cycle: uploaded-deck reads need ensureSchema, which used to live
+// here alongside a now-async import of the decks registry. This module just
+// consumes them now.
 
 export interface SlideMeta {
   index: number;
@@ -23,114 +25,11 @@ export interface SlideMeta {
   aiContext: string;
 }
 
-// Every deck we know how to seed. Today that's just the embed workshop deck.
-const SEEDS: DeckSeed[] = [buildHostWebsiteSeed];
-function seedFor(slug: string): DeckSeed | undefined {
+// SEEDS (the single source of seed truth) now lives in lib/schema.ts. We still
+// need it here to recover a slide's authored label when upserting an edit into a
+// row that was never seeded — keeps the grounding header intact.
+function seedFor(slug: string) {
   return SEEDS.find((s) => s.slug === slug);
-}
-
-// ---- schema + seed ----------------------------------------------------------
-
-let schemaPromise: Promise<void> | null = null;
-
-// Seed each known deck. This is DATA, not schema, and deliberately runs on EVERY
-// boot (after migrations) rather than being baked into a one-time migration: the
-// INSERT...ON CONFLICT DO NOTHING is inherently re-runnable and the SEEDS array
-// is expected to grow (a newly-added deck must populate on the next boot). Only
-// missing rows are ever filled — a presenter's later edits are never overwritten
-// on redeploy. Logic is unchanged from the old ensureSchema().
-async function seedDecks(pool: Pool): Promise<void> {
-  for (const seed of SEEDS) {
-    await pool.query(
-      `INSERT INTO decks (slug, title, date, description, embed_url, slide_count)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (slug) DO NOTHING`,
-      [seed.slug, seed.title, seed.date, seed.description, seed.embedUrl, seed.slideCount],
-    );
-    for (const s of seed.slides) {
-      await pool.query(
-        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (deck_slug, slide_index) DO NOTHING`,
-        [seed.slug, s.index, s.label, s.speakerNotes, s.aiContext],
-      );
-    }
-  }
-}
-
-// Guarantee a lightweight `decks` row for EVERY registry deck (lib/decks/index).
-// Distinct from seedDecks(): that one owns the rich per-SLIDE authored content and
-// is scoped to the SEEDS array (today just build-host-website). This one only
-// ensures the top-level `decks` row exists so publish_status has somewhere to
-// live — aws-lodge-demo and slide-system-tour have NO row today. INSERT-only
-// (ON CONFLICT (slug) DO NOTHING): it never touches an existing row, so it can't
-// clobber a presenter's later title edit or, crucially, their publish_status
-// choice (a plain INSERT that conflicts leaves publish_status untouched at its
-// current value). embed_url = d.embedUrl ?? null for hand-authored decks.
-async function ensureDeckRows(pool: Pool): Promise<void> {
-  for (const d of listDecks()) {
-    await pool.query(
-      `INSERT INTO decks (slug, title, date, description, embed_url, slide_count)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (slug) DO NOTHING`,
-      [
-        d.slug,
-        d.title,
-        d.date,
-        d.description ?? null,
-        d.embedUrl ?? null,
-        d.slideCount ?? d.slides.length,
-      ],
-    );
-  }
-}
-
-// Pick the initial "main" deck AFTER the rows exist — ONLY if no deck is main yet.
-// The single-statement `... AND NOT EXISTS (SELECT 1 ... WHERE publish_status='main')`
-// guard makes this atomic (no check-then-act race) and naturally idempotent: the
-// first boot on a fresh DB promotes the env's live deck; once ANY deck is main —
-// whether from this backfill or a presenter's later dashboard choice — every
-// future call matches zero rows and no-ops, so a redeploy NEVER clobbers a
-// presenter's choice. $1 mirrors app/page.tsx's exact fallback literal.
-async function ensureMainSet(pool: Pool): Promise<void> {
-  const slug = process.env.NEXT_PUBLIC_LIVE_DECK_SLUG || "build-host-website";
-  await pool.query(
-    `UPDATE decks SET publish_status = 'main'
-      WHERE slug = $1 AND NOT EXISTS (SELECT 1 FROM decks WHERE publish_status = 'main')`,
-    [slug],
-  );
-}
-
-/**
- * Run schema migrations (versioned, advisory-locked, forward-only — from
- * lib/migrations.ts) then seed initial rows, once per process. Resolves WITHOUT
- * throwing when there's no DB or any error occurs — callers that follow this
- * with a read/write simply take the fallback path. Memoized so the advisory lock
- * is taken at most once per process.
- *
- * ORDER MATTERS: runMigrations (schema) → seedDecks (per-slide authored content)
- * → ensureDeckRows (a top-level row for EVERY registry deck) → ensureMainSet
- * (choose the initial main deck). ensureDeckRows must precede ensureMainSet so the
- * target row actually exists to be UPDATEd; both run after migrations so the
- * publish_status column exists.
- */
-export function ensureSchema(): Promise<void> {
-  if (!schemaPromise) {
-    schemaPromise = (async () => {
-      const pool = await getPool();
-      if (!pool) return; // no DATABASE_URL / pg missing — nothing to do
-      try {
-        await runMigrations(pool); // DDL: versioned + advisory-locked
-        await seedDecks(pool); // DATA: idempotent insert-only per-slide seed
-        await ensureDeckRows(pool); // DATA: a decks row for every registry deck
-        await ensureMainSet(pool); // DATA: pick the initial main deck if none yet
-      } catch (err) {
-        // Log once, then degrade: reads/writes will fall back on their own.
-        console.error("[slides-store] ensureSchema failed — using static fallback:", err);
-      }
-    })();
-  }
-  return schemaPromise;
 }
 
 // ---- reads (never throw) ----------------------------------------------------

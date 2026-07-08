@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { getDeck } from "@/lib/decks";
 import { DeckViewer } from "@/components/DeckViewer";
 import { LiveDeck } from "@/components/LiveDeck";
+import { UploadedDeckFrame } from "@/components/UploadedDeckFrame";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable, getPublishStatusMap } from "@/lib/publish-store";
 
@@ -25,7 +26,7 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>;
 }): Promise<Metadata> {
   const { slug } = await params;
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   const presenter = await isPresenter();
 
   // Do NOT leak the real title for a deck this caller can't view: an unpublished
@@ -52,7 +53,7 @@ export default async function DeckPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   if (!deck) notFound();
 
   // Publish gate: an unpublished deck 404s for non-presenters (a hard 404, not a
@@ -61,6 +62,11 @@ export default async function DeckPage({
   // always pass (isDeckViewable short-circuits on the presenter flag).
   const presenter = await isPresenter();
   if (!(await isDeckViewable(slug, presenter))) notFound();
+
+  // Uploaded decks render as an isolated, bridge-less sandboxed artifact — check
+  // this BEFORE the embedUrl branch (an uploaded deck has no embedUrl and must
+  // never be routed through the trusted-first-party LiveDeck path).
+  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} />;
 
   // Self-contained live decks: the presenter (valid session cookie) drives;
   // everyone else is a viewer. Reading the cookie renders this path dynamically.

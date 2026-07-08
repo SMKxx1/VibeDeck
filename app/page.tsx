@@ -1,6 +1,7 @@
 import { getDeck } from "@/lib/decks";
 import { getMainDeckSlug } from "@/lib/publish-store";
 import { LiveDeck } from "@/components/LiveDeck";
+import { UploadedDeckFrame } from "@/components/UploadedDeckFrame";
 
 // The home page shows whichever deck is marked 'main' in the DB. Resolving that
 // is a PER-REQUEST read, so this route must be force-dynamic — otherwise Next
@@ -15,7 +16,15 @@ const FALLBACK_SLUG = process.env.NEXT_PUBLIC_LIVE_DECK_SLUG || "build-host-webs
 
 export default async function HomePage() {
   const mainSlug = (await getMainDeckSlug()) ?? FALLBACK_SLUG;
-  const deck = getDeck(mainSlug);
+  const deck = await getDeck(mainSlug);
+
+  // An uploaded deck can be the 'main' one too, and it renders through its own
+  // sandboxed frame — never the LiveDeck/embed path below. This branch MUST come
+  // before the embedUrl empty-state check, since an uploaded deck has no embedUrl
+  // and would otherwise be misread as "nothing is live".
+  if (deck?.kind === "uploaded") {
+    return <UploadedDeckFrame deck={deck} />;
+  }
 
   // Neutral 200 empty state — NEVER notFound(). "Nothing is live yet" is not a
   // 404: a 404 signals a broken/removed URL, the wrong signal for a class that
