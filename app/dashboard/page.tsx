@@ -18,7 +18,7 @@ export default async function DashboardPage() {
   // the column default, so a DB hiccup shows every deck as public rather than
   // stranding the presenter with a blank control.
   const statusMap = await getPublishStatusMap();
-  const decks = listDecks().map((d) => ({
+  const decks = (await listDecks()).map((d) => ({
     slug: d.slug,
     title: d.title,
     date: d.date,
@@ -26,8 +26,14 @@ export default async function DashboardPage() {
     slideCount: d.slideCount ?? d.slides.length,
     publishStatus: statusMap[d.slug] ?? ("normal" as const),
     // Threaded so the publish control can disable "Live" for decks "/" can't
-    // render — only self-contained HTML decks (with an embedUrl) go there.
+    // render. "/" has two render paths: an embedUrl (first-party iframe) or, for
+    // an uploaded deck, a contentUrl (UploadedDeckFrame) — either makes it Live-able.
     embedUrl: d.embedUrl,
+    contentUrl: d.contentUrl,
+    // Threaded so uploaded (DB-backed) cards get Replace/Delete/Preview actions
+    // while registry (in-code) cards don't — the two are managed differently.
+    // Also gates the contentUrl render path above (only 'uploaded' decks use it).
+    kind: d.kind ?? ("registry" as const),
   }));
   return <DeckLibrary decks={decks} />;
 }

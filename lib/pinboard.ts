@@ -68,3 +68,20 @@ export async function getPins(slug: string): Promise<Pin[]> {
   }
   return mem.get(slug) ?? [];
 }
+
+/**
+ * Wipe the pinboard for a slug (Redis list + memory fallback). Companion to
+ * lib/session.ts's clearSession: called on uploaded-deck DELETE so a reused slug
+ * can't inherit stale pins. Best-effort — never throws, so it can't fail the delete.
+ */
+export async function clearPinboard(slug: string): Promise<void> {
+  mem.delete(slug);
+  const redis = await getRedis();
+  if (redis) {
+    try {
+      await redis.del(keyFor(slug));
+    } catch {
+      /* best-effort — memory is already cleared for this instance */
+    }
+  }
+}

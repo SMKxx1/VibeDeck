@@ -10,8 +10,9 @@
 // prominent bento slots newest-first; design sample cards complete the grid so
 // it always reads as full. Typing in search swaps to a filtered results grid.
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 export type PublishStatus = "main" | "normal" | "unpublished";
 
@@ -22,10 +23,17 @@ export interface DeckCard {
   description: string;
   slideCount: number;
   publishStatus: PublishStatus;
-  // Present only for self-contained HTML decks. Gates the "Live" segment: "/"
-  // renders the main deck solely through this iframe URL, so a deck without one
-  // can never legitimately go Live (the server rejects it too).
+  // Present only for the first-party self-contained HTML deck. One of the two
+  // ways a deck can go "Live" on "/": rendered through this same-origin iframe URL.
   embedUrl?: string;
+  // The other Live path: present only for 'uploaded' decks, "/" renders them via
+  // UploadedDeckFrame off this URL. Gates the "Live" segment together with embedUrl
+  // — a deck with neither can never legitimately go Live (the server rejects it too).
+  contentUrl?: string;
+  // 'uploaded' decks are runtime DB rows the presenter created here; only they
+  // are replaceable/deletable/previewable via this dashboard (registry decks
+  // live in code). Undefined is treated as 'registry' — the pre-Phase-1 default.
+  kind?: "registry" | "uploaded";
 }
 
 // ---- publish-status control wiring ------------------------------------------
@@ -48,6 +56,47 @@ interface PublishCtxValue {
 const PublishCtx = createContext<PublishCtxValue | null>(null);
 function usePublish(): PublishCtxValue | null {
   return useContext(PublishCtx);
+}
+
+// ---- uploaded-deck admin wiring ---------------------------------------------
+
+// The upload panel is a single shared modal lifted to the DeckLibrary root, not
+// one-per-card: only ever one is open, and the "New deck" tile (bottom-right of
+// the bento) sits far from any given card's "Replace" pill, so prop-drilling a
+// setter through five structurally-different cards + the search grid would be
+// noise. A context is the same shared-channel choice PublishCtx already makes.
+// `refresh` re-runs the server component (dashboard reads listDecks() server-
+// side) so a create/replace/delete repaints the grid with no full reload.
+type PanelState =
+  | { mode: "create" }
+  | { mode: "replace"; deck: DeckCard };
+interface AdminCtxValue {
+  openCreate: () => void;
+  openReplace: (deck: DeckCard) => void;
+  refresh: () => void;
+}
+const AdminCtx = createContext<AdminCtxValue | null>(null);
+function useAdmin(): AdminCtxValue | null {
+  return useContext(AdminCtx);
+}
+
+// Map the admin routes' failure bodies onto plain presenter-facing sentences,
+// same idea as publishErrorMessage. Covers every status the POST/PUT/DELETE/
+// preview handlers can return so a failure is never a bare "try again".
+function adminErrorMessage(status: number, error?: string): string {
+  if (status === 401) return "Session expired — sign in again.";
+  if (status === 403) return "Blocked for security — reload and retry.";
+  if (status === 413 || error === "payload_too_large") return "Too large — decks are capped at 2 MB.";
+  if (error === "slug_conflict") return "That slug is already taken — pick another.";
+  if (error === "demote_first") return "Set this deck to Public or Hidden before deleting.";
+  if (error === "not_deletable") return "This deck can't be deleted here.";
+  if (error === "not_html") return "That doesn't look like HTML (no “<” found).";
+  if (error === "bad_slug") return "Slug must be lowercase letters, numbers, and hyphens.";
+  if (error === "missing_fields") return "Title and HTML are both required.";
+  if (error === "not_found") return "Deck not found — it may have been deleted.";
+  if (error === "deck_origin_unset") return "Preview isn't configured (DECK_ORIGIN unset).";
+  if (status === 503 || error === "database_unavailable") return "Database unavailable.";
+  return "Couldn't save — try again.";
 }
 
 // The three publish states, in escalating-visibility order (Live > Public >
@@ -469,6 +518,9 @@ function BentoCard(props: {
   href?: string;
   editHref?: string;
   publishSlug?: string;
+  // Set only for uploaded (DB-backed) decks — drives the Replace/Delete/Preview
+  // overlay. Registry/sample cards leave it undefined and show none of those.
+  uploaded?: DeckCard;
   gridColumn: string;
   gridRow: string;
   background: string;
@@ -476,7 +528,7 @@ function BentoCard(props: {
   radius?: number;
   children: React.ReactNode;
 }) {
-  const { href, editHref, publishSlug, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+  const { href, editHref, publishSlug, uploaded, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
   const ctx = usePublish();
   const status = publishSlug && ctx ? ctx.statusOf(publishSlug) : "normal";
   const hidden = status === "unpublished";
@@ -512,6 +564,7 @@ function BentoCard(props: {
       {hidden && <div aria-hidden style={hiddenOutlineStyle(radius)} />}
       {editHref && <EditPill href={editHref} />}
       {publishSlug && <PublishControl slug={publishSlug} />}
+      {uploaded && <UploadedActions deck={uploaded} />}
     </div>
   );
 }
@@ -519,8 +572,12 @@ function BentoCard(props: {
 // ---- main -------------------------------------------------------------------
 
 export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
+  const router = useRouter();
   const [q, setQ] = useState("");
   const [name, setName] = useState<string | null>(null);
+
+  // The one shared upload panel (create or replace). null = closed. See AdminCtx.
+  const [panel, setPanel] = useState<PanelState | null>(null);
 
   // Live publish state, seeded from the server-rendered props and thereafter the
   // single source of truth for every card. The API's response statusMap is the
@@ -532,11 +589,18 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
   const [saving, setSaving] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
 
-  // Which decks may be featured on "/" (Live). Only self-contained HTML decks
-  // carry an embedUrl, and "/" renders the main deck solely through that iframe —
-  // so this set gates the Live segment. Derived from the (stable) server props.
+  // Which decks may be featured on "/" (Live). "/" has two render paths, so a deck
+  // qualifies via EITHER: an embedUrl (the first-party deck's same-origin iframe) or,
+  // for an uploaded deck, a contentUrl (rendered through UploadedDeckFrame). A deck
+  // with neither can't be shown and is gated out. Derived from the (stable) props;
+  // the server enforces the same rule (app/api/admin/publish) as the real boundary.
   const embeddable = useMemo(
-    () => new Set(decks.filter((d) => d.embedUrl).map((d) => d.slug)),
+    () =>
+      new Set(
+        decks
+          .filter((d) => d.embedUrl || (d.kind === "uploaded" && d.contentUrl))
+          .map((d) => d.slug),
+      ),
     [decks],
   );
 
@@ -578,6 +642,35 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
     [statusMap, saving, errors, embeddable, setStatus],
   );
 
+  // Fold any decks the props now carry but statusMap hasn't seen into the live
+  // map. statusMap seeds ONCE from props (useState initializer), so after a
+  // router.refresh() adds a freshly-uploaded deck, its correct 'unpublished'
+  // status would otherwise fall through to the 'normal' default — showing a
+  // brand-new upload as already-public. Only ADD unseen slugs; never clobber a
+  // slug the presenter is actively editing (its live value is the authority).
+  useEffect(() => {
+    setStatusMap((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const d of decks) {
+        if (!(d.slug in next)) {
+          next[d.slug] = d.publishStatus;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [decks]);
+
+  const adminCtx = useMemo<AdminCtxValue>(
+    () => ({
+      openCreate: () => setPanel({ mode: "create" }),
+      openReplace: (deck) => setPanel({ mode: "replace", deck }),
+      refresh: () => router.refresh(),
+    }),
+    [router],
+  );
+
   useEffect(() => {
     try {
       setName(localStorage.getItem(NAME_KEY));
@@ -608,6 +701,7 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
 
   return (
     <PublishCtx.Provider value={publishCtx}>
+    <AdminCtx.Provider value={adminCtx}>
     <div
       style={{
         minHeight: "100vh",
@@ -791,8 +885,22 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
         .lm-edit:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
         .lm-pub-seg-o:hover { background: rgba(255,255,255,0.16) !important; }
         .lm-pub-seg-i:hover { background: rgba(40,38,32,0.07) !important; }
+        .lm-act:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
+        .lm-act-danger:hover { background: rgba(150,40,30,0.62) !important; }
+        .lm-panel-btn:hover { filter: brightness(1.06); }
       `}</style>
+      {panel && (
+        <UploadPanel
+          panel={panel}
+          onClose={() => setPanel(null)}
+          onDone={() => {
+            setPanel(null);
+            adminCtx.refresh();
+          }}
+        />
+      )}
     </div>
+    </AdminCtx.Provider>
     </PublishCtx.Provider>
   );
 }
@@ -984,6 +1092,13 @@ function editHrefOf(i: Item): string | undefined {
 function slugOf(i: Item): string | undefined {
   return !isSample(i) ? (i as DeckCard).slug : undefined;
 }
+// The DeckCard when this item is an UPLOADED (DB-backed) deck — the only kind
+// that gets Replace/Delete/Preview. Undefined for sample and registry cards.
+function uploadedOf(i: Item): DeckCard | undefined {
+  if (isSample(i)) return undefined;
+  const d = i as DeckCard;
+  return d.kind === "uploaded" ? d : undefined;
+}
 function shortDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return "";
@@ -1012,6 +1127,7 @@ function FeaturedCard({ item }: { item: Item }) {
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
+      uploaded={uploadedOf(item)}
       gridColumn="span 2"
       gridRow="span 2"
       radius={24}
@@ -1042,6 +1158,7 @@ function WideGreenCard({ item }: { item: Item }) {
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
+      uploaded={uploadedOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 18% 20%, #B7CE9E 0%, transparent 55%),radial-gradient(110% 130% at 88% 85%, #9DBE93 0%, transparent 55%),radial-gradient(120% 120% at 60% 0%, #C9D5A3 0%, transparent 50%),linear-gradient(160deg,#A8C291,#93B488)"
@@ -1064,6 +1181,7 @@ function TallGoldCard({ item }: { item: Item }) {
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
+      uploaded={uploadedOf(item)}
       gridColumn="span 1"
       gridRow="span 2"
       background="radial-gradient(100% 110% at 22% 14%, #D8C57E 0%, transparent 55%),radial-gradient(120% 120% at 82% 88%, #A8B87E 0%, transparent 55%),linear-gradient(160deg,#C9B873,#B4B47C)"
@@ -1090,6 +1208,7 @@ function SmallCoralCard({ item }: { item: Item }) {
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
+      uploaded={uploadedOf(item)}
       gridColumn="span 1"
       gridRow="span 1"
       background="radial-gradient(100% 120% at 18% 12%, #E9A07C 0%, transparent 55%),radial-gradient(120% 120% at 92% 96%, #93A8C6 0%, transparent 60%),linear-gradient(150deg,#E0A487,#A6A9C0)"
@@ -1110,6 +1229,7 @@ function WideLimeCard({ item }: { item: Item }) {
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
+      uploaded={uploadedOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 16% 18%, #C6D88A 0%, transparent 55%),radial-gradient(120% 130% at 86% 84%, #9BC07E 0%, transparent 55%),linear-gradient(150deg,#AEC97F,#BBD06E)"
@@ -1131,10 +1251,17 @@ function WideLimeCard({ item }: { item: Item }) {
   );
 }
 
+// The "New deck" tile — no longer decorative. Clicking it opens the shared
+// upload panel (create mode) which POSTs an HTML deck to /api/admin/decks. A
+// <button> (not a div) so it's keyboard-reachable like the affordance it now is.
 function NewDeckCard() {
+  const admin = useAdmin();
   return (
-    <div
+    <button
+      type="button"
       className="lm-new"
+      onClick={() => admin?.openCreate()}
+      title="Upload a self-contained HTML deck"
       style={{
         gridColumn: "span 1",
         gridRow: "span 1",
@@ -1150,8 +1277,9 @@ function NewDeckCard() {
         WebkitBackdropFilter: "blur(16px)",
         boxShadow: "0 12px 30px -18px rgba(60,55,45,0.4)",
         transition: "background .18s cubic-bezier(.2,.6,.2,1)",
+        cursor: "pointer",
+        fontFamily: "inherit",
       }}
-      title="Add a deck: create a file in lib/decks/, register it, and deploy."
     >
       <div
         style={{
@@ -1170,6 +1298,383 @@ function NewDeckCard() {
         </svg>
       </div>
       <div style={{ fontSize: 13.5, fontWeight: 400, color: "#4A4750" }}>New deck</div>
+    </button>
+  );
+}
+
+// ---- uploaded-deck actions (Replace / Preview / Delete) ---------------------
+
+// A small frosted button matching EditPill's language — the shared chrome for
+// every uploaded-deck action so the row reads as one control cluster.
+function actionPillStyle(danger: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    height: 26,
+    padding: "0 9px",
+    borderRadius: 9,
+    border: danger ? "1px solid rgba(255,180,170,0.5)" : "1px solid rgba(255,255,255,0.35)",
+    background: danger ? "rgba(150,40,30,0.42)" : "rgba(30,28,26,0.34)",
+    backdropFilter: "blur(8px)",
+    WebkitBackdropFilter: "blur(8px)",
+    color: "rgba(255,255,255,0.95)",
+    fontFamily: "inherit",
+    fontSize: 11.5,
+    fontWeight: 500,
+    whiteSpace: "nowrap",
+    cursor: "pointer",
+  };
+}
+
+// Replace / Preview / Delete for one uploaded deck. Like EditPill/PublishControl
+// it's a SIBLING of the card's <Link> (never nested — nested anchors are invalid
+// HTML), so its clicks POST/GET/DELETE without also firing the card's navigation
+// (stopPropagation). Overlay mode anchors bottom-left of a bento card; inline
+// mode sits under a search-result card. Delete is two-step (a confirm) so a
+// stray click can't destroy a deck. Replace defers to the shared upload panel.
+function UploadedActions({ deck, variant = "overlay" }: { deck: DeckCard; variant?: "overlay" | "inline" }) {
+  const admin = useAdmin();
+  const [busy, setBusy] = useState<null | "preview" | "delete">(null);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const overlay = variant === "overlay";
+
+  async function preview() {
+    setError(null);
+    setBusy("preview");
+    // Open the tab synchronously so the browser credits it to this click (a
+    // post-await window.open is treated as an unrequested popup and blocked). It
+    // starts blank, then we point it at the minted URL once the token returns —
+    // or close it on failure. opener is nulled while it's still same-origin
+    // about:blank so the isolated deck origin gets no handle back to the app.
+    const tab = window.open("about:blank", "_blank");
+    if (tab) tab.opener = null;
+    try {
+      const res = await fetch(`/api/admin/decks/${deck.slug}/preview`);
+      const data = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (res.ok && data.url) {
+        if (tab) tab.location.href = data.url;
+      } else {
+        if (tab) tab.close();
+        setError(adminErrorMessage(res.status, data.error));
+      }
+    } catch {
+      if (tab) tab.close();
+      setError("Network error — try again.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove() {
+    setError(null);
+    setBusy("delete");
+    try {
+      const res = await fetch(`/api/admin/decks/${deck.slug}`, { method: "DELETE" });
+      if (res.ok) {
+        // The row is gone; re-run the server component so the card disappears.
+        admin?.refresh();
+        return; // leave `busy` set — this control unmounts on refresh
+      }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(adminErrorMessage(res.status, data.error));
+      setConfirming(false);
+    } catch {
+      setError("Network error — try again.");
+      setConfirming(false);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      style={
+        overlay
+          ? { position: "absolute", bottom: 10, left: 10, zIndex: 3, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6 }
+          : { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6, marginTop: 12 }
+      }
+    >
+      <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        {confirming ? (
+          <>
+            <button
+              type="button"
+              className="lm-act-danger"
+              onClick={remove}
+              disabled={busy === "delete"}
+              style={actionPillStyle(true)}
+            >
+              {busy === "delete" ? "Deleting…" : "Confirm delete"}
+            </button>
+            <button
+              type="button"
+              className="lm-act"
+              onClick={() => setConfirming(false)}
+              disabled={busy === "delete"}
+              style={actionPillStyle(false)}
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" className="lm-act" onClick={() => admin?.openReplace(deck)} title="Replace this deck's HTML" style={actionPillStyle(false)}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M13 7a5 5 0 1 0-1.3 4M13 3v4h-4" />
+              </svg>
+              Replace
+            </button>
+            <button type="button" className="lm-act" onClick={preview} disabled={busy === "preview"} title="Open a signed preview in a new tab" style={actionPillStyle(false)}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M1.5 8S4 3 8 3s6.5 5 6.5 5-2.5 5-6.5 5-6.5-5-6.5-5z" />
+                <circle cx="8" cy="8" r="1.8" />
+              </svg>
+              {busy === "preview" ? "Opening…" : "Preview"}
+            </button>
+            <button type="button" className="lm-act-danger" onClick={() => setConfirming(true)} title="Delete this deck" style={actionPillStyle(true)}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 4h10M6 4V2.6h4V4M4.5 4l.6 9h5.8l.6-9" />
+              </svg>
+              Delete
+            </button>
+          </>
+        )}
+      </div>
+      {error && <span style={statusLineStyle(overlay, true)}>{error}</span>}
+    </div>
+  );
+}
+
+// ---- upload / replace panel -------------------------------------------------
+
+// The shared modal for both creating and replacing an uploaded deck. Reuses the
+// same idle/saving/error state machine idiom as PublishControl.setStatus — one
+// in-flight guard, an error line on failure, and a parent-driven close on
+// success (onDone → refresh). A textarea for pasting HTML is the MVP input; the
+// file picker is a convenience that just reads a chosen .html file INTO the same
+// textarea (so the submit path is identical whether pasted or picked).
+function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: () => void; onDone: () => void }) {
+  const replacing = panel.mode === "replace";
+  const existing = replacing ? panel.deck : undefined;
+  const [title, setTitle] = useState(existing?.title ?? "");
+  const [slug, setSlug] = useState("");
+  const [date, setDate] = useState("");
+  const [description, setDescription] = useState(existing?.description ?? "");
+  const [html, setHtml] = useState("");
+  const [status, setStatus] = useState<"idle" | "saving">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // Esc closes, matching the backdrop click — but never mid-save (a close would
+  // strand an in-flight request the presenter can't see the result of).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && status !== "saving") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [status, onClose]);
+
+  function pickFile(file: File | undefined) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setHtml(typeof reader.result === "string" ? reader.result : "");
+      // Seed the title from the filename only when the presenter hasn't typed one.
+      setTitle((t) => t || file.name.replace(/\.html?$/i, ""));
+    };
+    reader.readAsText(file);
+  }
+
+  async function submit() {
+    setError(null);
+    if (!title.trim() || !html.trim()) {
+      setError("Title and HTML are both required.");
+      return;
+    }
+    setStatus("saving");
+    try {
+      const res = replacing
+        ? await fetch(`/api/admin/decks/${existing!.slug}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: title.trim(), html }),
+          })
+        : await fetch("/api/admin/decks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: title.trim(),
+              html,
+              // Only send optional fields when set — an empty slug must trigger
+              // the server's title-derived auto-slug, not fail slug validation.
+              ...(slug.trim() ? { slug: slug.trim() } : {}),
+              ...(date.trim() ? { date: date.trim() } : {}),
+              ...(description.trim() ? { description: description.trim() } : {}),
+            }),
+          });
+      if (res.ok) {
+        onDone();
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(adminErrorMessage(res.status, data.error));
+      setStatus("idle");
+    } catch {
+      setError("Network error — try again.");
+      setStatus("idle");
+    }
+  }
+
+  const saving = status === "saving";
+  const label: React.CSSProperties = { fontSize: 11, fontWeight: 500, letterSpacing: "0.1em", textTransform: "uppercase", color: "#9A958A" };
+  const field: React.CSSProperties = {
+    width: "100%",
+    height: 40,
+    padding: "0 12px",
+    borderRadius: 11,
+    border: "1px solid rgba(60,55,45,0.16)",
+    background: "rgba(255,255,255,0.7)",
+    fontFamily: "inherit",
+    fontSize: 14,
+    color: "#2C2932",
+    outline: "none",
+    boxSizing: "border-box",
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={replacing ? "Replace deck" : "Upload a new deck"}
+      onClick={() => !saving && onClose()}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 50,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(30,28,24,0.34)",
+        backdropFilter: "blur(4px)",
+        WebkitBackdropFilter: "blur(4px)",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(640px, 100%)",
+          maxHeight: "calc(100vh - 48px)",
+          overflowY: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: 16,
+          padding: 26,
+          borderRadius: 22,
+          background: "#F4F2EC",
+          border: "1px solid rgba(255,255,255,0.8)",
+          boxShadow: "0 30px 70px -30px rgba(40,35,25,0.6)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em", color: "#262229" }}>
+            {replacing ? "Replace deck content" : "Upload a deck"}
+          </div>
+          <button
+            type="button"
+            onClick={() => !saving && onClose()}
+            aria-label="Close"
+            style={{ width: 32, height: 32, borderRadius: 10, border: "1px solid rgba(60,55,45,0.14)", background: "rgba(255,255,255,0.6)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#6E6A62" strokeWidth={1.5} strokeLinecap="round">
+              <path d="M4 4l8 8M12 4l-8 8" />
+            </svg>
+          </button>
+        </div>
+
+        {replacing && (
+          <div style={{ fontSize: 13, lineHeight: 1.5, color: "#6E6A62" }}>
+            Replacing <strong style={{ color: "#2C2932" }}>{existing!.title}</strong> swaps its HTML only — its
+            publish status and link (<code>/d/{existing!.slug}</code>) stay exactly as they are.
+          </div>
+        )}
+
+        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={label}>Title</span>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Deck title" style={field} autoFocus />
+        </label>
+
+        {!replacing && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={label}>Slug (optional)</span>
+              <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="auto from title" style={field} />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={label}>Date (optional)</span>
+              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={field} />
+            </label>
+          </div>
+        )}
+
+        {!replacing && (
+          <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <span style={label}>Description (optional)</span>
+            <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="One-line summary" style={field} />
+          </label>
+        )}
+
+        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={label}>HTML{replacing ? " (new content)" : ""}</span>
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              style={{ fontFamily: "inherit", fontSize: 11.5, fontWeight: 500, color: "#4A4750", background: "rgba(255,255,255,0.7)", border: "1px solid rgba(60,55,45,0.14)", borderRadius: 8, padding: "4px 9px", cursor: "pointer" }}
+            >
+              Choose .html file
+            </button>
+            <input ref={fileRef} type="file" accept=".html,.htm,text/html" onChange={(e) => pickFile(e.target.files?.[0])} style={{ display: "none" }} />
+          </div>
+          <textarea
+            value={html}
+            onChange={(e) => setHtml(e.target.value)}
+            placeholder="<!doctype html> … paste a self-contained HTML deck"
+            spellCheck={false}
+            style={{ ...field, height: 200, padding: 12, resize: "vertical", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, lineHeight: 1.5 }}
+          />
+        </label>
+
+        {error && (
+          <div style={{ fontSize: 13, fontWeight: 500, color: "#C23B27", background: "rgba(194,59,39,0.08)", borderRadius: 10, padding: "8px 12px" }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 2 }}>
+          <button
+            type="button"
+            onClick={() => !saving && onClose()}
+            disabled={saving}
+            style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 400, color: "#4A4750", background: "transparent", border: "1px solid rgba(60,55,45,0.18)", borderRadius: 11, padding: "0 18px", height: 42, cursor: saving ? "default" : "pointer" }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="lm-panel-btn"
+            onClick={submit}
+            disabled={saving}
+            style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 500, color: "#F4F2EC", background: "#2C2A31", border: "none", borderRadius: 11, padding: "0 22px", height: 42, cursor: saving ? "default" : "pointer", opacity: saving ? 0.75 : 1 }}
+          >
+            {saving ? "Saving…" : replacing ? "Replace content" : "Upload deck"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1233,6 +1738,7 @@ function SearchResultCard({ d }: { d: DeckCard }) {
         {d.description && <div style={{ fontSize: 14, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62" }}>{d.description}</div>}
       </Link>
       <PublishControl slug={d.slug} variant="inline" />
+      {d.kind === "uploaded" && <UploadedActions deck={d} variant="inline" />}
     </div>
   );
 }

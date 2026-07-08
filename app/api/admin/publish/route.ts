@@ -46,7 +46,7 @@ export async function POST(req: Request) {
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
   // Only slugs that actually exist in the registry can be published — otherwise
   // a typo would create/flip a status row for a deck that renders nowhere.
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 400 });
 
   const status = (body.status ?? "").toString();
@@ -54,15 +54,19 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_status" }, { status: 400 });
   }
 
-  // Guard the "/"-invariant at the true boundary. "/" renders the main deck ONLY
-  // through an iframe on Deck.embedUrl (app/page.tsx: `!deck.embedUrl` → "No
-  // presentation is live right now"). A canonical React Slide[] deck has no
-  // embedUrl, so marking one 'main' would succeed here yet leave "/" blank with
-  // no hint why — exactly the gap a presenter hit. Refuse it instead. The
-  // dashboard also disables the control, but a direct POST (curl) bypasses that,
-  // so this server check is what actually holds. 'normal'/'unpublished' need no
-  // embedUrl (they render via the React engine at /d/<slug>), so only gate 'main'.
-  if (status === "main" && !deck.embedUrl) {
+  // Guard the "/"-invariant at the true boundary: "/" can only render a main deck
+  // that it actually knows how to show, and there are now TWO such paths. Either
+  // an embedUrl (the first-party workshop deck, iframed same-origin) OR — for an
+  // uploaded deck — a contentUrl (app/page.tsx renders it via UploadedDeckFrame off
+  // deck.contentUrl). A canonical React Slide[] deck has neither, so marking one
+  // 'main' would succeed here yet leave "/" blank with no hint why — exactly the
+  // gap a presenter hit. Refuse ONLY when both paths are absent. (contentUrl is
+  // undefined when DECK_ORIGIN is unset, so an uploaded deck with no reachable
+  // origin is correctly rejected too.) The dashboard also disables the control,
+  // but a direct POST (curl) bypasses that, so this server check is what actually
+  // holds. 'normal'/'unpublished' render via /d/<slug> and need neither, so only
+  // gate 'main'.
+  if (status === "main" && !deck.embedUrl && !(deck.kind === "uploaded" && deck.contentUrl)) {
     return NextResponse.json(
       {
         error: "not_embeddable",
