@@ -10,6 +10,7 @@
 export type RedisClient = {
   get: <T = unknown>(key: string) => Promise<T | null>;
   set: (key: string, value: unknown, opts?: { ex?: number }) => Promise<unknown>;
+  del: (key: string) => Promise<unknown>;
   lpush: (key: string, ...values: unknown[]) => Promise<number>;
   lrange: <T = unknown>(key: string, start: number, stop: number) => Promise<T[]>;
   ltrim: (key: string, start: number, stop: number) => Promise<unknown>;
@@ -58,6 +59,7 @@ export function getRedis(): Promise<RedisClient | null> {
             opts?.ex
               ? client.set(key, enc(value), "EX", opts.ex)
               : client.set(key, enc(value)),
+          del: (key: string) => client.del(key),
           lpush: (key: string, ...values: unknown[]) =>
             client.lpush(key, ...values.map(enc)),
           lrange: async <T = unknown>(key: string, start: number, stop: number) =>

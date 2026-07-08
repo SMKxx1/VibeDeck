@@ -116,3 +116,23 @@ export async function heartbeat(slug: string): Promise<SessionState> {
   await persist(slug, next);
   return next;
 }
+
+/**
+ * Wipe ALL live-session state for a slug: the Redis key, the poll cache, and the
+ * in-instance memory fallback. Called when an uploaded deck is DELETED so a later
+ * deck that happens to reuse the freed slug can't inherit a stale presenter
+ * position/max. Best-effort by contract — swallows a Redis blip (memory is already
+ * cleared for this instance) so it can never fail the delete that invoked it.
+ */
+export async function clearSession(slug: string): Promise<void> {
+  mem.delete(slug);
+  cache.delete(slug);
+  const redis = await getRedis();
+  if (redis) {
+    try {
+      await redis.del(keyFor(slug));
+    } catch {
+      /* best-effort — the memory fallback is already cleared for this instance */
+    }
+  }
+}
