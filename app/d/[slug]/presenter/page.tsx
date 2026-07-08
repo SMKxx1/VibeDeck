@@ -19,8 +19,22 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>;
 }): Promise<Metadata> {
   const { slug } = await params;
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  const presenter = verifySessionToken(token);
+
+  // The presenter console is presenter-only content — always keep it out of
+  // search indexes. And never leak the real deck title to a non-presenter: this
+  // route hides both published and unpublished decks behind auth, so a generic
+  // "Presenter" title for anyone unauthenticated avoids confirming the slug
+  // exists (the same slug-enumeration oracle the sibling /d/[slug] fix closes).
+  if (!presenter) {
+    return { title: "Presenter", robots: { index: false, follow: false } };
+  }
   const deck = getDeck(slug);
-  return { title: deck ? `${deck.title} — Presenter` : "Presenter" };
+  return {
+    title: deck ? `${deck.title} — Presenter` : "Presenter",
+    robots: { index: false, follow: false },
+  };
 }
 
 export default async function PresenterPage({
@@ -28,14 +42,21 @@ export default async function PresenterPage({
 }: {
   params: Promise<{ slug: string }>;
 }) {
+  // Gate the WHOLE route, not just the embed branch: the hand-authored decks
+  // (the only ones that can realistically be "unpublished") render via
+  // PresenterView below, which exposes full slide bodies AND speaker notes. An
+  // unauthenticated request must never reach that. Check auth BEFORE the deck
+  // lookup so existing and missing slugs redirect identically (no 200-vs-404
+  // enumeration oracle) — mirrors app/dashboard/edit/[slug]/page.tsx.
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  if (!verifySessionToken(token)) redirect("/login");
+
   const { slug } = await params;
   const deck = getDeck(slug);
   if (!deck) notFound();
 
-  // The live deck's presenter view is the dedicated console — presenter-only.
+  // The live deck's presenter view is the dedicated console.
   if (deck.embedUrl) {
-    const token = (await cookies()).get(AUTH_COOKIE)?.value;
-    if (!verifySessionToken(token)) redirect("/login");
     return <PresenterConsole slug={deck.slug} embedUrl={deck.embedUrl} title={deck.title} />;
   }
 

@@ -10,8 +10,10 @@
 // prominent bento slots newest-first; design sample cards complete the grid so
 // it always reads as full. Typing in search swaps to a filtered results grid.
 
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+
+export type PublishStatus = "main" | "normal" | "unpublished";
 
 export interface DeckCard {
   slug: string;
@@ -19,6 +21,212 @@ export interface DeckCard {
   date: string;
   description: string;
   slideCount: number;
+  publishStatus: PublishStatus;
+}
+
+// ---- publish-status control wiring ------------------------------------------
+
+// Lifted to the DeckLibrary root and threaded by context (not props) on purpose:
+// the /api/admin/publish POST returns the FULL statusMap, and a single promote-
+// to-'main' DEMOTES the previous main — that demotion has to repaint the OTHER
+// card with no page reload. Five structurally-different bento cards plus the
+// search grid all need the same live status; none of them is a natural prop-
+// drilling spine, so a context is the cleanest shared channel.
+interface PublishCtxValue {
+  statusOf: (slug: string) => PublishStatus;
+  isSaving: (slug: string) => boolean;
+  errorOf: (slug: string) => string | null;
+  setStatus: (slug: string, status: PublishStatus) => void;
+}
+const PublishCtx = createContext<PublishCtxValue | null>(null);
+function usePublish(): PublishCtxValue | null {
+  return useContext(PublishCtx);
+}
+
+// The three publish states, in escalating-visibility order (Live > Public >
+// Hidden). Titles double as the affordance's hover explanation.
+const PUBLISH_SEGMENTS: { key: PublishStatus; label: string; title: string; aria: string }[] = [
+  {
+    key: "main",
+    label: "Live",
+    title: "Feature on the home page ( / ). Replaces whatever is live there now.",
+    aria: "Set as the live deck shown on the home page",
+  },
+  {
+    key: "normal",
+    label: "Public",
+    title: "Public at its own /d/ link, but not on the home page.",
+    aria: "Make public at its own link",
+  },
+  {
+    key: "unpublished",
+    label: "Hidden",
+    title: "Only presenters can open it; anyone else gets a 404.",
+    aria: "Hide from everyone but presenters",
+  },
+];
+
+// Map the API's failure modes onto the same idle/saving/saved/error feel as
+// SlideMetaEditor's per-card Save, so the two presenter tools read consistently.
+function publishErrorMessage(status: number, error?: string): string {
+  if (status === 401) return "Session expired — sign in again.";
+  if (status === 503 || error === "database_unavailable") return "Database unavailable.";
+  return "Couldn't update — try again.";
+}
+
+// The active segment's fill IS the status badge: bright lime for Live (the
+// "LIVE ON /" signal), a light chip for Public, a dark chip + lock for Hidden.
+// Inactive segments are muted, tinted for the card surface they overlay (dark
+// frosted overlay vs. light inline search card).
+function segStyle(kind: PublishStatus, active: boolean, overlay: boolean): React.CSSProperties {
+  const base: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    height: 24,
+    padding: active ? "0 9px" : "0 7px",
+    borderRadius: 7,
+    border: "none",
+    fontFamily: "inherit",
+    fontSize: 11.5,
+    fontWeight: active ? 600 : 500,
+    cursor: active ? "default" : "pointer",
+    whiteSpace: "nowrap",
+    background: "transparent",
+    color: overlay ? "rgba(255,255,255,0.72)" : "#8A857C",
+    transition: "background .15s, color .15s",
+  };
+  if (!active) return base;
+  if (kind === "main") return { ...base, background: "#BFE048", color: "#2C2A31" };
+  if (kind === "unpublished") {
+    return { ...base, background: overlay ? "rgba(20,18,16,0.72)" : "rgba(44,42,49,0.85)", color: "#F4F2EC" };
+  }
+  return { ...base, background: overlay ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.95)", color: "#2C2A31" };
+}
+
+function statusLineStyle(overlay: boolean, isError: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    maxWidth: 220,
+    padding: "3px 8px",
+    borderRadius: 7,
+    fontSize: 11,
+    fontWeight: 500,
+    lineHeight: 1.25,
+    background: overlay ? "rgba(30,28,26,0.42)" : "rgba(40,38,32,0.05)",
+    color: isError ? (overlay ? "#FFC7BC" : "#C23B27") : overlay ? "rgba(255,255,255,0.86)" : "#6E6A62",
+    backdropFilter: overlay ? "blur(8px)" : undefined,
+    WebkitBackdropFilter: overlay ? "blur(8px)" : undefined,
+  };
+}
+
+function SegIcon({ kind }: { kind: PublishStatus }) {
+  if (kind === "main") {
+    return (
+      <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+        <circle cx="6" cy="6" r="2.6" fill="currentColor" />
+        <circle cx="6" cy="6" r="5" stroke="currentColor" strokeWidth="1" opacity="0.5" />
+      </svg>
+    );
+  }
+  if (kind === "normal") {
+    return (
+      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.1">
+        <circle cx="6" cy="6" r="4.6" />
+        <path d="M1.4 6h9.2M6 1.4c1.7 1.3 1.7 7.9 0 9.2M6 1.4c-1.7 1.3-1.7 7.9 0 9.2" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.1">
+      <rect x="2.6" y="5.4" width="6.8" height="5" rx="1.1" />
+      <path d="M4.1 5.4V4a1.9 1.9 0 0 1 3.8 0v1.4" />
+    </svg>
+  );
+}
+
+// A presenter-only 3-state publish control. `overlay` mode is an absolute
+// top-left sibling of a bento card's <Link> (never nested — nested anchors are
+// invalid HTML, same rule EditPill follows); `inline` mode sits under a search
+// result card. stopPropagation keeps a click from also triggering the card link.
+function PublishControl({ slug, variant = "overlay" }: { slug: string; variant?: "overlay" | "inline" }) {
+  const ctx = usePublish();
+  if (!ctx) return null;
+  const status = ctx.statusOf(slug);
+  const saving = ctx.isSaving(slug);
+  const error = ctx.errorOf(slug);
+  const overlay = variant === "overlay";
+  const showLine = saving || !!error || status === "unpublished";
+
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      style={
+        overlay
+          ? { position: "absolute", top: 10, left: 10, zIndex: 3, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6 }
+          : { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6, marginTop: 12 }
+      }
+    >
+      <div
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 2,
+          padding: 3,
+          borderRadius: 10,
+          opacity: saving ? 0.7 : 1,
+          background: overlay ? "rgba(30,28,26,0.38)" : "rgba(40,38,32,0.05)",
+          border: overlay ? "1px solid rgba(255,255,255,0.32)" : "1px solid rgba(60,55,45,0.14)",
+          backdropFilter: overlay ? "blur(8px)" : undefined,
+          WebkitBackdropFilter: overlay ? "blur(8px)" : undefined,
+        }}
+      >
+        {PUBLISH_SEGMENTS.map((seg) => {
+          const active = seg.key === status;
+          return (
+            <button
+              key={seg.key}
+              type="button"
+              title={seg.title}
+              aria-label={seg.aria}
+              aria-pressed={active}
+              disabled={saving}
+              onClick={() => {
+                if (!active && !saving) ctx.setStatus(slug, seg.key);
+              }}
+              className={active ? undefined : overlay ? "lm-pub-seg-o" : "lm-pub-seg-i"}
+              style={segStyle(seg.key, active, overlay)}
+            >
+              <SegIcon kind={seg.key} />
+              {active && <span>{seg.label}</span>}
+            </button>
+          );
+        })}
+      </div>
+      {showLine && (
+        <span style={statusLineStyle(overlay, !!error && !saving)}>
+          {!saving && !error && status === "unpublished" && <SegIcon kind="unpublished" />}
+          {saving ? "Saving…" : error ? error : "Only you can see this."}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// The dashed outline drawn OVER an unpublished card. It's a sibling of the card
+// (not the card's own border) so it stays crisp even though the card itself is
+// desaturated — signalling "this isn't public" at a glance.
+function hiddenOutlineStyle(radius: number): React.CSSProperties {
+  return {
+    position: "absolute",
+    inset: 0,
+    borderRadius: radius,
+    border: "2px dashed rgba(44,42,49,0.4)",
+    pointerEvents: "none",
+    zIndex: 1,
+  };
 }
 
 const NAME_KEY = "presentation:name";
@@ -229,10 +437,13 @@ function EditPill({ href }: { href: string }) {
 }
 
 // A bento card — links to /d/<slug> when real, decorative otherwise. Real cards
-// also get an EditPill overlay linking to the editor.
+// also get an EditPill overlay linking to the editor and, when `publishSlug` is
+// set, a 3-state publish control. An unpublished deck's card is desaturated and
+// dashed-outlined so it visibly reads as not-public.
 function BentoCard(props: {
   href?: string;
   editHref?: string;
+  publishSlug?: string;
   gridColumn: string;
   gridRow: string;
   background: string;
@@ -240,7 +451,10 @@ function BentoCard(props: {
   radius?: number;
   children: React.ReactNode;
 }) {
-  const { href, editHref, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+  const { href, editHref, publishSlug, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+  const ctx = usePublish();
+  const status = publishSlug && ctx ? ctx.statusOf(publishSlug) : "normal";
+  const hidden = status === "unpublished";
   const cardStyle: React.CSSProperties = {
     position: "relative",
     width: "100%",
@@ -254,6 +468,9 @@ function BentoCard(props: {
     boxShadow,
     textDecoration: "none",
     color: "inherit",
+    // Desaturate an unpublished card. Applied to the card only — the overlay
+    // controls are siblings, so they stay full-contrast and legible.
+    filter: hidden ? "saturate(0.6) brightness(0.98)" : undefined,
     transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
   };
   const card = href ? (
@@ -263,11 +480,13 @@ function BentoCard(props: {
   ) : (
     <div style={cardStyle}>{children}</div>
   );
-  // Wrap in a positioned grid item so the EditPill can sit on top as a sibling.
+  // Wrap in a positioned grid item so the overlays can sit on top as siblings.
   return (
     <div style={{ gridColumn, gridRow, position: "relative" }}>
       {card}
+      {hidden && <div aria-hidden style={hiddenOutlineStyle(radius)} />}
       {editHref && <EditPill href={editHref} />}
+      {publishSlug && <PublishControl slug={publishSlug} />}
     </div>
   );
 }
@@ -277,6 +496,53 @@ function BentoCard(props: {
 export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
   const [q, setQ] = useState("");
   const [name, setName] = useState<string | null>(null);
+
+  // Live publish state, seeded from the server-rendered props and thereafter the
+  // single source of truth for every card. The API's response statusMap is the
+  // authority on success (it reflects the demote-the-old-main side effect), so we
+  // merge it wholesale rather than optimistically flipping just the clicked slug.
+  const [statusMap, setStatusMap] = useState<Record<string, PublishStatus>>(() =>
+    Object.fromEntries(decks.map((d) => [d.slug, d.publishStatus])),
+  );
+  const [saving, setSaving] = useState<Record<string, boolean>>({});
+  const [errors, setErrors] = useState<Record<string, string | null>>({});
+
+  const setStatus = useCallback((slug: string, status: PublishStatus) => {
+    setSaving((s) => ({ ...s, [slug]: true }));
+    setErrors((e) => ({ ...e, [slug]: null }));
+    void (async () => {
+      try {
+        const res = await fetch("/api/admin/publish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, status }),
+        });
+        if (res.ok) {
+          const data = (await res.json().catch(() => ({}))) as {
+            statusMap?: Record<string, PublishStatus>;
+          };
+          if (data.statusMap) setStatusMap((prev) => ({ ...prev, ...data.statusMap }));
+        } else {
+          const data = (await res.json().catch(() => ({}))) as { error?: string };
+          setErrors((e) => ({ ...e, [slug]: publishErrorMessage(res.status, data.error) }));
+        }
+      } catch {
+        setErrors((e) => ({ ...e, [slug]: "Network error — try again." }));
+      } finally {
+        setSaving((s) => ({ ...s, [slug]: false }));
+      }
+    })();
+  }, []);
+
+  const publishCtx = useMemo<PublishCtxValue>(
+    () => ({
+      statusOf: (slug) => statusMap[slug] ?? "normal",
+      isSaving: (slug) => !!saving[slug],
+      errorOf: (slug) => errors[slug] ?? null,
+      setStatus,
+    }),
+    [statusMap, saving, errors, setStatus],
+  );
 
   useEffect(() => {
     try {
@@ -307,6 +573,7 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
   const searching = q.trim().length > 0;
 
   return (
+    <PublishCtx.Provider value={publishCtx}>
     <div
       style={{
         minHeight: "100vh",
@@ -488,8 +755,11 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
         .lm-card:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(60,55,45,0.55) !important; }
         .lm-new:hover { background: rgba(255,255,255,0.6) !important; }
         .lm-edit:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
+        .lm-pub-seg-o:hover { background: rgba(255,255,255,0.16) !important; }
+        .lm-pub-seg-i:hover { background: rgba(40,38,32,0.07) !important; }
       `}</style>
     </div>
+    </PublishCtx.Provider>
   );
 }
 
@@ -676,6 +946,10 @@ function hrefOf(i: Item): string | undefined {
 function editHrefOf(i: Item): string | undefined {
   return !isSample(i) && (i as DeckCard).slug ? `/dashboard/edit/${(i as DeckCard).slug}` : undefined;
 }
+// The slug a publish control acts on — undefined for decorative sample cards.
+function slugOf(i: Item): string | undefined {
+  return !isSample(i) ? (i as DeckCard).slug : undefined;
+}
 function shortDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return "";
@@ -703,6 +977,7 @@ function FeaturedCard({ item }: { item: Item }) {
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
+      publishSlug={slugOf(item)}
       gridColumn="span 2"
       gridRow="span 2"
       radius={24}
@@ -732,6 +1007,7 @@ function WideGreenCard({ item }: { item: Item }) {
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
+      publishSlug={slugOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 18% 20%, #B7CE9E 0%, transparent 55%),radial-gradient(110% 130% at 88% 85%, #9DBE93 0%, transparent 55%),radial-gradient(120% 120% at 60% 0%, #C9D5A3 0%, transparent 50%),linear-gradient(160deg,#A8C291,#93B488)"
@@ -753,6 +1029,7 @@ function TallGoldCard({ item }: { item: Item }) {
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
+      publishSlug={slugOf(item)}
       gridColumn="span 1"
       gridRow="span 2"
       background="radial-gradient(100% 110% at 22% 14%, #D8C57E 0%, transparent 55%),radial-gradient(120% 120% at 82% 88%, #A8B87E 0%, transparent 55%),linear-gradient(160deg,#C9B873,#B4B47C)"
@@ -778,6 +1055,7 @@ function SmallCoralCard({ item }: { item: Item }) {
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
+      publishSlug={slugOf(item)}
       gridColumn="span 1"
       gridRow="span 1"
       background="radial-gradient(100% 120% at 18% 12%, #E9A07C 0%, transparent 55%),radial-gradient(120% 120% at 92% 96%, #93A8C6 0%, transparent 60%),linear-gradient(150deg,#E0A487,#A6A9C0)"
@@ -797,6 +1075,7 @@ function WideLimeCard({ item }: { item: Item }) {
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
+      publishSlug={slugOf(item)}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 16% 18%, #C6D88A 0%, transparent 55%),radial-gradient(120% 130% at 86% 84%, #9BC07E 0%, transparent 55%),linear-gradient(150deg,#AEC97F,#BBD06E)"
@@ -874,38 +1153,52 @@ function SearchResults({ results, query }: { results: DeckCard[]; query: string 
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
           {results.map((d) => (
-            <Link
-              key={d.slug}
-              href={`/d/${d.slug}`}
-              className="lm-card"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-                padding: "22px 22px 20px",
-                borderRadius: 18,
-                textDecoration: "none",
-                color: "#2C2932",
-                background: "rgba(255,255,255,0.5)",
-                border: "1px solid rgba(255,255,255,0.72)",
-                backdropFilter: "blur(16px)",
-                WebkitBackdropFilter: "blur(16px)",
-                boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
-                transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#9A958A" }}>
-                <span>{d.date}</span>
-                <span>
-                  {d.slideCount} {d.slideCount === 1 ? "slide" : "slides"}
-                </span>
-              </div>
-              <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em" }}>{d.title}</div>
-              {d.description && <div style={{ fontSize: 14, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62" }}>{d.description}</div>}
-            </Link>
+            <SearchResultCard key={d.slug} d={d} />
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function SearchResultCard({ d }: { d: DeckCard }) {
+  const ctx = usePublish();
+  const status = ctx ? ctx.statusOf(d.slug) : d.publishStatus;
+  const hidden = status === "unpublished";
+  return (
+    // The control is a SIBLING under the card link (never nested — no anchor in
+    // an anchor), so it can POST without triggering the card's navigation.
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      <Link
+        href={`/d/${d.slug}`}
+        className="lm-card"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          padding: "22px 22px 20px",
+          borderRadius: 18,
+          textDecoration: "none",
+          color: "#2C2932",
+          background: "rgba(255,255,255,0.5)",
+          border: hidden ? "1px dashed rgba(44,42,49,0.4)" : "1px solid rgba(255,255,255,0.72)",
+          filter: hidden ? "saturate(0.6) brightness(0.99)" : undefined,
+          backdropFilter: "blur(16px)",
+          WebkitBackdropFilter: "blur(16px)",
+          boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
+          transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#9A958A" }}>
+          <span>{d.date}</span>
+          <span>
+            {d.slideCount} {d.slideCount === 1 ? "slide" : "slides"}
+          </span>
+        </div>
+        <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em" }}>{d.title}</div>
+        {d.description && <div style={{ fontSize: 14, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62" }}>{d.description}</div>}
+      </Link>
+      <PublishControl slug={d.slug} variant="inline" />
     </div>
   );
 }
