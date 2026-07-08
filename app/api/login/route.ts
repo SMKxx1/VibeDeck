@@ -5,6 +5,7 @@ import {
   checkPresenterCredentials,
   createSessionToken,
 } from "@/lib/auth";
+import { assertSameOrigin } from "@/lib/csrf";
 
 // Presenter sign-in. On valid credentials, set the signed session cookie.
 
@@ -16,6 +17,12 @@ interface Body {
 }
 
 export async function POST(req: Request) {
+  // CSRF: reject a browser-attested cross-origin request first (see lib/csrf.ts).
+  // Login CSRF is low-stakes here (no credential theft, just a nuisance session),
+  // but the check is cheap and correct to include for completeness/consistency.
+  if (!assertSameOrigin(req)) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
   let body: Body;
   try {
     body = (await req.json()) as Body;
