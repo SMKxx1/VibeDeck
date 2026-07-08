@@ -22,6 +22,10 @@ export interface DeckCard {
   description: string;
   slideCount: number;
   publishStatus: PublishStatus;
+  // Present only for self-contained HTML decks. Gates the "Live" segment: "/"
+  // renders the main deck solely through this iframe URL, so a deck without one
+  // can never legitimately go Live (the server rejects it too).
+  embedUrl?: string;
 }
 
 // ---- publish-status control wiring ------------------------------------------
@@ -36,6 +40,9 @@ interface PublishCtxValue {
   statusOf: (slug: string) => PublishStatus;
   isSaving: (slug: string) => boolean;
   errorOf: (slug: string) => string | null;
+  // Whether this deck may be featured on "/" (Live). Keyed by slug like the
+  // others so every card can ask without prop-drilling embedUrl through the bento.
+  embeddableOf: (slug: string) => boolean;
   setStatus: (slug: string, status: PublishStatus) => void;
 }
 const PublishCtx = createContext<PublishCtxValue | null>(null);
@@ -71,6 +78,10 @@ const PUBLISH_SEGMENTS: { key: PublishStatus; label: string; title: string; aria
 function publishErrorMessage(status: number, error?: string): string {
   if (status === 401) return "Session expired — sign in again.";
   if (status === 503 || error === "database_unavailable") return "Database unavailable.";
+  // Defensive: the server refused to feature a non-embed deck on "/". The "Live"
+  // segment is disabled for these, so this only surfaces if the guard is somehow
+  // reached anyway (or an existing bad 'main' is re-clicked) — fail loud, not silent.
+  if (error === "not_embeddable") return "This deck can't be shown on the home page.";
   return "Couldn't update — try again.";
 }
 
@@ -78,7 +89,7 @@ function publishErrorMessage(status: number, error?: string): string {
 // "LIVE ON /" signal), a light chip for Public, a dark chip + lock for Hidden.
 // Inactive segments are muted, tinted for the card surface they overlay (dark
 // frosted overlay vs. light inline search card).
-function segStyle(kind: PublishStatus, active: boolean, overlay: boolean): React.CSSProperties {
+function segStyle(kind: PublishStatus, active: boolean, overlay: boolean, blocked: boolean): React.CSSProperties {
   const base: React.CSSProperties = {
     display: "inline-flex",
     alignItems: "center",
@@ -96,6 +107,10 @@ function segStyle(kind: PublishStatus, active: boolean, overlay: boolean): React
     color: overlay ? "rgba(255,255,255,0.72)" : "#8A857C",
     transition: "background .15s, color .15s",
   };
+  // Blocked implies inactive (an already-'main' non-embed deck is left looking
+  // Live so it reflects reality). Keep the segment visible but visibly
+  // unavailable — dimmed + not-allowed — so it reads as "exists, just not here".
+  if (blocked) return { ...base, opacity: 0.38, cursor: "not-allowed" };
   if (!active) return base;
   if (kind === "main") return { ...base, background: "#BFE048", color: "#2C2A31" };
   if (kind === "unpublished") {
@@ -157,6 +172,9 @@ function PublishControl({ slug, variant = "overlay" }: { slug: string; variant?:
   const status = ctx.statusOf(slug);
   const saving = ctx.isSaving(slug);
   const error = ctx.errorOf(slug);
+  // "/" can only render a main deck via Deck.embedUrl's iframe, so a deck without
+  // one can never go Live — that segment is disabled below (server enforces it too).
+  const embeddable = ctx.embeddableOf(slug);
   const overlay = variant === "overlay";
   const showLine = saving || !!error || status === "unpublished";
 
@@ -185,19 +203,26 @@ function PublishControl({ slug, variant = "overlay" }: { slug: string; variant?:
       >
         {PUBLISH_SEGMENTS.map((seg) => {
           const active = seg.key === status;
+          // Disable ONLY the Live segment for a non-embed deck, and only when it
+          // isn't already active (an existing bad 'main' stays shown as Live so it
+          // mirrors the DB). A disabled segment is left visible, not hidden, so the
+          // option still reads as real — just unavailable for this deck type.
+          const blocked = seg.key === "main" && !embeddable && !active;
+          const disabled = saving || blocked;
           return (
             <button
               key={seg.key}
               type="button"
-              title={seg.title}
+              title={blocked ? "This deck type can't be shown on the home page ( / ) — only self-contained HTML decks can go Live." : seg.title}
               aria-label={seg.aria}
               aria-pressed={active}
-              disabled={saving}
+              aria-disabled={blocked || undefined}
+              disabled={disabled}
               onClick={() => {
-                if (!active && !saving) ctx.setStatus(slug, seg.key);
+                if (!active && !disabled) ctx.setStatus(slug, seg.key);
               }}
-              className={active ? undefined : overlay ? "lm-pub-seg-o" : "lm-pub-seg-i"}
-              style={segStyle(seg.key, active, overlay)}
+              className={active || blocked ? undefined : overlay ? "lm-pub-seg-o" : "lm-pub-seg-i"}
+              style={segStyle(seg.key, active, overlay, blocked)}
             >
               <SegIcon kind={seg.key} />
               {active && <span>{seg.label}</span>}
@@ -507,6 +532,14 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
   const [saving, setSaving] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
 
+  // Which decks may be featured on "/" (Live). Only self-contained HTML decks
+  // carry an embedUrl, and "/" renders the main deck solely through that iframe —
+  // so this set gates the Live segment. Derived from the (stable) server props.
+  const embeddable = useMemo(
+    () => new Set(decks.filter((d) => d.embedUrl).map((d) => d.slug)),
+    [decks],
+  );
+
   const setStatus = useCallback((slug: string, status: PublishStatus) => {
     setSaving((s) => ({ ...s, [slug]: true }));
     setErrors((e) => ({ ...e, [slug]: null }));
@@ -539,9 +572,10 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
       statusOf: (slug) => statusMap[slug] ?? "normal",
       isSaving: (slug) => !!saving[slug],
       errorOf: (slug) => errors[slug] ?? null,
+      embeddableOf: (slug) => embeddable.has(slug),
       setStatus,
     }),
-    [statusMap, saving, errors, setStatus],
+    [statusMap, saving, errors, embeddable, setStatus],
   );
 
   useEffect(() => {
