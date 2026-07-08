@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { assertSameOrigin } from "@/lib/csrf";
 import { getDeck } from "@/lib/decks";
 import { setPublishStatus, type PublishStatus } from "@/lib/publish-store";
 
@@ -25,6 +26,11 @@ interface PostBody {
 }
 
 export async function POST(req: Request) {
+  // CSRF: reject a browser-attested cross-origin write before touching auth or
+  // the body (see lib/csrf.ts — Lax cookie + same-site deck subdomain gap).
+  if (!assertSameOrigin(req)) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
   if (!(await isPresenter())) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }

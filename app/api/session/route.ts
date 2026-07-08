@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { getSession, setPresenterIndex, resetLock, heartbeat, isLive } from "@/lib/session";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 
 // The live-session channel. Viewers GET the presenter's position (polled);
@@ -39,6 +40,12 @@ interface PostBody {
 }
 
 export async function POST(req: Request) {
+  // CSRF: reject a browser-attested cross-origin write first (see lib/csrf.ts —
+  // Lax cookie + same-site deck subdomain gap). Same 403 forbidden shape as the
+  // bad-token case just below, so the two rejections read identically.
+  if (!assertSameOrigin(req)) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
   if (!verifySessionToken(token)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });

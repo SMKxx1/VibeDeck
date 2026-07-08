@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { assertSameOrigin } from "@/lib/csrf";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides, updateSlideMeta } from "@/lib/slides-store";
 
@@ -44,6 +45,11 @@ interface PutBody {
 }
 
 export async function PUT(req: Request) {
+  // CSRF: reject a browser-attested cross-origin write before touching auth or
+  // the body (see lib/csrf.ts — Lax cookie + same-site deck subdomain gap).
+  if (!assertSameOrigin(req)) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  }
   if (!(await isPresenter())) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
