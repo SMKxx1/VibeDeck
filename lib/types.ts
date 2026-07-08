@@ -76,4 +76,18 @@ export interface Deck {
   embedUrl?: string;
   /** Library-card slide count when `slides` isn't the source of truth (embed decks). */
   slideCount?: number;
+  /**
+   * Provenance. 'registry' = a compiled in-repo deck (lib/decks/static); 'uploaded'
+   * = a runtime `decks` row carrying its own HTML, served on the isolated deck
+   * origin. Absent is treated as 'registry' (every existing deck). The view layer
+   * MUST branch on this — an uploaded deck is rendered in a bridge-less sandboxed
+   * iframe, NEVER the trusted-first-party LiveDeck/embed path.
+   */
+  kind?: "registry" | "uploaded";
+  /**
+   * For `kind: "uploaded"` only: the absolute URL on DECK_ORIGIN that serves this
+   * deck's own HTML (`${DECK_ORIGIN}/d-content/<slug>`). Undefined when DECK_ORIGIN
+   * is unset — the deck still lists, but as unavailable rather than crashing.
+   */
+  contentUrl?: string;
 }

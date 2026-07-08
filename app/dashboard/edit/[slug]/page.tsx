@@ -17,7 +17,7 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>;
 }): Promise<Metadata> {
   const { slug } = await params;
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   return { title: deck ? `Edit — ${deck.title}` : "Edit deck" };
 }
 
@@ -30,7 +30,7 @@ export default async function EditDeckPage({
   if (!verifySessionToken(token)) redirect("/login");
 
   const { slug } = await params;
-  const deck = getDeck(slug);
+  const deck = await getDeck(slug);
   if (!deck) notFound();
 
   // When the DB is genuinely reachable we get the seeded/edited rows; otherwise

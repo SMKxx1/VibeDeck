@@ -1,23 +1,25 @@
-// One registry = the single source of truth for which decks exist
-// (slide-system-rules.md §1).
+// The MERGED deck registry: compiled in-repo decks (lib/decks/static) plus runtime
+// uploaded decks (lib/uploaded-decks). This is the one place the two provenances
+// are unified for the app to consume.
 //
-// Adding a deck is ONE defined step:
-//   1. create lib/decks/<your-deck>.ts that `export`s a Deck
-//   2. import it here and add it to the `decks` array below
-// Commit + deploy = "saved". The deck then lives forever at /d/<slug>.
+// Both getters are async because uploaded decks require a DB read. staticDecks is
+// pure/synchronous — it's read first so a compiled deck ALWAYS wins a slug
+// collision (static precedence): an uploaded row can never shadow a real registry
+// deck. Adding a compiled deck stays a code-only step (see lib/decks/static.ts).
 
 import type { Deck } from "../types";
-import { awsLodgeDemo } from "./aws-lodge-demo";
-import { slideSystemTour } from "./slide-system-tour";
-import { buildHostWebsite } from "./build-host-website";
+import { staticDecks } from "./static";
+import { getUploadedDeck, getUploadedDecks } from "../uploaded-decks";
 
-export const decks: Deck[] = [buildHostWebsite, awsLodgeDemo, slideSystemTour];
-
-export function getDeck(slug: string): Deck | undefined {
-  return decks.find((d) => d.slug === slug);
+/** Static precedence: a compiled deck always wins a slug collision. */
+export async function getDeck(slug: string): Promise<Deck | undefined> {
+  return staticDecks.find((d) => d.slug === slug) ?? (await getUploadedDeck(slug));
 }
 
-/** Every deck, newest first — used by the library home page. */
-export function listDecks(): Deck[] {
-  return [...decks].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+/** Every deck, newest first — used by the library home page + dashboard. */
+export async function listDecks(): Promise<Deck[]> {
+  const uploaded = await getUploadedDecks();
+  return [...staticDecks, ...uploaded].sort((a, b) =>
+    a.date < b.date ? 1 : a.date > b.date ? -1 : 0,
+  );
 }

@@ -96,9 +96,34 @@ const migration002: Migration = {
   },
 };
 
+// 003_uploaded_decks: let a `decks` row carry its OWN self-contained HTML so an
+// uploaded deck is a runtime row, not a compiled registry entry.
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002). DEFAULT 'registry' backfills
+// every existing row with ZERO writes — the column simply reads 'registry' for all
+// three pre-existing decks, so this is a genuine no-op against the live DB and
+// changes no behavior on its own. The byte-size cap on `html` lives in the upload
+// validator (a route concern), NOT as a column constraint — the only DB-level
+// invariant worth enforcing is that an 'uploaded' deck can never exist WITHOUT its
+// html (the CHECK below), since serving a null-bodied uploaded deck would 500.
+const migration003: Migration = {
+  id: "003_uploaded_decks",
+  async up(client) {
+    await client.query(`
+      ALTER TABLE decks ADD COLUMN kind TEXT NOT NULL DEFAULT 'registry'
+        CHECK (kind IN ('registry','uploaded'))
+    `);
+    await client.query(`ALTER TABLE decks ADD COLUMN html TEXT`); // NULL for registry decks
+    await client.query(`
+      ALTER TABLE decks ADD CONSTRAINT uploaded_has_html
+        CHECK (kind <> 'uploaded' OR html IS NOT NULL)
+    `);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
-export const MIGRATIONS: Migration[] = [migration001, migration002];
+export const MIGRATIONS: Migration[] = [migration001, migration002, migration003];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
 // must run every boot before we can consult it. Safe to re-run. `checksum` is

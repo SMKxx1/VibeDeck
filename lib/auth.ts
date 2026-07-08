@@ -88,3 +88,55 @@ export function verifySessionToken(token: string | undefined | null): boolean {
 }
 
 export const SESSION_MAX_AGE = MAX_AGE_SECONDS;
+
+// Preview tokens: a short-lived capability that lets a presenter view an
+// 'unpublished' uploaded deck on the isolated DECK_ORIGIN, where there is NO
+// session cookie to authenticate against (that content lives on a genuinely
+// separate origin — see middleware.ts / lib/csrf.ts). The token is the ONLY
+// thing that opens the fail-closed /d-content gate for unpublished content, so
+// it MUST be unforgeable and MUST expire. We reuse the exact HMAC mechanism the
+// session cookie uses (secret() + sign() above) rather than inventing a second
+// signing scheme — one secret, one construction, one place to reason about.
+const PREVIEW_MAX_AGE_MS = 5 * 60 * 1000; // ~5 minutes: long enough to click, short enough to not linger
+
+/**
+ * Mint a signed preview token binding a specific slug to an expiry. Shape mirrors
+ * the session token: base64url(payload).signature. The slug is INSIDE the signed
+ * payload so a token minted for deck A can never be replayed against deck B.
+ */
+export function createPreviewToken(slug: string): string {
+  const payload = b64url(JSON.stringify({ slug, exp: Date.now() + PREVIEW_MAX_AGE_MS }));
+  return `${payload}.${sign(payload)}`;
+}
+
+/**
+ * Verify a preview token: valid signature, not expired, and bound to exactly the
+ * slug being requested. Any failure returns false — this is the gate that lets
+ * untrusted-content serving fail closed, so it must never throw or fuzzy-match.
+ */
+export function verifyPreviewToken(token: string | undefined | null, slug: string): boolean {
+  if (!token) return false;
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const payload = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  // Signature FIRST, timing-safe — same discipline as verifySessionToken: bind
+  // the token cryptographically before trusting any claim inside it.
+  const expected = sign(payload);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString()) as {
+      slug?: string;
+      exp?: number;
+    };
+    return (
+      data.slug === slug &&
+      typeof data.exp === "number" &&
+      Date.now() < data.exp
+    );
+  } catch {
+    return false;
+  }
+}
