@@ -32,6 +32,11 @@ const HIDDEN_POLL_MS = 60_000; // tab in the background
 const PRESENTER_POLL_MS = 5_000; // presenter: this poll is only a cross-device fallback
 const NAME_KEY = "presentation:name";
 
+// Q&A queue (#5): the viewer panel polls only while it's open, so a closed panel
+// costs nothing. Slower cadence than the live session poll; near-dormant when hidden.
+const QNA_POLL_MS = 5_000;
+const QNA_HIDDEN_MS = 30_000;
+
 // Viewer→presenter backchannel reaction kinds (#2). "lost" is rendered as its
 // own distinct button; the rest ride in a compact icon row.
 type SignalKind = "up" | "party" | "slow" | "hand" | "lost";
@@ -73,6 +78,18 @@ interface ViewerPoll {
   at: number;
 }
 
+// A question in the upvotable Q&A queue (#5). Viewers receive only non-dismissed
+// entries, already sorted (votes desc, oldest-first).
+interface QnaQuestion {
+  id: string;
+  name: string;
+  text: string;
+  votes: number;
+  answered: boolean;
+  dismissed: boolean;
+  at: number;
+}
+
 export function LiveDeck({
   slug,
   embedUrl,
@@ -103,6 +120,12 @@ export function LiveDeck({
   const [poll, setPoll] = useState<ViewerPoll | null>(null);
   const [myVote, setMyVote] = useState<{ pollId: string; optionIndex: number } | null>(null);
   const [reduceMotion, setReduceMotion] = useState(false);
+  // Q&A queue (#5): the toggleable question panel. `questions` is the (already-sorted)
+  // non-dismissed queue; `myVotes` marks the qids this viewer has upvoted so the
+  // button locks locally (the server is idempotent regardless).
+  const [qnaOpen, setQnaOpen] = useState(false);
+  const [questions, setQuestions] = useState<QnaQuestion[]>([]);
+  const [myVotes, setMyVotes] = useState<Record<string, boolean>>({});
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -246,6 +269,80 @@ export function LiveDeck({
     [slug],
   );
 
+  // Upvote a queued question (#5). Optimistically locks the button for this qid,
+  // then reflects the server's authoritative count. Idempotent per name, so a
+  // double-tap is harmless; a non-OK response (e.g. 404 gone) drops the local lock.
+  const upvoteQuestion = useCallback(
+    async (qid: string) => {
+      const who = nameRef.current;
+      if (!who) {
+        setShowGate(true);
+        return;
+      }
+      setMyVotes((m) => (m[qid] ? m : { ...m, [qid]: true }));
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action: "upvote", qid, name: who }),
+        });
+        if (res.ok) {
+          const { votes } = (await res.json()) as { votes?: number };
+          if (typeof votes === "number") {
+            setQuestions((qs) => qs.map((q) => (q.id === qid ? { ...q, votes } : q)));
+          }
+        } else {
+          setMyVotes((m) => {
+            const n = { ...m };
+            delete n[qid];
+            return n;
+          });
+        }
+      } catch {
+        setMyVotes((m) => {
+          const n = { ...m };
+          delete n[qid];
+          return n;
+        });
+      }
+    },
+    [slug],
+  );
+
+  // Post a new question (#5). Resolves to a viewer-facing error string, or null on
+  // success (the panel clears its input then). Requires a name — the same gate the
+  // poll uses.
+  const askQuestion = useCallback(
+    async (text: string): Promise<string | null> => {
+      const who = nameRef.current;
+      if (!who) {
+        setShowGate(true);
+        return "Enter a name to ask.";
+      }
+      const t = text.trim();
+      if (!t) return null;
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action: "ask", name: who, text: t }),
+        });
+        if (res.ok) {
+          const { question } = (await res.json()) as { question?: QnaQuestion };
+          if (question) {
+            setQuestions((qs) => (qs.some((q) => q.id === question.id) ? qs : [...qs, question]));
+          }
+          return null;
+        }
+        if (res.status === 429) return "You're doing that too fast.";
+        return "Couldn't post — the queue may be full.";
+      } catch {
+        return "Couldn't post — try again.";
+      }
+    },
+    [slug],
+  );
+
   // Load stored viewer name.
   useEffect(() => {
     if (role !== "viewer") return;
@@ -278,6 +375,59 @@ export function LiveDeck({
 
   // Abort any in-flight vote when the deck unmounts.
   useEffect(() => () => voteCtrlRef.current?.abort(), []);
+
+  // Q&A queue poll (#5): runs only while the viewer has the panel open, so a closed
+  // panel spares Redis. Mirrors the session poll's shape — hidden-tab backoff,
+  // catch-up on refocus, and abort on unmount.
+  useEffect(() => {
+    if (role !== "viewer" || !qnaOpen || showGate) return;
+    let alive = true;
+    let timer: number | undefined;
+    const ctrl = new AbortController();
+
+    async function pull() {
+      try {
+        const res = await fetch(`/api/qna?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { questions?: QnaQuestion[] };
+        if (alive) setQuestions(data.questions ?? []);
+      } catch {
+        /* transient / aborted — next tick */
+      }
+    }
+
+    function nextDelay(): number {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return QNA_HIDDEN_MS;
+      }
+      return QNA_POLL_MS;
+    }
+
+    async function loop() {
+      if (!alive) return;
+      await pull();
+      if (!alive) return;
+      timer = window.setTimeout(loop, nextDelay());
+    }
+    void loop();
+
+    const onVisible = () => {
+      if (!alive || document.visibilityState !== "visible") return;
+      window.clearTimeout(timer);
+      void loop();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [role, qnaOpen, showGate, slug]);
 
   // Messages from the deck bridge.
   useEffect(() => {
@@ -601,6 +751,7 @@ export function LiveDeck({
                 </span>
               )}
               {name && <ReactionBar onSend={sendSignal} />}
+              <QnaButton open={qnaOpen} count={questions.length} onClick={() => setQnaOpen((o) => !o)} />
               <ChatButton open={chatOpen} onClick={() => setChatOpen((o) => !o)} />
               {name && <span style={glassChip()}>{name}</span>}
             </>
@@ -632,6 +783,20 @@ export function LiveDeck({
             reduceMotion={reduceMotion}
             onVote={(i) => void castVote(poll.id, i)}
             onNeedName={() => setShowGate(true)}
+          />
+        )}
+
+        {/* Q&A queue (#5) — a viewer panel anchored to the right, below the top
+            controls; the poll card sits bottom-left so the two never collide. */}
+        {role === "viewer" && qnaOpen && (
+          <QnaPanel
+            questions={questions}
+            hasName={!!name}
+            myVotes={myVotes}
+            onUpvote={(qid) => void upvoteQuestion(qid)}
+            onAsk={askQuestion}
+            onNeedName={() => setShowGate(true)}
+            onClose={() => setQnaOpen(false)}
           />
         )}
       </div>
@@ -776,6 +941,22 @@ function ChatButton({ open, onClick }: { open: boolean; onClick: () => void }) {
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
       </svg>
       Ask
+    </button>
+  );
+}
+
+// Toggle for the viewer's Q&A queue (#5). Shows the last-known question count once
+// the panel has fetched it. Distinct from the tutor "Ask" chat above.
+function QnaButton({ open, count, onClick }: { open: boolean; count: number; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={open}
+      title="See the room's questions, upvote, or ask your own"
+      style={{ ...pill(open ? "#2C2A31" : "rgba(255,255,255,0.62)", open ? "#F4F2EC" : "#2C2A31"), border: open ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 6 }}
+    >
+      <span aria-hidden style={{ fontSize: 13, lineHeight: 1 }}>❓</span>
+      Questions{count > 0 ? ` (${count})` : ""}
     </button>
   );
 }
@@ -1170,3 +1351,235 @@ function pollTag(color: string): React.CSSProperties {
     flex: "0 0 auto",
   };
 }
+
+// The viewer's Q&A queue panel (#5). Read the room's questions (already sorted
+// top-voted first), upvote with one tap (locks locally; the server is idempotent),
+// and post your own. Anchored to the right so it clears the bottom-left poll card.
+// Owns only its input state — the queue + vote marks live in the parent so they
+// persist across open/close.
+function QnaPanel({
+  questions,
+  hasName,
+  myVotes,
+  onUpvote,
+  onAsk,
+  onNeedName,
+  onClose,
+}: {
+  questions: QnaQuestion[];
+  hasName: boolean;
+  myVotes: Record<string, boolean>;
+  onUpvote: (qid: string) => void;
+  onAsk: (text: string) => Promise<string | null>;
+  onNeedName: () => void;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const t = text.trim();
+    if (!t || asking) return;
+    setAsking(true);
+    setError(null);
+    const err = await onAsk(t);
+    setAsking(false);
+    if (err) setError(err);
+    else setText("");
+  };
+
+  return (
+    <div style={qnaCardWrap} role="group" aria-label="Question queue">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>Questions</span>
+        <button onClick={onClose} title="Hide questions" aria-label="Hide questions" style={qnaCloseBtn}>
+          ✕
+        </button>
+      </div>
+
+      <div style={qnaList}>
+        {questions.length === 0 ? (
+          <div style={qnaEmpty}>No questions yet — be the first to ask.</div>
+        ) : (
+          questions.map((q) => {
+            const voted = !!myVotes[q.id];
+            return (
+              <div key={q.id} style={qnaItem}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 13.5, color: "#2C2A31", lineHeight: 1.4 }}>{q.text}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: "#6E6A62", minWidth: 0 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 150 }}>{q.name}</span>
+                    {q.answered && <span style={qnaAnsweredTag}>✓ answered</span>}
+                  </div>
+                </div>
+                <button
+                  onClick={() => (hasName ? onUpvote(q.id) : onNeedName())}
+                  disabled={voted}
+                  aria-pressed={voted}
+                  title={voted ? "You upvoted this" : "Upvote this question"}
+                  style={qnaVoteBtn(voted)}
+                >
+                  👍 {q.votes}
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {hasName ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {error && <div style={qnaErrorText}>{error}</div>}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+              placeholder="Ask a question…"
+              maxLength={280}
+              style={qnaInput}
+            />
+            <button onClick={() => void submit()} disabled={!text.trim() || asking} style={qnaAskBtn(!!text.trim() && !asking)}>
+              {asking ? "…" : "Ask"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={onNeedName} style={pollNameBtn}>
+          Enter a name to ask
+        </button>
+      )}
+    </div>
+  );
+}
+
+const qnaCardWrap: React.CSSProperties = {
+  position: "absolute",
+  right: 16,
+  top: 60,
+  bottom: 16,
+  zIndex: 38,
+  width: "min(360px, calc(100% - 32px))",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: 16,
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.82)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+const qnaList: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
+};
+
+const qnaItem: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 10,
+  padding: "10px 11px",
+  borderRadius: 12,
+  background: "rgba(255,255,255,0.6)",
+  border: "1px solid rgba(60,55,45,0.1)",
+};
+
+const qnaEmpty: React.CSSProperties = {
+  fontSize: 12.5,
+  color: "#6E6A62",
+  padding: "10px 2px",
+};
+
+const qnaAnsweredTag: React.CSSProperties = {
+  fontSize: 9.5,
+  fontWeight: 700,
+  letterSpacing: "0.05em",
+  textTransform: "uppercase",
+  color: "#3F7A12",
+  whiteSpace: "nowrap",
+  flex: "0 0 auto",
+};
+
+function qnaVoteBtn(voted: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    flex: "0 0 auto",
+    height: 30,
+    padding: "0 11px",
+    borderRadius: 999,
+    cursor: voted ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 12.5,
+    fontWeight: 600,
+    color: voted ? "#F4F2EC" : "#2C2A31",
+    background: voted ? "#2C2A31" : "rgba(255,255,255,0.7)",
+    border: voted ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.18)",
+    transition: "background .15s ease, color .15s ease",
+  };
+}
+
+const qnaInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  height: 40,
+  padding: "0 13px",
+  borderRadius: 11,
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.85)",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  color: "#2C2A31",
+  outline: "none",
+};
+
+function qnaAskBtn(enabled: boolean): React.CSSProperties {
+  return {
+    flex: "0 0 auto",
+    height: 40,
+    padding: "0 16px",
+    borderRadius: 11,
+    border: "none",
+    cursor: enabled ? "pointer" : "default",
+    background: enabled ? "#2C2A31" : "#B7B2A8",
+    color: "#F4F2EC",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 500,
+  };
+}
+
+const qnaErrorText: React.CSSProperties = {
+  fontSize: 12,
+  color: "#B5331F",
+  fontWeight: 500,
+};
+
+const qnaCloseBtn: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  flex: "0 0 auto",
+  borderRadius: 8,
+  border: "1px solid rgba(60,55,45,0.16)",
+  background: "rgba(255,255,255,0.6)",
+  color: "#6E6A62",
+  cursor: "pointer",
+  fontSize: 13,
+  lineHeight: 1,
+  padding: 0,
+};
