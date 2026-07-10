@@ -4,6 +4,8 @@ import { getDeck } from "@/lib/decks";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable } from "@/lib/publish-store";
 import { getSlideContextText } from "@/lib/slides-store";
+import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
+import { extractSlideTexts } from "@/lib/deck-validator";
 import { slideToText } from "@/lib/deckUtils";
 import {
   checkRateLimit,
@@ -89,11 +91,19 @@ export async function POST(req: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return none();
 
-  // Light grounding: the slide's own context text (DB grounding for uploaded/embed
-  // decks, or the canonical Slide model for a registry deck).
+  // Light grounding: prefer authored ai_context, but fall back to the slide's own
+  // visible TEXT so suggestions work even before #8 grounding is authored (a fresh
+  // uploaded deck has empty ai_context). Uploaded → extract from stored html;
+  // registry Slide[] deck → the canonical model.
   let slideText = (await getSlideContextText(slug, slideIndex)) ?? "";
-  if (!slideText && deck.kind !== "uploaded" && !deck.embedUrl && deck.slides[slideIndex]) {
-    slideText = slideToText(deck.slides[slideIndex]);
+  if (!slideText.trim()) {
+    if (deck.kind === "uploaded") {
+      const stored = await getUploadedDeckHtml(slug);
+      const st = stored ? extractSlideTexts(stored.html).find((s) => s.index === slideIndex) : null;
+      if (st) slideText = st.text;
+    } else if (!deck.embedUrl && deck.slides[slideIndex]) {
+      slideText = slideToText(deck.slides[slideIndex]);
+    }
   }
   if (!slideText.trim()) return none(); // nothing to ground on → no suggestions
 
