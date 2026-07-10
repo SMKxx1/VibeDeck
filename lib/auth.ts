@@ -12,7 +12,16 @@ export const AUTH_COOKIE = "presenter_session";
 const MAX_AGE_SECONDS = 60 * 60 * 12; // a session lasts a workday
 
 function secret(): string {
-  return process.env.AUTH_SECRET || "dev-insecure-secret-change-me";
+  const s = process.env.AUTH_SECRET;
+  if (s) return s;
+  // FAIL CLOSED in production. Without AUTH_SECRET the HMAC key would be the
+  // public default, so ANYONE could mint a validly-signed `{v:2, role:"admin"}`
+  // cookie — total auth bypass (own/delete any deck, mint invites). A dev-only
+  // default is acceptable locally where NODE_ENV !== "production".
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("AUTH_SECRET must be set in production");
+  }
+  return "dev-insecure-secret-change-me";
 }
 
 function b64url(buf: Buffer | string): string {
@@ -23,68 +32,123 @@ function sign(payload: string): string {
   return crypto.createHmac("sha256", secret()).update(payload).digest("base64url");
 }
 
-/** Check the presenter credentials against env (with a documented dev default). */
-export function checkPresenterCredentials(username: string, password: string): boolean {
-  const u = process.env.PRESENTER_USERNAME || "presenter";
-  const p = process.env.PRESENTER_PASSWORD || "present"; // dev default — override in env
-  if (!password) return false;
-  // Constant-time-ish compare on the password.
-  const pw = Buffer.from(password);
-  const expected = Buffer.from(p);
-  const okPw = pw.length === expected.length && crypto.timingSafeEqual(pw, expected);
-  return username === u && okPw;
+// NOTE: login no longer compares against an env password. The single shared
+// PRESENTER_USERNAME/PRESENTER_PASSWORD are used ONCE, at boot, to SEED the admin
+// row (lib/schema ensureAdminUser); every login thereafter is scrypt-verified
+// against the users table (app/api/login). There is deliberately no env-credential
+// code path here anymore.
+
+// The payload carries an explicit schema version `v`. History:
+//   v:0 — pre-versioning, no `v` field. {role:"presenter", iat}.
+//   v:1 — {v:1, role:"presenter", iat}.
+//   v:2 — {v:2, userId, role, iat} (Phase 4 accounts; role ∈ admin|presenter).
+// The ~16 boolean gates call verifySessionToken (unchanged signature). Routes
+// that need identity/authorization call getSession. Legacy v:0/v:1 cookies (no
+// userId) are mapped to the ADMIN identity by getSession — the single shared
+// presenter of the pre-accounts era WAS the admin, so existing sessions keep full
+// access with no forced re-login. The signature is HMAC over the whole payload,
+// so a tampered role/userId or a version downgrade fails without AUTH_SECRET.
+
+export type Role = "admin" | "presenter";
+export interface Session {
+  // null only for a legacy (v<2) cookie mapped to the admin — it has no user row.
+  userId: string | null;
+  role: Role;
 }
 
-// The payload carries an explicit schema version `v` so the token shape can grow
-// without touching the 8 boolean gates that call verifySessionToken: the
-// discriminator lives inside the signed token, not in the function signature.
-// `v: 1` is the shape this change mints. Tokens minted before versioning had no
-// `v` field at all — we treat "missing v" as implicit legacy version 0 and apply
-// the exact old claims rule, so presenters logged in across the deploy keep their
-// session until it ages out (<=12h). A future `v: 2` (e.g. adding userId) becomes
-// a new `case` here plus a widened claims type — not a rewrite of any caller.
-
-/** Mint a signed session token: base64url(payload).signature — payload is v:1. */
-export function createSessionToken(): string {
-  const payload = b64url(JSON.stringify({ v: 1, role: "presenter", iat: Date.now() }));
+/** Mint a v:2 session token binding a user id + role. */
+export function createSessionToken(userId: string, role: Role): string {
+  const payload = b64url(JSON.stringify({ v: 2, userId, role, iat: Date.now() }));
   return `${payload}.${sign(payload)}`;
 }
 
-/** Verify a session token: valid signature, presenter role, not expired. */
-export function verifySessionToken(token: string | undefined | null): boolean {
-  if (!token) return false;
+// Verify the HMAC (timing-safe, FIRST) and parse the payload. Returns the parsed
+// object or null. No CLAIM checks here — callers apply version-specific claim
+// logic — but this is the single crypto+parse gate both verify and getSession
+// use, so neither can accidentally skip the signature.
+interface RawPayload {
+  v?: number;
+  userId?: unknown;
+  role?: unknown;
+  iat?: unknown;
+}
+function verifiedPayload(token: string | undefined | null): RawPayload | null {
+  if (!token) return null;
   const dot = token.lastIndexOf(".");
-  if (dot <= 0) return false;
+  if (dot <= 0) return null;
   const payload = token.slice(0, dot);
   const sig = token.slice(dot + 1);
-  // Signature check is unchanged and runs FIRST: legacy and new tokens are both
-  // cryptographically bound before we ever inspect claims. We only teach the
-  // claims validator two shapes; we do not weaken the crypto layer.
   const expected = sign(payload);
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   try {
-    const data = JSON.parse(Buffer.from(payload, "base64url").toString()) as {
-      v?: number;
-      role?: string;
-      iat?: number;
-    };
-    // Shared claims rule (identical to the pre-versioning logic).
-    const claimsOk =
-      data.role === "presenter" &&
-      typeof data.iat === "number" &&
-      Date.now() - data.iat <= MAX_AGE_SECONDS * 1000;
-    switch (data.v) {
-      case undefined: // implicit legacy version 0 — no `v` was ever written before this change
-      case 1:
-        return claimsOk;
-      default: // any version this build doesn't understand (future v, or garbage)
-        return false;
-    }
+    return JSON.parse(Buffer.from(payload, "base64url").toString()) as RawPayload;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function notExpired(iat: unknown): boolean {
+  return typeof iat === "number" && Date.now() - iat <= MAX_AGE_SECONDS * 1000;
+}
+
+// The role a given version is ALLOWED to carry. v<2 only ever minted "presenter";
+// v:2 may be admin or presenter. This is what prevents a forged-looking downgrade
+// from being accepted with an unexpected role — but the signature already makes
+// forgery impossible; this is claim-shape discipline.
+function roleOkFor(v: number | undefined, role: unknown): boolean {
+  if (v === 2) return role === "admin" || role === "presenter";
+  return role === "presenter"; // v:0 / v:1
+}
+
+/**
+ * Boolean gate used by the ~16 presenter-gated routes. True iff the token is
+ * validly signed, not expired, and carries an accepted (version-appropriate)
+ * role. Widened for v:2 so admin cookies also pass every gate.
+ */
+export function verifySessionToken(token: string | undefined | null): boolean {
+  const data = verifiedPayload(token);
+  if (!data) return false;
+  if (!notExpired(data.iat)) return false;
+  if (!roleOkFor(data.v, data.role)) return false;
+  if (data.v === 2 && typeof data.userId !== "string") return false;
+  return data.v === undefined || data.v === 1 || data.v === 2;
+}
+
+/**
+ * Identity + role for authorization (ownership, admin-only actions). Runs the
+ * IDENTICAL signature + expiry + role checks as verifySessionToken (returns null
+ * for anything invalid/expired — an expired admin cookie must NOT manage decks),
+ * THEN maps: v:2 → its stored {userId, role}; legacy v:0/v:1 → the admin identity
+ * with a null userId (the pre-accounts presenter was the admin).
+ */
+export function getSession(token: string | undefined | null): Session | null {
+  const data = verifiedPayload(token);
+  if (!data) return null;
+  if (!notExpired(data.iat)) return null;
+  if (!roleOkFor(data.v, data.role)) return null;
+  if (data.v === 2) {
+    if (typeof data.userId !== "string") return null;
+    return { userId: data.userId, role: data.role as Role };
+  }
+  if (data.v === undefined || data.v === 1) {
+    return { userId: null, role: "admin" }; // legacy admin
+  }
+  return null; // unknown future version
+}
+
+/**
+ * Authorization for a specific deck. An admin manages anything. A presenter
+ * manages ONLY a deck they own — `ownerId && ownerId === session.userId`. The
+ * `ownerId &&` guard is load-bearing: a registry/system deck has ownerId=null and
+ * a legacy-admin session has userId=null, so `null === null` must NOT grant
+ * access — but a legacy admin already passed via role==='admin' above, and a real
+ * presenter's non-null userId can never equal a null ownerId.
+ */
+export function canManageDeck(session: Session, ownerId: string | null): boolean {
+  if (session.role === "admin") return true;
+  return !!ownerId && ownerId === session.userId;
 }
 
 export const SESSION_MAX_AGE = MAX_AGE_SECONDS;

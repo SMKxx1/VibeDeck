@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { AUTH_COOKIE, verifySessionToken, createPreviewToken } from "@/lib/auth";
+import { AUTH_COOKIE, getSession, createPreviewToken } from "@/lib/auth";
+import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getUploadedDeck } from "@/lib/uploaded-decks";
 
@@ -20,20 +21,28 @@ export const dynamic = "force-dynamic";
 // hand back a broken URL.
 const DECK_ORIGIN = process.env.DECK_ORIGIN;
 
-async function isPresenter(): Promise<boolean> {
+async function currentSession() {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
+  return getSession(token);
 }
 
 export async function GET(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  if (!(await isPresenter())) {
+  const session = await currentSession();
+  if (!session) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
   const { slug } = await params;
+
+  // Ownership: only an admin or the deck's owner may mint a preview capability for
+  // it. A non-owner gets 404, indistinguishable from a missing slug.
+  const perm = await checkDeckManage(session, slug);
+  if (!perm.ok) {
+    return NextResponse.json({ error: perm.error }, { status: perm.status });
+  }
 
   // Only uploaded decks are previewable this way — a registry slug (or a missing
   // one) has no /d-content page to open, so minting a token for it is meaningless.

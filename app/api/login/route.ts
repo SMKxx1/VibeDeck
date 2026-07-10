@@ -1,25 +1,24 @@
 import { NextResponse } from "next/server";
-import {
-  AUTH_COOKIE,
-  SESSION_MAX_AGE,
-  checkPresenterCredentials,
-  createSessionToken,
-} from "@/lib/auth";
+import { AUTH_COOKIE, SESSION_MAX_AGE, createSessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
+import { getUserByEmail, verifyPassword, checkLoginRateLimit } from "@/lib/users";
+import { DUMMY_HASH } from "@/lib/password";
 
-// Presenter sign-in. On valid credentials, set the signed session cookie.
+// Login (Phase 4): email/username + password against the users table (scrypt).
+// The seeded admin's identifier is PRESENTER_USERNAME (may be a plain username,
+// not an email), so `username` is accepted too. On success we mint a v:2 session
+// carrying the user's id + role.
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 interface Body {
   username?: string;
+  email?: string;
   password?: string;
 }
 
 export async function POST(req: Request) {
-  // CSRF: reject a browser-attested cross-origin request first (see lib/csrf.ts).
-  // Login CSRF is low-stakes here (no credential theft, just a nuisance session),
-  // but the check is cheap and correct to include for completeness/consistency.
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
@@ -29,15 +28,30 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
-  const username = (body.username ?? "").toString();
+  const identifier = (body.email ?? body.username ?? "").toString().trim();
   const password = (body.password ?? "").toString();
-
-  if (!checkPresenterCredentials(username, password)) {
+  if (!identifier || !password) {
     return NextResponse.json({ error: "invalid_credentials" }, { status: 401 });
   }
 
-  const res = NextResponse.json({ ok: true });
-  res.cookies.set(AUTH_COOKIE, createSessionToken(), {
+  // Rate-limit per identifier BEFORE scrypt — the hash cost must not be a DoS on
+  // this unauthenticated endpoint, and this caps brute-force against one account.
+  if (!(await checkLoginRateLimit(identifier.toLowerCase()))) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+  }
+
+  const user = await getUserByEmail(identifier);
+  // ALWAYS run scrypt — against a fixed dummy hash when the user is absent — so a
+  // missing account costs the same as a real one (no user-enumeration timing
+  // oracle). The dummy hash can never match a real password. The response is a
+  // generic "invalid_credentials" either way (never reveal whether the email exists).
+  const ok = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
+  if (!user || !ok) {
+    return NextResponse.json({ error: "invalid_credentials" }, { status: 401 });
+  }
+
+  const res = NextResponse.json({ ok: true, role: user.role });
+  res.cookies.set(AUTH_COOKIE, createSessionToken(user.id, user.role), {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",

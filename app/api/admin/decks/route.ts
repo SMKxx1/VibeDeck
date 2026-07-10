@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { staticDecks } from "@/lib/decks/static";
 import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
@@ -25,9 +25,12 @@ const MAX_BYTES = 2_000_000;
 // trailing/double hyphens. Length is bounded separately (1–64).
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-async function isPresenter(): Promise<boolean> {
+// The session behind the request cookie, or null. We need the SESSION (not the
+// boolean gate) here because a created deck's owner_id is set to the creator's
+// user id — so the person who uploads a deck can later manage it (Phase 4).
+async function currentSession() {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
+  return getSession(token);
 }
 
 // Static-slug collision, checked DIRECTLY against staticDecks (not via the merged
@@ -82,7 +85,8 @@ export async function POST(req: Request) {
   // Gate order (cheapest/fastest first, per spec): presenter cookie (401) →
   // same-origin CSRF (403) → Content-Length cap (413) → JSON parse (400) →
   // field validation. assertSameOrigin is the same helper every admin write uses.
-  if (!(await isPresenter())) {
+  const session = await currentSession();
+  if (!session) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   if (!assertSameOrigin(req)) {
@@ -169,7 +173,14 @@ export async function POST(req: Request) {
   // arbiter, so surface that as 409 rather than a 500.
   let result: "ok" | "conflict";
   try {
-    result = await insertUploadedDeck({ slug, title, date, description, html });
+    result = await insertUploadedDeck({
+      slug,
+      title,
+      date,
+      description,
+      html,
+      ownerId: session.userId, // null for a legacy admin cookie — an admin can manage anything anyway
+    });
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
   }

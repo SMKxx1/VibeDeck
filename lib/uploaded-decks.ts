@@ -146,15 +146,63 @@ export async function insertUploadedDeck(fields: {
   date: string;
   description: string | null;
   html: string;
+  ownerId: string | null; // the creating user (Phase 4). NULL for a legacy-admin session.
 }): Promise<"ok" | "conflict"> {
   await ensureSchema();
   const res = await query(
-    `INSERT INTO decks (slug, title, date, description, kind, publish_status, html, embed_url, slide_count)
-     VALUES ($1, $2, $3, $4, 'uploaded', 'unpublished', $5, NULL, 0)
+    `INSERT INTO decks (slug, title, date, description, kind, publish_status, html, embed_url, slide_count, owner_id)
+     VALUES ($1, $2, $3, $4, 'uploaded', 'unpublished', $5, NULL, 0, $6)
      ON CONFLICT (slug) DO NOTHING`,
-    [fields.slug, fields.title, fields.date, fields.description, fields.html],
+    [fields.slug, fields.title, fields.date, fields.description, fields.html, fields.ownerId],
   );
   return (res.rowCount ?? 0) === 0 ? "conflict" : "ok";
+}
+
+/**
+ * The owner + kind of ANY deck (registry or uploaded) for authorization, or null
+ * if the slug genuinely doesn't exist. Registry decks have owner_id NULL
+ * (admin-managed). A route loads this, then applies canManageDeck(session,
+ * ownerId) before mutating. Freshly queried (not a cached Deck) so ownership can't
+ * be stale.
+ *
+ * Deliberately THROWS on a DB error rather than returning null: an authorization
+ * gate must be able to tell "no such deck" (→ 404) apart from "database down"
+ * (→ 503). Collapsing both into null would 404 a legit owner's edit during a DB
+ * blip. Neither outcome leaks deck existence (a prober sees 503 for every slug
+ * while the DB is down, 404 for both missing and unauthorized when it's up).
+ */
+export async function getDeckOwner(
+  slug: string,
+): Promise<{ ownerId: string | null; kind: string } | null> {
+  await ensureSchema();
+  const res = await query<{ owner_id: string | null; kind: string }>(
+    `SELECT owner_id, kind FROM decks WHERE slug = $1`,
+    [slug],
+  );
+  const r = res.rows[0];
+  return r ? { ownerId: r.owner_id, kind: r.kind } : null;
+}
+
+/**
+ * slug → owner_id for EVERY decks row (uploaded decks AND the lightweight rows
+ * ensured for each registry deck). Lets the dashboard compute per-deck manage
+ * rights in ONE query instead of N getDeckOwner round-trips. Registry rows carry
+ * owner_id NULL. Returns {} on DB error — the dashboard then treats every deck as
+ * unmanageable (shows no owner-only controls) rather than crashing; harmless
+ * because the server routes still enforce authorization on every real mutation.
+ */
+export async function getAllDeckOwners(): Promise<Record<string, string | null>> {
+  await ensureSchema();
+  try {
+    const res = await query<{ slug: string; owner_id: string | null }>(
+      `SELECT slug, owner_id FROM decks`,
+    );
+    const map: Record<string, string | null> = {};
+    for (const r of res.rows) map[r.slug] = r.owner_id;
+    return map;
+  } catch {
+    return {};
+  }
 }
 
 /**
