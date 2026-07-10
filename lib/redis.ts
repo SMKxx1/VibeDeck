@@ -18,6 +18,11 @@ export type RedisClient = {
   incr: (key: string) => Promise<number>;
   incrby: (key: string, increment: number) => Promise<number>;
   expire: (key: string, seconds: number) => Promise<unknown>;
+  // Hash ops — used for live presence (one field per viewer, so concurrent viewer
+  // heartbeats are per-field atomic writes, never a lost-update read-modify-write).
+  hset: (key: string, field: string, value: unknown) => Promise<number>;
+  hgetall: <T = unknown>(key: string) => Promise<Record<string, T>>;
+  hdel: (key: string, ...fields: string[]) => Promise<number>;
 };
 
 let redisPromise: Promise<RedisClient | null> | null = null;
@@ -71,6 +76,14 @@ export function getRedis(): Promise<RedisClient | null> {
           incr: (key: string) => client.incr(key),
           incrby: (key: string, increment: number) => client.incrby(key, increment),
           expire: (key: string, seconds: number) => client.expire(key, seconds),
+          hset: (key: string, field: string, value: unknown) => client.hset(key, field, enc(value)),
+          hgetall: async <T = unknown>(key: string) => {
+            const raw = await client.hgetall(key);
+            const out: Record<string, T> = {};
+            for (const k of Object.keys(raw)) out[k] = dec<T>(raw[k]) as T;
+            return out;
+          },
+          hdel: (key: string, ...fields: string[]) => client.hdel(key, ...fields),
         };
         return wrapped;
       } catch {

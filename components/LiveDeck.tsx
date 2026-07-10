@@ -32,6 +32,16 @@ const HIDDEN_POLL_MS = 60_000; // tab in the background
 const PRESENTER_POLL_MS = 5_000; // presenter: this poll is only a cross-device fallback
 const NAME_KEY = "presentation:name";
 
+// Viewer→presenter backchannel reaction kinds (#2). "lost" is rendered as its
+// own distinct button; the rest ride in a compact icon row.
+type SignalKind = "up" | "party" | "slow" | "hand" | "lost";
+const REACTIONS: { kind: SignalKind; emoji: string; label: string }[] = [
+  { kind: "up", emoji: "👍", label: "Nice" },
+  { kind: "party", emoji: "🎉", label: "Celebrate" },
+  { kind: "slow", emoji: "🐢", label: "Slow down" },
+  { kind: "hand", emoji: "🙋", label: "Raise hand" },
+];
+
 type Role = "viewer" | "presenter";
 
 interface DeckState {
@@ -71,6 +81,8 @@ export function LiveDeck({
   const [autoFollow, setAutoFollow] = useState(true);
   const [chatOpen, setChatOpen] = useState(false);
   const [controlsShown, setControlsShown] = useState(true);
+  // Live headcount from the presence heartbeat (#1) — powers the "N watching" chip.
+  const [watching, setWatching] = useState(0);
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -160,6 +172,26 @@ export function LiveDeck({
     [slug, role, send],
   );
 
+  // Viewer backchannel reaction (#2): fire-and-forget POST. A 429 (rate_limited)
+  // or any error is swallowed — the per-button cooldown is the real guard, and a
+  // dropped reaction is harmless.
+  const sendSignal = useCallback(
+    async (kind: SignalKind) => {
+      const who = nameRef.current;
+      if (!who) return;
+      try {
+        await fetch("/api/signal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, name: who, kind }),
+        });
+      } catch {
+        /* ignore — reactions are best-effort */
+      }
+    },
+    [slug],
+  );
+
   // Load stored viewer name.
   useEffect(() => {
     if (role !== "viewer") return;
@@ -211,10 +243,42 @@ export function LiveDeck({
     let alive = true;
     let timer: number | undefined;
     let lastLive = false;
+    // Aborts any in-flight session/presence fetch when the effect tears down.
+    const ctrl = new AbortController();
+
+    // Viewer presence heartbeat (#1): "I'm here, on slide N, following=Y". Runs on
+    // the SAME poll tick as the session read (no second timer), so it inherits the
+    // adaptive cadence + hidden-tab backoff. Publish-gated — any non-200 just skips
+    // this tick. The returned headcount feeds the "N watching" chip.
+    async function beat() {
+      const who = nameRef.current;
+      if (role !== "viewer" || !who) return;
+      try {
+        const res = await fetch("/api/presence", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            slug,
+            name: who,
+            index: deckRef.current.index,
+            follow: autoFollowRef.current,
+          }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { watching?: number };
+        if (alive && typeof data.watching === "number") setWatching(data.watching);
+      } catch {
+        /* transient / aborted — next tick */
+      }
+    }
 
     async function poll() {
       try {
-        const res = await fetch(`/api/session?slug=${encodeURIComponent(slug)}`, { cache: "no-store" });
+        const res = await fetch(`/api/session?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+          signal: ctrl.signal,
+        });
         if (!res.ok || !alive) return;
         const s = (await res.json()) as SessionState;
         lastLive = s.live;
@@ -222,6 +286,8 @@ export function LiveDeck({
         // Presenter windows sync with each other instantly via BroadcastChannel,
         // never via this poll — polling here would fight local navigation.
         if (role === "presenter") return;
+        // Heartbeat presence on every viewer tick (live or free-roam browsing).
+        void beat();
         if (!s.live) {
           sendFree();
           return;
@@ -264,6 +330,7 @@ export function LiveDeck({
     return () => {
       alive = false;
       window.clearTimeout(timer);
+      ctrl.abort();
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [role, showGate, slug, send, sendFree, followTo]);
@@ -402,6 +469,7 @@ export function LiveDeck({
       /* ignore */
     }
     setName(null);
+    setWatching(0);
     setShowGate(true);
   }, [role]);
 
@@ -452,6 +520,12 @@ export function LiveDeck({
                   Browsing freely
                 </span>
               )}
+              {name && watching >= 1 && (
+                <span style={glassChip()} title="People watching this deck right now">
+                  👁 {watching} watching
+                </span>
+              )}
+              {name && <ReactionBar onSend={sendSignal} />}
               <ChatButton open={chatOpen} onClick={() => setChatOpen((o) => !o)} />
               {name && <span style={glassChip()}>{name}</span>}
             </>
@@ -616,6 +690,97 @@ function ChatButton({ open, onClick }: { open: boolean; onClick: () => void }) {
       Ask
     </button>
   );
+}
+
+// A compact reaction row (#2). Each tap fires one signal, pulses the button, and
+// starts a ~3s local cooldown so a viewer can't machine-gun it (the server also
+// rate-limits). "I'm lost" is styled distinctly to stand out.
+function ReactionBar({ onSend }: { onSend: (kind: SignalKind) => void }) {
+  const [cooling, setCooling] = useState<Record<string, boolean>>({});
+  const [pulse, setPulse] = useState<SignalKind | null>(null);
+  const timers = useRef<number[]>([]);
+  useEffect(
+    () => () => {
+      timers.current.forEach((t) => window.clearTimeout(t));
+    },
+    [],
+  );
+
+  const tap = (kind: SignalKind) => {
+    if (cooling[kind]) return;
+    onSend(kind);
+    setPulse(kind);
+    setCooling((c) => ({ ...c, [kind]: true }));
+    timers.current.push(
+      window.setTimeout(() => setPulse((p) => (p === kind ? null : p)), 420),
+      window.setTimeout(() => setCooling((c) => ({ ...c, [kind]: false })), 3000),
+    );
+  };
+
+  return (
+    <div style={{ ...glassChip(), gap: 3, padding: "0 6px" }} role="group" aria-label="Send a reaction to the presenter">
+      {REACTIONS.map((r) => (
+        <button
+          key={r.kind}
+          onClick={() => tap(r.kind)}
+          disabled={!!cooling[r.kind]}
+          title={r.label}
+          aria-label={r.label}
+          style={reactionBtn(pulse === r.kind, !!cooling[r.kind])}
+        >
+          {r.emoji}
+        </button>
+      ))}
+      <button
+        onClick={() => tap("lost")}
+        disabled={!!cooling.lost}
+        title="I'm lost — let the presenter know"
+        aria-label="I'm lost"
+        style={lostBtn(pulse === "lost", !!cooling.lost)}
+      >
+        😕 I&rsquo;m lost
+      </button>
+    </div>
+  );
+}
+
+function reactionBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    width: 30,
+    height: 30,
+    borderRadius: 9,
+    border: "none",
+    background: pulsing ? "rgba(191,224,72,0.55)" : "transparent",
+    cursor: disabled ? "default" : "pointer",
+    fontSize: 16,
+    lineHeight: 1,
+    padding: 0,
+    opacity: disabled && !pulsing ? 0.4 : 1,
+    transform: pulsing ? "scale(1.28)" : "scale(1)",
+    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
+  };
+}
+
+function lostBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    height: 26,
+    padding: "0 10px",
+    borderRadius: 8,
+    border: "1px solid rgba(210,120,40,0.5)",
+    background: pulsing ? "#E07B39" : "rgba(224,123,57,0.16)",
+    color: pulsing ? "#fff" : "#9A4B12",
+    fontFamily: '"Outfit", system-ui, sans-serif',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: disabled ? "default" : "pointer",
+    opacity: disabled && !pulsing ? 0.55 : 1,
+    transform: pulsing ? "scale(1.06)" : "scale(1)",
+    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
+    whiteSpace: "nowrap",
+  };
 }
 
 function NameGate({ onSubmit }: { onSubmit: (name: string) => void }) {

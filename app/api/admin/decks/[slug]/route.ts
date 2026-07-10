@@ -12,6 +12,8 @@ import { validateDeckHtml } from "@/lib/deck-validator";
 import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { clearSession } from "@/lib/session";
 import { clearPinboard } from "@/lib/pinboard";
+import { clearPresence } from "@/lib/presence";
+import { clearSignals } from "@/lib/signals";
 
 // Ownership-gated REPLACE (PUT) and DELETE for an already-uploaded deck. Gate
 // order: authenticated session (401) → CSRF (403) → OWNERSHIP (checkDeckManage:
@@ -165,7 +167,12 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ slug:
   // so a later deck that reuses the freed slug can't inherit stale position/pins.
   // allSettled + the helpers' own swallowing mean a cleanup error NEVER fails the
   // delete — the row is already gone, this is just hygiene.
-  await Promise.allSettled([clearSession(slug), clearPinboard(slug)]);
+  await Promise.allSettled([
+    clearSession(slug),
+    clearPinboard(slug),
+    clearPresence(slug),
+    clearSignals(slug),
+  ]);
 
   return NextResponse.json({ slug });
 }
