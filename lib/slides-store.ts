@@ -10,8 +10,9 @@
 // Seeding is insert-only (ON CONFLICT DO NOTHING) so a redeploy never clobbers a
 // presenter's later edits.
 
-import { isDbReachable, query } from "./db";
+import { getPool, isDbReachable, query } from "./db";
 import { ensureSchema, SEEDS } from "./schema";
+import type { DeckSlideMeta } from "./deck-validator";
 
 // ensureSchema (the DB boot sequence) and SEEDS both moved to lib/schema.ts to
 // break an import cycle: uploaded-deck reads need ensureSchema, which used to live
@@ -190,5 +191,87 @@ export async function updateSlideMeta(
   } catch (err) {
     console.error("[slides-store] updateSlideMeta failed:", err);
     return { ok: false, error: "database_unavailable" };
+  }
+}
+
+/**
+ * Replace an UPLOADED deck's per-slide grounding wholesale from its validated
+ * bundle (label + AI context + speaker notes derived by lib/deck-validator from
+ * the deck's <section>s and its vibedeck-context manifest). Called on upload and
+ * on replace.
+ *
+ * Unlike updateSlideMeta (a presenter's partial edit of ONE slide), this is the
+ * author RE-DECLARING the whole deck, so it overwrites every field for every
+ * slide and — critically — deletes any stale rows at indices beyond the new
+ * slide count (a replace that shrinks the deck must not leave orphaned grounding
+ * that /api/ask's getFullContextText would still feed to the model). The delete
+ * + multi-row upsert run in ONE transaction on a pinned client so a concurrent
+ * read never sees a half-applied deck. Batched into a single INSERT (not N
+ * round-trips) so a 300-slide deck is one query, not 300.
+ *
+ * Best-effort by design: returns void and swallows on no-DB / error. A missing
+ * DB just means the deck has no authored grounding yet (generic AI answers),
+ * which is a graceful degrade, not an upload failure — the deck HTML itself is
+ * already stored by the caller regardless.
+ */
+export async function replaceUploadedDeckSlides(
+  slug: string,
+  slides: DeckSlideMeta[],
+): Promise<void> {
+  await ensureSchema();
+  const pool = await getPool();
+  if (!pool) return;
+
+  // Acquire the pinned client OUTSIDE the transaction try, guarded: pool.connect()
+  // itself can reject (pool exhausted past connectionTimeoutMillis, or the DB
+  // dropped between the html write and here). This function is best-effort — the
+  // deck's html is ALREADY stored by the caller — so a failure to acquire must
+  // swallow and return, never propagate as a 5xx that falsely fails a request
+  // whose durable work already succeeded.
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    console.error("[slides-store] replaceUploadedDeckSlides: could not acquire a connection:", err);
+    return;
+  }
+  try {
+    await client.query("BEGIN");
+    // Drop any grounding rows at indices this deck no longer has.
+    await client.query(`DELETE FROM deck_slides WHERE deck_slug = $1 AND slide_index >= $2`, [
+      slug,
+      slides.length,
+    ]);
+    if (slides.length > 0) {
+      // Build one multi-row INSERT ... ON CONFLICT DO UPDATE. Params per row:
+      // (deck_slug, slide_index, label, speaker_notes, ai_context).
+      const rows: string[] = [];
+      const values: unknown[] = [];
+      let n = 1;
+      for (const s of slides) {
+        rows.push(`($${n++}, $${n++}, $${n++}, $${n++}, $${n++})`);
+        values.push(slug, s.index, s.label, s.speakerNotes, s.aiContext);
+      }
+      await client.query(
+        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
+         VALUES ${rows.join(", ")}
+         ON CONFLICT (deck_slug, slide_index) DO UPDATE
+           SET label = EXCLUDED.label,
+               speaker_notes = EXCLUDED.speaker_notes,
+               ai_context = EXCLUDED.ai_context,
+               updated_at = now()`,
+        values,
+      );
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* ignore — connection released regardless */
+    }
+    console.error("[slides-store] replaceUploadedDeckSlides failed:", err);
+  } finally {
+    client.release();
   }
 }

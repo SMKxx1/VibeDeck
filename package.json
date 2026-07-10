@@ -12,6 +12,7 @@
   "dependencies": {
     "ioredis": "^5.4.1",
     "next": "15.5.19",
+    "node-html-parser": "^7.0.1",
     "pg": "^8.22.0",
     "react": "19.1.0",
     "react-dom": "19.1.0"

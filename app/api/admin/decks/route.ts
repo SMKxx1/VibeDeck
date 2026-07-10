@@ -4,6 +4,8 @@ import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { staticDecks } from "@/lib/decks/static";
 import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
+import { validateDeckHtml } from "@/lib/deck-validator";
+import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 
 // Presenter-gated deck UPLOAD — THE route that first lets new deck content enter
 // the system at runtime. Containment is NOT this route's job: the origin
@@ -114,10 +116,18 @@ export async function POST(req: Request) {
   if (Buffer.byteLength(html, "utf8") > MAX_BYTES) {
     return NextResponse.json({ error: "payload_too_large" }, { status: 413 });
   }
-  // Trivial "looks like markup" sanity check — NOT validation (Phase 2 owns a real
-  // bundle contract). The origin+CSP+sandbox boundary is what contains the content.
-  if (!html.includes("<")) {
-    return NextResponse.json({ error: "not_html" }, { status: 400 });
+  // Conformance gate (Phase 2): the deck must be a well-formed VibeDeck bundle —
+  // exactly one <deck-stage>, >=1 <section> slide, no external <script src>, and a
+  // valid (or absent) vibedeck-context manifest. This is NOT the security boundary
+  // (that's the separate origin + CSP + sandbox); it guarantees the shared runtime
+  // can render it and that we can safely derive its slide list + AI grounding.
+  // Rejected decks are never stored. `validation.slides` is populated below.
+  const validation = validateDeckHtml(html);
+  if (!validation.ok) {
+    return NextResponse.json(
+      { error: "invalid_deck", issues: validation.issues, warnings: validation.warnings },
+      { status: 422 },
+    );
   }
 
   const date =
@@ -166,5 +176,11 @@ export async function POST(req: Request) {
   if (result === "conflict") {
     return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
   }
-  return NextResponse.json({ slug }, { status: 201 });
+
+  // Populate the deck's per-slide AI grounding + presenter notes from its
+  // validated bundle so it works with the AI tutor immediately (best-effort — a
+  // DB hiccup here just leaves grounding empty, it doesn't fail the stored upload).
+  await replaceUploadedDeckSlides(slug, validation.slides);
+
+  return NextResponse.json({ slug, warnings: validation.warnings }, { status: 201 });
 }
