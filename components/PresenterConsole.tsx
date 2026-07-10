@@ -60,6 +60,18 @@ interface Poll {
   at: number;
 }
 
+// A question in the upvotable Q&A queue (#5). The presenter's GET is cookie-authed,
+// so it also includes dismissed entries (viewers never see those).
+interface QnaQuestion {
+  id: string;
+  name: string;
+  text: string;
+  votes: number;
+  answered: boolean;
+  dismissed: boolean;
+  at: number;
+}
+
 export function PresenterConsole({
   slug,
   embedUrl,
@@ -94,6 +106,11 @@ export function PresenterConsole({
   const [livePoll, setLivePoll] = useState<Poll | null>(null);
   const [liveTally, setLiveTally] = useState<number[]>([]);
   const [liveTotal, setLiveTotal] = useState(0);
+
+  // Q&A queue (#5): the full cookie-authed queue (includes dismissed), refreshed on
+  // the same ~4s console tick as presence/signals/poll.
+  const [qnaPanelOpen, setQnaPanelOpen] = useState(false);
+  const [questions, setQuestions] = useState<QnaQuestion[]>([]);
 
   const sessionRef = useRef(session);
   sessionRef.current = session;
@@ -230,6 +247,27 @@ export function PresenterConsole({
       /* aborted / transient */
     }
   }, [pollAction]);
+
+  // Q&A control (#5): answer / dismiss / undismiss. Each returns the fresh sorted
+  // queue, which we adopt directly; the ~4s tick reconciles thereafter.
+  const qnaAction = useCallback(
+    async (action: "answer" | "dismiss" | "undismiss", qid: string) => {
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action, qid }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { questions?: QnaQuestion[] };
+          if (data.questions) setQuestions(data.questions);
+        }
+      } catch {
+        /* transient — the tick will refresh */
+      }
+    },
+    [slug],
+  );
 
   // Abort any in-flight poll control request on unmount.
   useEffect(() => () => pollCtrlRef.current?.abort(), []);
@@ -406,11 +444,13 @@ export function PresenterConsole({
 
     async function tick() {
       try {
-        // Fold the live-poll tally (#3) into the same tick as presence + reactions.
-        const [pRes, sRes, qRes] = await Promise.all([
+        // Fold the live-poll tally (#3) and Q&A queue (#5) into the same tick as
+        // presence + reactions — one round-trip, one abort signal.
+        const [pRes, sRes, qRes, qaRes] = await Promise.all([
           fetch(`/api/presence?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/signal?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/poll?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/qna?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
         ]);
         if (alive && pRes.ok) {
           const data = (await pRes.json()) as { count?: number; viewers?: Viewer[] };
@@ -438,6 +478,10 @@ export function PresenterConsole({
             setLiveTally(incoming ? (data.tally ?? []) : []);
             setLiveTotal(incoming ? (data.total ?? 0) : 0);
           }
+        }
+        if (alive && qaRes.ok) {
+          const data = (await qaRes.json()) as { questions?: QnaQuestion[] };
+          setQuestions(data.questions ?? []);
         }
       } catch {
         /* transient / aborted — try again next tick */
@@ -496,6 +540,9 @@ export function PresenterConsole({
     else exploring += 1;
   }
 
+  // The header badge counts the live (non-dismissed) queue.
+  const qnaActiveCount = questions.reduce((n, q) => (q.dismissed ? n : n + 1), 0);
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "#22201F", color: "#F4F2EC", fontFamily: '"Outfit", system-ui, sans-serif', display: "flex", flexDirection: "column" }}>
       <style>{FLOAT_KEYFRAMES}</style>
@@ -531,6 +578,19 @@ export function PresenterConsole({
             }}
           >
             📊 Poll{livePoll ? (livePoll.revealed ? " · revealed" : " · live") : ""}
+          </button>
+          <button
+            onClick={() => setQnaPanelOpen((o) => !o)}
+            title="Audience questions & AI confusion digest"
+            aria-pressed={qnaPanelOpen}
+            style={{
+              ...btn(qnaPanelOpen ? "#BFE048" : "rgba(255,255,255,0.1)", qnaPanelOpen ? "#1B1B20" : "#F4F2EC"),
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
+            }}
+          >
+            ❓ Questions{qnaActiveCount > 0 ? ` · ${qnaActiveCount}` : ""}
           </button>
           <ConsoleTimer />
           <button onClick={() => void post({ reset: true })} title="Set the current slide as the viewers' ceiling" style={btn("#B5331F", "#fff")}>
@@ -615,6 +675,17 @@ export function PresenterConsole({
             onReveal={revealPollAction}
             onClose={closePollAction}
             onDismiss={() => setPollPanelOpen(false)}
+          />
+        )}
+
+        {/* Q&A queue panel (#5) — digest · queue · answer/dismiss · one-tap AI answer */}
+        {qnaPanelOpen && (
+          <QnaPanel
+            questions={questions}
+            slug={slug}
+            index={deck.index}
+            onAction={qnaAction}
+            onDismiss={() => setQnaPanelOpen(false)}
           />
         )}
       </div>
@@ -1322,4 +1393,320 @@ const presTag: React.CSSProperties = {
   color: "#BFE048",
   whiteSpace: "nowrap",
   flex: "0 0 auto",
+};
+
+// Per-question drafted-answer state (#5). Local to the panel so it resets when the
+// panel is closed (matching the poll compose form).
+interface AiAnswerState {
+  loading: boolean;
+  open: boolean;
+  answer?: string;
+  error?: string;
+}
+
+// The presenter's Q&A panel (#5): a top-of-panel AI confusion digest, then the full
+// queue (top-voted first; dismissed ones greyed but still listed). Per question:
+// Answer, Dismiss/Restore, and a one-tap ✨ AI answer drafted from the current slide
+// (collapsible so the presenter can verify before speaking). AI/digest state is local
+// — the parent owns the queue and applies each action's returned list.
+function QnaPanel({
+  questions,
+  slug,
+  index,
+  onAction,
+  onDismiss,
+}: {
+  questions: QnaQuestion[];
+  slug: string;
+  index: number;
+  onAction: (action: "answer" | "dismiss" | "undismiss", qid: string) => void;
+  onDismiss: () => void;
+}) {
+  const [ai, setAi] = useState<Record<string, AiAnswerState>>({});
+  const [themes, setThemes] = useState<string[] | null>(null);
+  const [digestLoading, setDigestLoading] = useState(false);
+  const [digestError, setDigestError] = useState<string | null>(null);
+  const aiCtrlsRef = useRef<Record<string, AbortController>>({});
+  const digestCtrlRef = useRef<AbortController | null>(null);
+  const indexRef = useRef(index);
+  indexRef.current = index;
+
+  // Abort any in-flight AI/digest requests when the panel closes/unmounts.
+  useEffect(
+    () => () => {
+      Object.values(aiCtrlsRef.current).forEach((c) => c.abort());
+      digestCtrlRef.current?.abort();
+    },
+    [],
+  );
+
+  // Draft an answer for one question via /api/ask (non-stream). A prior draft for the
+  // SAME question is aborted; concurrent drafts across questions are allowed.
+  async function aiAnswer(qid: string, questionText: string) {
+    aiCtrlsRef.current[qid]?.abort();
+    const ctrl = new AbortController();
+    aiCtrlsRef.current[qid] = ctrl;
+    setAi((m) => ({ ...m, [qid]: { loading: true, open: true } }));
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          slug,
+          name: "presenter",
+          question: questionText,
+          slideIndex: indexRef.current,
+          stream: false,
+        }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as { answer?: string; error?: string };
+      if (!res.ok) {
+        setAi((m) => ({ ...m, [qid]: { loading: false, open: true, error: mapAskError(data.error) } }));
+        return;
+      }
+      const answer = (data.answer ?? "").trim() || "No answer was generated.";
+      setAi((m) => ({ ...m, [qid]: { loading: false, open: true, answer } }));
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setAi((m) => ({ ...m, [qid]: { loading: false, open: true, error: "Couldn't draft an answer — try again." } }));
+    } finally {
+      if (aiCtrlsRef.current[qid] === ctrl) delete aiCtrlsRef.current[qid];
+    }
+  }
+
+  const toggleAi = (qid: string) =>
+    setAi((m) => (m[qid] ? { ...m, [qid]: { ...m[qid], open: !m[qid].open } } : m));
+
+  // AI confusion digest — /api/qna/digest never errors, so [] just means "not enough".
+  async function runDigest() {
+    setDigestLoading(true);
+    setDigestError(null);
+    digestCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    digestCtrlRef.current = ctrl;
+    try {
+      const res = await fetch("/api/qna/digest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as { themes?: string[] };
+      setThemes(Array.isArray(data.themes) ? data.themes.slice(0, 3) : []);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setDigestError("Couldn't summarize — try again.");
+    } finally {
+      setDigestLoading(false);
+    }
+  }
+
+  return (
+    <div style={pollPanelWrap}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <Label>Questions</Label>
+        <button onClick={onDismiss} title="Hide panel" aria-label="Hide questions panel" style={pollIconBtn}>
+          ✕
+        </button>
+      </div>
+
+      {/* AI confusion digest */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <button onClick={() => void runDigest()} disabled={digestLoading} style={draftBtn(digestLoading)}>
+          {digestLoading ? "Summarizing…" : "✨ Summarize confusion"}
+        </button>
+        {digestError && <div style={pollErrorText}>{digestError}</div>}
+        {themes &&
+          (themes.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontSize: 11.5, color: "#9A958A" }}>The room is stuck on:</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {themes.map((t, i) => (
+                  <span key={i} style={digestChip}>
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: "#7A7770" }}>Not enough questions yet.</div>
+          ))}
+      </div>
+
+      {/* the queue */}
+      <div style={pollScroll}>
+        {questions.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#7A7770" }}>No questions from the room yet.</div>
+        ) : (
+          questions.map((q) => {
+            const a = ai[q.id];
+            const hasDraft = !!(a && (a.answer || a.error));
+            return (
+              <div key={q.id} style={qnaRow(q.dismissed)}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={qnaVotes}>
+                    <span style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>{q.votes}</span>
+                    <span style={{ fontSize: 8.5, color: "#9A958A", textTransform: "uppercase", letterSpacing: "0.06em" }}>votes</span>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+                    <div style={{ fontSize: 13.5, color: q.dismissed ? "#9A958A" : "#F4F2EC", lineHeight: 1.4 }}>{q.text}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, color: "#9A958A", flexWrap: "wrap", minWidth: 0 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 130 }}>{q.name}</span>
+                      {q.answered && <span style={qnaStateTag("#BFE048")}>✓ answered</span>}
+                      {q.dismissed && <span style={qnaStateTag("#9A958A")}>dismissed</span>}
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 2 }}>
+                      {!q.dismissed && (
+                        <button
+                          onClick={() => onAction("answer", q.id)}
+                          style={qnaActionBtn}
+                          title={q.answered ? "Already answered — click to re-mark" : "Mark as answered"}
+                        >
+                          {q.answered ? "✓ Answered" : "✓ Answer"}
+                        </button>
+                      )}
+                      {q.dismissed ? (
+                        <button onClick={() => onAction("undismiss", q.id)} style={qnaActionBtn} title="Restore to the queue">
+                          ↩ Restore
+                        </button>
+                      ) : (
+                        <button onClick={() => onAction("dismiss", q.id)} style={qnaActionBtn} title="Dismiss from the queue">
+                          Dismiss
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          if (hasDraft) toggleAi(q.id);
+                          else void aiAnswer(q.id, q.text);
+                        }}
+                        disabled={a?.loading}
+                        style={qnaAiBtn(!!a?.loading)}
+                        title="Draft an answer with AI from the current slide"
+                      >
+                        {a?.loading ? "✨ Drafting…" : hasDraft ? (a?.open ? "Hide AI answer" : "Show AI answer") : "✨ AI answer"}
+                      </button>
+                      {hasDraft && !a?.loading && (
+                        <button onClick={() => void aiAnswer(q.id, q.text)} style={qnaActionBtn} title="Redraft with AI">
+                          ↻
+                        </button>
+                      )}
+                    </div>
+
+                    {a && a.open && (a.loading || a.answer || a.error) && (
+                      <div style={qnaAiBlock}>
+                        {a.loading ? (
+                          <span style={{ color: "#9A958A", fontSize: 12.5 }}>Drafting an answer…</span>
+                        ) : a.error ? (
+                          <span style={pollErrorText}>{a.error}</span>
+                        ) : (
+                          <div style={{ fontSize: 12.5, lineHeight: 1.55, color: "#E7E4DC", whiteSpace: "pre-wrap" }}>{a.answer}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function mapAskError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "unknown_deck":
+      return "This deck isn't available.";
+    default:
+      return "Couldn't draft an answer — try again.";
+  }
+}
+
+const digestChip: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: "#D6E88A",
+  background: "rgba(191,224,72,0.14)",
+  border: "1px solid rgba(191,224,72,0.4)",
+  borderRadius: 999,
+  padding: "5px 11px",
+  lineHeight: 1.35,
+};
+
+function qnaRow(dismissed: boolean): React.CSSProperties {
+  return {
+    borderRadius: 10,
+    padding: "10px 11px",
+    background: dismissed ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.05)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    opacity: dismissed ? 0.6 : 1,
+  };
+}
+
+const qnaVotes: React.CSSProperties = {
+  flex: "0 0 auto",
+  width: 40,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: 2,
+  padding: "5px 0",
+  borderRadius: 8,
+  background: "rgba(255,255,255,0.06)",
+};
+
+function qnaStateTag(color: string): React.CSSProperties {
+  return {
+    fontSize: 9.5,
+    fontWeight: 700,
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    color,
+    whiteSpace: "nowrap",
+    flex: "0 0 auto",
+  };
+}
+
+const qnaActionBtn: React.CSSProperties = {
+  height: 28,
+  padding: "0 10px",
+  borderRadius: 8,
+  border: "1px solid rgba(255,255,255,0.16)",
+  background: "rgba(255,255,255,0.06)",
+  color: "#E7E4DC",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  fontSize: 12,
+  fontWeight: 500,
+};
+
+function qnaAiBtn(loading: boolean): React.CSSProperties {
+  return {
+    height: 28,
+    padding: "0 10px",
+    borderRadius: 8,
+    border: "1px solid rgba(191,224,72,0.4)",
+    background: "rgba(191,224,72,0.14)",
+    color: "#D6E88A",
+    cursor: loading ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 12,
+    fontWeight: 600,
+    opacity: loading ? 0.75 : 1,
+  };
+}
+
+const qnaAiBlock: React.CSSProperties = {
+  marginTop: 4,
+  padding: "9px 11px",
+  borderRadius: 8,
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.1)",
 };
