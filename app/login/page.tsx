@@ -8,7 +8,7 @@ import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -21,7 +21,7 @@ export default function LoginPage() {
       const res = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ email, password }),
       });
       if (res.ok) {
         router.push("/dashboard");
@@ -105,11 +105,11 @@ export default function LoginPage() {
         </div>
 
         <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5, color: "#6E6A62" }}>
-          Username
+          Email
           <input
             style={field}
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
             autoComplete="username"
             autoFocus
           />

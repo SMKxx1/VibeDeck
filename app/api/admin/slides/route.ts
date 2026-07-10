@@ -1,32 +1,51 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { AUTH_COOKIE, getSession, canManageDeck } from "@/lib/auth";
+import { checkDeckManage } from "@/lib/deck-authz";
+import { getDeckOwner } from "@/lib/uploaded-decks";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides, updateSlideMeta } from "@/lib/slides-store";
 
-// Presenter-gated editor API for per-slide speaker notes + AI grounding context.
-// GET reads a deck's slide metadata; PUT saves one slide's edits. Both require a
-// valid presenter cookie. Reads/writes go through lib/slides-store, which falls
-// back gracefully — here we surface a 503 when there's genuinely no DB so the
-// editor can show a clear message.
+// Ownership-gated editor API for per-slide speaker notes + AI grounding context.
+// GET reads a deck's slide metadata; PUT saves one slide's edits. READ is broader
+// than WRITE by design (S2): any presenter may READ a registry deck's grounding
+// (the shared, admin-authored official decks everyone presents) OR any deck they
+// manage; WRITE is restricted to canManageDeck, so a presenter can never edit a
+// registry deck's or another presenter's notes. Reads/writes go through
+// lib/slides-store; we surface a 503 when there's genuinely no DB.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_FIELD = 8000;
 
-async function isPresenter(): Promise<boolean> {
+async function currentSession() {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
+  return getSession(token);
 }
 
 export async function GET(req: Request) {
-  if (!(await isPresenter())) {
+  const session = await currentSession();
+  if (!session) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+
+  // READ authorization (S2): a registry deck's grounding is shared/readable by any
+  // presenter; anything else must be a deck this session manages. getDeckOwner
+  // throws on DB error → 503; null → the slug doesn't exist → 404 (don't leak).
+  let owner: { ownerId: string | null; kind: string } | null;
+  try {
+    owner = await getDeckOwner(slug);
+  } catch {
+    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
+  }
+  if (!owner) return NextResponse.json({ error: "not_found" }, { status: 404 });
+  if (owner.kind !== "registry" && !canManageDeck(session, owner.ownerId)) {
+    return NextResponse.json({ error: "not_found" }, { status: 404 });
+  }
 
   // Distinguish "DB down" from "deck simply has no slides" by actually probing
   // reachability — a set-but-unreachable DATABASE_URL must surface, not degrade.
@@ -50,7 +69,8 @@ export async function PUT(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  if (!(await isPresenter())) {
+  const session = await currentSession();
+  if (!session) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   let body: PutBody;
@@ -62,6 +82,13 @@ export async function PUT(req: Request) {
 
   const slug = (body.slug ?? "").toString();
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+
+  // WRITE authorization (S2): editing grounding requires manage rights — admin, or
+  // the deck's owner. Registry decks (owner NULL) are therefore admin-only to edit.
+  const perm = await checkDeckManage(session, slug);
+  if (!perm.ok) {
+    return NextResponse.json({ error: perm.error }, { status: perm.status });
+  }
 
   const index = body.index;
   if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {

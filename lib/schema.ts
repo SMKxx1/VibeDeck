@@ -11,9 +11,11 @@
 // or any error occurs — callers that follow it with a read/write take their own
 // static fallback. Memoized so the advisory lock is taken at most once per process.
 
+import { randomBytes } from "crypto";
 import type { Pool } from "pg";
 import { getPool } from "./db";
 import { runMigrations } from "./migrations";
+import { hashPassword } from "./password";
 import { buildHostWebsiteSeed, type DeckSeed } from "./decks/build-host-website-seed";
 import { staticDecks } from "./decks/static";
 
@@ -92,6 +94,30 @@ async function ensureMainSet(pool: Pool): Promise<void> {
   );
 }
 
+// Seed the initial ADMIN user (Phase 4) from PRESENTER_USERNAME/PASSWORD so the
+// pre-accounts credential becomes a real DB-backed admin — the existing login
+// keeps working, now as an account. CHECK-FIRST (avoids paying scrypt on every
+// boot once seeded) with ON CONFLICT (email) DO NOTHING as the concurrent-boot
+// race backstop (two boots can't create two admins). Never re-hashes or clobbers
+// an existing row, so a later password change survives a redeploy. Uses the same
+// resolved dev defaults the old credential check used, so local dev still has a
+// working login. Runs after migrations (the users table exists).
+async function ensureAdminUser(pool: Pool): Promise<void> {
+  const username = process.env.PRESENTER_USERNAME || "presenter";
+  const password = process.env.PRESENTER_PASSWORD || "present";
+  const existing = await pool.query(`SELECT 1 FROM users WHERE lower(email) = lower($1)`, [
+    username,
+  ]);
+  if (existing.rows.length > 0) return; // already seeded — don't re-hash or clobber
+  const id = randomBytes(18).toString("base64url");
+  const hash = await hashPassword(password);
+  await pool.query(
+    `INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'admin')
+     ON CONFLICT (email) DO NOTHING`,
+    [id, username, hash],
+  );
+}
+
 /**
  * Run schema migrations (versioned, advisory-locked, forward-only — from
  * lib/migrations.ts) then seed initial rows, once per process. Resolves WITHOUT
@@ -113,6 +139,7 @@ export function ensureSchema(): Promise<void> {
         await seedDecks(pool); // DATA: idempotent insert-only per-slide seed
         await ensureDeckRows(pool); // DATA: a decks row for every registry deck
         await ensureMainSet(pool); // DATA: pick the initial main deck if none yet
+        await ensureAdminUser(pool); // DATA: seed the initial admin (Phase 4)
       } catch (err) {
         // Log once, then degrade: reads/writes will fall back on their own.
         console.error("[schema] ensureSchema failed — using static fallback:", err);

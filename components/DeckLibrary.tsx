@@ -34,6 +34,10 @@ export interface DeckCard {
   // are replaceable/deletable/previewable via this dashboard (registry decks
   // live in code). Undefined is treated as 'registry' — the pre-Phase-1 default.
   kind?: "registry" | "uploaded";
+  // Phase 4 — may the current session manage this deck; gates the owner-only
+  // overlays (edit notes, publish control, replace/delete). Undefined is treated
+  // as false.
+  canManage?: boolean;
 }
 
 // ---- publish-status control wiring ------------------------------------------
@@ -238,7 +242,7 @@ function SegIcon({ kind }: { kind: PublishStatus }) {
 // top-left sibling of a bento card's <Link> (never nested — nested anchors are
 // invalid HTML, same rule EditPill follows); `inline` mode sits under a search
 // result card. stopPropagation keeps a click from also triggering the card link.
-function PublishControl({ slug, variant = "overlay" }: { slug: string; variant?: "overlay" | "inline" }) {
+function PublishControl({ slug, isAdmin, variant = "overlay" }: { slug: string; isAdmin: boolean; variant?: "overlay" | "inline" }) {
   const ctx = usePublish();
   if (!ctx) return null;
   const status = ctx.statusOf(slug);
@@ -275,17 +279,27 @@ function PublishControl({ slug, variant = "overlay" }: { slug: string; variant?:
       >
         {PUBLISH_SEGMENTS.map((seg) => {
           const active = seg.key === status;
-          // Disable ONLY the Live segment for a non-embed deck, and only when it
-          // isn't already active (an existing bad 'main' stays shown as Live so it
-          // mirrors the DB). A disabled segment is left visible, not hidden, so the
-          // option still reads as real — just unavailable for this deck type.
-          const blocked = seg.key === "main" && !embeddable && !active;
+          // Disable the Live segment when it isn't already active (an existing bad
+          // 'main' stays shown as Live so it mirrors the DB). Two independent
+          // reasons block it: the deck type can't be shown on "/" (non-embed), OR
+          // the current session isn't an admin (only admins may feature on "/").
+          // A blocked segment is left visible, not hidden, so the option still
+          // reads as real — just unavailable here.
+          const blockedEmbed = seg.key === "main" && !embeddable && !active;
+          const blockedAdmin = seg.key === "main" && !isAdmin && !active;
+          const blocked = blockedEmbed || blockedAdmin;
           const disabled = saving || blocked;
           return (
             <button
               key={seg.key}
               type="button"
-              title={blocked ? "This deck type can't be shown on the home page ( / ) — only self-contained HTML decks can go Live." : seg.title}
+              title={
+                blockedEmbed
+                  ? "This deck type can't be shown on the home page ( / ) — only self-contained HTML decks can go Live."
+                  : blockedAdmin
+                    ? "Only an admin can feature a deck on the home page ( / )."
+                    : seg.title
+              }
               aria-label={seg.aria}
               aria-pressed={active}
               aria-disabled={blocked || undefined}
@@ -544,6 +558,14 @@ function BentoCard(props: {
   // Set only for uploaded (DB-backed) decks — drives the Replace/Delete/Preview
   // overlay. Registry/sample cards leave it undefined and show none of those.
   uploaded?: DeckCard;
+  // Phase 4 — may the current session manage this deck? Gates the interactive
+  // owner-only overlays (EditPill / PublishControl / UploadedActions). Note that
+  // `publishSlug` is still threaded even when this is false so the card's own
+  // hidden/desaturation styling reflects the live status; only the interactive
+  // controls are withheld.
+  canManage?: boolean;
+  // Admin-only "Live" segment gating — forwarded to PublishControl.
+  isAdmin?: boolean;
   gridColumn: string;
   gridRow: string;
   background: string;
@@ -551,7 +573,7 @@ function BentoCard(props: {
   radius?: number;
   children: React.ReactNode;
 }) {
-  const { href, editHref, publishSlug, uploaded, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+  const { href, editHref, publishSlug, uploaded, canManage, isAdmin, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
   const ctx = usePublish();
   const status = publishSlug && ctx ? ctx.statusOf(publishSlug) : "normal";
   const hidden = status === "unpublished";
@@ -585,16 +607,20 @@ function BentoCard(props: {
     <div style={{ gridColumn, gridRow, position: "relative" }}>
       {card}
       {hidden && <div aria-hidden style={hiddenOutlineStyle(radius)} />}
-      {editHref && <EditPill href={editHref} />}
-      {publishSlug && <PublishControl slug={publishSlug} />}
-      {uploaded && <UploadedActions deck={uploaded} />}
+      {/* Owner-only interactive overlays render ONLY when the session may manage
+          this deck. The `hidden`/desaturation styling above still tracks
+          `publishSlug` regardless, so a presenter viewing a non-manageable deck
+          sees its status but no controls. */}
+      {canManage && editHref && <EditPill href={editHref} />}
+      {canManage && publishSlug && <PublishControl slug={publishSlug} isAdmin={!!isAdmin} />}
+      {canManage && uploaded && <UploadedActions deck={uploaded} />}
     </div>
   );
 }
 
 // ---- main -------------------------------------------------------------------
 
-export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
+export function DeckLibrary({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: boolean }) {
   const router = useRouter();
   const [q, setQ] = useState("");
   const [name, setName] = useState<string | null>(null);
@@ -926,6 +952,32 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
                 <rect x="11" y="11" width="6" height="6" rx="1.6" />
               </svg>
             </div>
+            {/* Admin-only entry to the invitations manager. Styled identically to
+                the logout button so the rail reads as one control column. */}
+            {isAdmin && (
+              <Link
+                href="/dashboard/invites"
+                title="Invitations"
+                aria-label="Invitations"
+                style={{
+                  width: 52,
+                  height: 52,
+                  borderRadius: 16,
+                  background: "rgba(255,255,255,0.4)",
+                  border: "1px solid rgba(255,255,255,0.6)",
+                  backdropFilter: "blur(10px)",
+                  WebkitBackdropFilter: "blur(10px)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#7B7B83" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <path d="M3 7l9 6 9-6" />
+                </svg>
+              </Link>
+            )}
             <button
               type="button"
               onClick={logout}
@@ -957,11 +1009,11 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
           {/* content column */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 18 }}>
             {searching ? (
-              <SearchResults results={filtered} query={q} />
+              <SearchResults results={filtered} query={q} isAdmin={isAdmin} />
             ) : (
               <div style={{ display: "grid", gridTemplateColumns: "minmax(0,0.92fr) minmax(0,1.5fr)", gap: 22, alignItems: "stretch" }}>
                 <Hero name={name} deckWord={numberWord(cardCount)} totalSlides={totalSlides} resume={resume} />
-                <Bento decks={decks} />
+                <Bento decks={decks} isAdmin={isAdmin} />
               </div>
             )}
           </div>
@@ -1146,7 +1198,7 @@ function ResumeStrip({ resume }: { resume?: DeckCard }) {
 
 // ---- bento ------------------------------------------------------------------
 
-function Bento({ decks }: { decks: DeckCard[] }) {
+function Bento({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: boolean }) {
   // Fill the five deck slots newest-first with real decks, then sample decks so
   // the grid always reads as full. items[0]=featured, [1]=wide, [2]=tall,
   // [3]=small, [4]=wide.
@@ -1157,11 +1209,11 @@ function Bento({ decks }: { decks: DeckCard[] }) {
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gridTemplateRows: "repeat(3,158px)", gap: 14 }}>
-      {c0 && <FeaturedCard item={c0} />}
-      {c1 && <WideGreenCard item={c1} />}
-      {c2 && <TallGoldCard item={c2} />}
-      {c3 && <SmallCoralCard item={c3} />}
-      {c4 && <WideLimeCard item={c4} />}
+      {c0 && <FeaturedCard item={c0} isAdmin={isAdmin} />}
+      {c1 && <WideGreenCard item={c1} isAdmin={isAdmin} />}
+      {c2 && <TallGoldCard item={c2} isAdmin={isAdmin} />}
+      {c3 && <SmallCoralCard item={c3} isAdmin={isAdmin} />}
+      {c4 && <WideLimeCard item={c4} isAdmin={isAdmin} />}
       <NewDeckCard />
     </div>
   );
@@ -1189,6 +1241,11 @@ function uploadedOf(i: Item): DeckCard | undefined {
   const d = i as DeckCard;
   return d.kind === "uploaded" ? d : undefined;
 }
+// Phase 4 — may the current session manage this item? Only real decks flagged
+// canManage qualify; sample/decorative cards are never manageable.
+function canManageOf(i: Item): boolean {
+  return !isSample(i) && (i as DeckCard).canManage === true;
+}
 function shortDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return "";
@@ -1211,13 +1268,15 @@ function CardTopRow({ label, arrowSize = 16 }: { label: string; arrowSize?: numb
   );
 }
 
-function FeaturedCard({ item }: { item: Item }) {
+function FeaturedCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
   return (
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
       uploaded={uploadedOf(item)}
+      canManage={canManageOf(item)}
+      isAdmin={isAdmin}
       gridColumn="span 2"
       gridRow="span 2"
       radius={24}
@@ -1242,13 +1301,15 @@ function FeaturedCard({ item }: { item: Item }) {
   );
 }
 
-function WideGreenCard({ item }: { item: Item }) {
+function WideGreenCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
   return (
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
       uploaded={uploadedOf(item)}
+      canManage={canManageOf(item)}
+      isAdmin={isAdmin}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 18% 20%, #B7CE9E 0%, transparent 55%),radial-gradient(110% 130% at 88% 85%, #9DBE93 0%, transparent 55%),radial-gradient(120% 120% at 60% 0%, #C9D5A3 0%, transparent 50%),linear-gradient(160deg,#A8C291,#93B488)"
@@ -1265,13 +1326,15 @@ function WideGreenCard({ item }: { item: Item }) {
   );
 }
 
-function TallGoldCard({ item }: { item: Item }) {
+function TallGoldCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
   return (
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
       uploaded={uploadedOf(item)}
+      canManage={canManageOf(item)}
+      isAdmin={isAdmin}
       gridColumn="span 1"
       gridRow="span 2"
       background="radial-gradient(100% 110% at 22% 14%, #D8C57E 0%, transparent 55%),radial-gradient(120% 120% at 82% 88%, #A8B87E 0%, transparent 55%),linear-gradient(160deg,#C9B873,#B4B47C)"
@@ -1292,13 +1355,15 @@ function TallGoldCard({ item }: { item: Item }) {
   );
 }
 
-function SmallCoralCard({ item }: { item: Item }) {
+function SmallCoralCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
   return (
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
       uploaded={uploadedOf(item)}
+      canManage={canManageOf(item)}
+      isAdmin={isAdmin}
       gridColumn="span 1"
       gridRow="span 1"
       background="radial-gradient(100% 120% at 18% 12%, #E9A07C 0%, transparent 55%),radial-gradient(120% 120% at 92% 96%, #93A8C6 0%, transparent 60%),linear-gradient(150deg,#E0A487,#A6A9C0)"
@@ -1313,13 +1378,15 @@ function SmallCoralCard({ item }: { item: Item }) {
   );
 }
 
-function WideLimeCard({ item }: { item: Item }) {
+function WideLimeCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
   return (
     <BentoCard
       href={hrefOf(item)}
       editHref={editHrefOf(item)}
       publishSlug={slugOf(item)}
       uploaded={uploadedOf(item)}
+      canManage={canManageOf(item)}
+      isAdmin={isAdmin}
       gridColumn="span 2"
       gridRow="span 1"
       background="radial-gradient(90% 130% at 16% 18%, #C6D88A 0%, transparent 55%),radial-gradient(120% 130% at 86% 84%, #9BC07E 0%, transparent 55%),linear-gradient(150deg,#AEC97F,#BBD06E)"
@@ -2030,7 +2097,7 @@ function BootCheck({ slug }: { slug: string }) {
 
 // ---- search results ---------------------------------------------------------
 
-function SearchResults({ results, query }: { results: DeckCard[]; query: string }) {
+function SearchResults({ results, query, isAdmin }: { results: DeckCard[]; query: string; isAdmin: boolean }) {
   return (
     <div>
       <div style={{ fontSize: 13, fontWeight: 500, letterSpacing: "0.14em", textTransform: "uppercase", color: "#9A958A", margin: "2px 0 16px" }}>
@@ -2041,7 +2108,7 @@ function SearchResults({ results, query }: { results: DeckCard[]; query: string 
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
           {results.map((d) => (
-            <SearchResultCard key={d.slug} d={d} />
+            <SearchResultCard key={d.slug} d={d} isAdmin={isAdmin} />
           ))}
         </div>
       )}
@@ -2049,8 +2116,12 @@ function SearchResults({ results, query }: { results: DeckCard[]; query: string 
   );
 }
 
-function SearchResultCard({ d }: { d: DeckCard }) {
+function SearchResultCard({ d, isAdmin }: { d: DeckCard; isAdmin: boolean }) {
   const ctx = usePublish();
+  // Phase 4 — the owner-only overlays (publish control, replace/delete) render
+  // only when this session may manage the deck. The card's hidden styling still
+  // tracks the live status regardless.
+  const canManage = d.canManage === true;
   const status = ctx ? ctx.statusOf(d.slug) : d.publishStatus;
   const hidden = status === "unpublished";
   return (
@@ -2086,8 +2157,8 @@ function SearchResultCard({ d }: { d: DeckCard }) {
         <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em" }}>{d.title}</div>
         {d.description && <div style={{ fontSize: 14, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62" }}>{d.description}</div>}
       </Link>
-      <PublishControl slug={d.slug} variant="inline" />
-      {d.kind === "uploaded" && <UploadedActions deck={d} variant="inline" />}
+      {canManage && <PublishControl slug={d.slug} isAdmin={isAdmin} variant="inline" />}
+      {canManage && d.kind === "uploaded" && <UploadedActions deck={d} variant="inline" />}
     </div>
   );
 }

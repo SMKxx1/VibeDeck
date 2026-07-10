@@ -2,7 +2,8 @@ import { cookies } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import type { Metadata } from "next";
 import { getDeck } from "@/lib/decks";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { checkDeckManage } from "@/lib/deck-authz";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides } from "@/lib/slides-store";
 import { SlideMetaEditor } from "@/components/SlideMetaEditor";
@@ -27,7 +28,8 @@ export default async function EditDeckPage({
   params: Promise<{ slug: string }>;
 }) {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  if (!verifySessionToken(token)) redirect("/login");
+  const session = getSession(token);
+  if (!session) redirect("/login");
 
   const { slug } = await params;
   const deck = await getDeck(slug);
@@ -37,6 +39,19 @@ export default async function EditDeckPage({
   // the editor still renders (read-only) with a clear "database unavailable"
   // banner. Probe reachability, not just config, so a real outage is visible.
   const dbAvailable = await isDbReachable();
+
+  // Ownership gate (Phase 4): this editor SAVES grounding, and saving is owner-only
+  // (the PUT /api/admin/slides route enforces canManageDeck). So refuse to even
+  // open the editor for a deck this session can't manage — a presenter aiming at a
+  // registry deck or a peer's deck gets a 404, matching the API's non-leak stance,
+  // rather than a form whose Save silently 404s. Gate only when the DB is up: with
+  // no DB, ownership is unknowable and only registry decks resolve at all (their
+  // grounding is presenter-readable per S2), so fall through to the read-only
+  // degraded view the banner already covers.
+  if (dbAvailable) {
+    const perm = await checkDeckManage(session, slug);
+    if (!perm.ok) notFound();
+  }
   const slides = dbAvailable ? await getDeckSlides(slug) : [];
 
   return (

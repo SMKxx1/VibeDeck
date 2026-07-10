@@ -121,9 +121,51 @@ const migration003: Migration = {
   },
 };
 
+// 004_accounts: multi-user accounts (Phase 4) — users, invites, and per-deck
+// ownership. Schema-only. `decks.owner_id` is NULLABLE and backfills every
+// existing row to NULL with zero writes: a NULL owner means a registry/system
+// deck, which only an admin manages (uploaded decks get their creator's id going
+// forward). ON DELETE SET NULL so removing a user orphans their decks to the
+// admin-managed pool rather than cascading a delete. password_hash stores a
+// self-describing scrypt string (see lib/users.ts).
+const migration004: Migration = {
+  id: "004_accounts",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id            TEXT PRIMARY KEY,
+        email         TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'presenter' CHECK (role IN ('admin','presenter')),
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS invites (
+        token       TEXT PRIMARY KEY,
+        email       TEXT,
+        role        TEXT NOT NULL DEFAULT 'presenter' CHECK (role IN ('admin','presenter')),
+        created_by  TEXT REFERENCES users(id) ON DELETE SET NULL,
+        used_by     TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires_at  TIMESTAMPTZ NOT NULL
+      )
+    `);
+    // ADD COLUMN IF NOT EXISTS (not a bare ADD COLUMN): the runner records a
+    // migration only AFTER up() succeeds and does NOT wrap up() in a transaction,
+    // so if this ALTER succeeds but the follow-up INSERT into schema_migrations
+    // fails transiently, the next boot re-runs 004 — a bare ADD COLUMN would then
+    // die on "column already exists" and wedge boot permanently. IF NOT EXISTS
+    // makes the whole migration safely re-runnable (the CREATE TABLEs already are).
+    await client.query(
+      `ALTER TABLE decks ADD COLUMN IF NOT EXISTS owner_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
+    );
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
-export const MIGRATIONS: Migration[] = [migration001, migration002, migration003];
+export const MIGRATIONS: Migration[] = [migration001, migration002, migration003, migration004];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
 // must run every boot before we can consult it. Safe to re-run. `checksum` is
