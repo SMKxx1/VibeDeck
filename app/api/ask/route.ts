@@ -2,7 +2,14 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { getDeck } from "@/lib/decks";
 import { deckToText, slideToText } from "@/lib/deckUtils";
-import { checkRateLimit, recordTokens } from "@/lib/kv";
+import {
+  checkRateLimit,
+  recordTokens,
+  checkTokenBudget,
+  recordBudgetTokens,
+  getExplainCache,
+  setExplainCache,
+} from "@/lib/kv";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable } from "@/lib/publish-store";
 import {
@@ -22,6 +29,17 @@ export const runtime = "nodejs";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
+// "Explain differently" chips (#10): fixed reframe instructions. Each REPLACES the
+// viewer's free-text question and is grounded on the current slide like any other
+// question, then cached per (slug, slide, mode) so the whole room reuses it.
+const EXPLAIN_PROMPTS = {
+  eli5: "Explain what this slide is teaching as simply as you possibly can — as if to a curious beginner with no background. Use plain words and, if it helps, one everyday example.",
+  analogy: "Explain the core idea on this slide using a single concrete, everyday analogy that makes it click.",
+  example: "Walk through one short, concrete worked example that illustrates what this slide is teaching.",
+  deeper: "Go one level deeper on this slide — the reasoning behind it, an important nuance, or how it connects to the bigger picture — while staying accurate to the material shown.",
+} as const;
+type ExplainMode = keyof typeof EXPLAIN_PROMPTS;
+
 interface AskBody {
   name?: string;
   question?: string;
@@ -30,6 +48,8 @@ interface AskBody {
   slideLabel?: string;
   password?: string;
   history?: { role?: string; content?: string }[];
+  stream?: boolean; // #9: opt into token-by-token SSE (LiveChat sets this)
+  explain?: string; // #10: a fixed reframe mode (eli5|analogy|example|deeper)
 }
 
 interface Citation {
@@ -60,9 +80,22 @@ export async function POST(req: Request) {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 40) || "anonymous";
-  const question = (body.question ?? "").toString().trim();
   const slug = (body.slug ?? "").toString();
-  const slideIndex = Number.isFinite(body.slideIndex) ? Number(body.slideIndex) : 0;
+  // Floor + clamp so a fractional/negative index can never index deck.slides at a
+  // non-integer key (which would throw a 500 for a registry Slide[] deck).
+  const slideIndex = Number.isFinite(body.slideIndex)
+    ? Math.max(0, Math.floor(Number(body.slideIndex)))
+    : 0;
+
+  // Reframe chip (#10): a valid `explain` mode REPLACES the free-text question with
+  // a canned instruction and takes the cached, non-streamed fast path below.
+  const explainMode: ExplainMode | null =
+    typeof body.explain === "string" && body.explain in EXPLAIN_PROMPTS
+      ? (body.explain as ExplainMode)
+      : null;
+  const question = explainMode
+    ? EXPLAIN_PROMPTS[explainMode]
+    : (body.question ?? "").toString().trim();
 
   if (!question) return NextResponse.json({ error: "empty_question" }, { status: 400 });
   if (question.length > 2000) return NextResponse.json({ error: "too_long" }, { status: 400 });
@@ -103,6 +136,24 @@ export async function POST(req: Request) {
   const rl = await checkRateLimit(name);
   if (!rl.allowed) {
     return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
+  }
+  // Explain-mode fast path (#10): a room-shared cached reframe returns instantly
+  // and spends no tokens/budget. Checked AFTER the publish gate + rate limit (so a
+  // hidden deck can't be probed via cache) but BEFORE the budget gate (a cached
+  // answer costs nothing and must never be blocked by the daily cap).
+  const explainKey = explainMode ? `${slug}:${slideIndex}:${explainMode}` : "";
+  if (explainMode) {
+    const cached = await getExplainCache(explainKey);
+    if (cached) {
+      return NextResponse.json({ answer: cached, citations: [], tokens: 0, cached: true });
+    }
+  }
+  // Global daily platform-key budget — a runaway/abuse guardrail set high enough
+  // that normal classroom use never reaches it. Degrades to a 429 the chat shows
+  // as a friendly "at capacity" note rather than a hard failure.
+  const budget = await checkTokenBudget();
+  if (!budget.allowed) {
+    return NextResponse.json({ error: "ai_budget_exceeded" }, { status: 429 });
   }
 
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -188,6 +239,9 @@ export async function POST(req: Request) {
     question,
   ].join("\n");
 
+  // Explain reframes take the cached non-stream path even if the client set stream.
+  const wantStream = body.stream === true && !explainMode;
+
   const payload: Record<string, unknown> = {
     model,
     messages: [
@@ -207,11 +261,22 @@ export async function POST(req: Request) {
     reasoning: { effort: "medium" },
   };
   if (webOn) payload.plugins = [{ id: "web", max_results: webMax }];
+  // #9: stream tokens back when the client opts in (LiveChat sets stream:true).
+  // The grounding assembly above is byte-identical either way — only the response
+  // handling below branches. Legacy callers that omit `stream` still get JSON.
+  if (wantStream) {
+    payload.stream = true;
+    // Without this, OpenRouter (OpenAI-compatible) emits NO usage chunk in stream
+    // mode, so our server-side token total would stay 0 and the budget + privacy-
+    // safe accounting would silently under-count. This makes the final SSE chunk
+    // carry `usage`.
+    payload.stream_options = { include_usage: true };
+  }
 
-  // Bound the upstream call. Web search can be slow, but a chat answer that
-  // takes too long is worse than a clean "try again", so cap it at 45s.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
+  // Bound the upstream call at 45s (a stalled answer is worse than a clean retry).
+  // Renamed to `ac` so it doesn't shadow the ReadableStream controller below.
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), 45_000);
 
   const callOpenRouter = (p: Record<string, unknown>) =>
     fetch(OPENROUTER_URL, {
@@ -223,7 +288,7 @@ export async function POST(req: Request) {
         "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Class Presentation App",
       },
       body: JSON.stringify(p),
-      signal: controller.signal,
+      signal: ac.signal,
     });
 
   try {
@@ -231,19 +296,23 @@ export async function POST(req: Request) {
 
     // Not every model lets you turn reasoning off — some hybrids make it
     // mandatory and reject `reasoning:{enabled:false}` with a 400. Rather than
-    // fail the whole request, retry once without the reasoning field.
+    // fail the whole request, retry once without the reasoning field. This MUST
+    // happen before we start streaming (an error is a normal JSON body, not a
+    // stream), which is exactly why the streaming path can't be a raw passthrough.
     if (orRes.status === 400 && payload.reasoning) {
       const detail = await orRes.text().catch(() => "");
       if (/reasoning/i.test(detail)) {
         delete payload.reasoning;
         orRes = await callOpenRouter(payload);
       } else {
+        clearTimeout(timeout);
         console.error(`[ask] OpenRouter 400:`, detail.slice(0, 300));
         return NextResponse.json({ error: "upstream_error" }, { status: 502 });
       }
     }
 
     if (!orRes.ok) {
+      clearTimeout(timeout);
       // Log the upstream status + a short reason to make failures debuggable.
       // This carries no prompt or answer, so it respects the privacy rule.
       const detail = await orRes.text().catch(() => "");
@@ -251,6 +320,129 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "upstream_error" }, { status: 502 });
     }
 
+    // ---- STREAMING path (#9). We consume the upstream SSE SERVER-SIDE (never a
+    // raw passthrough) so we still capture the usage total for token accounting +
+    // the daily budget — the client can't do that, and the privacy rule means the
+    // server is the only place a token COUNT may be recorded. We re-emit a small
+    // clean protocol: `{t:"d",c}` content deltas, then a final `{t:"done"}` with
+    // deduped citations + the token count (or `{t:"error"}` on a mid-stream fault).
+    if (wantStream) {
+      if (!orRes.body) {
+        clearTimeout(timeout);
+        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
+      }
+      const upstreamBody = orRes.body;
+      const stream = new ReadableStream<Uint8Array>({
+        async start(sink) {
+          const enc = new TextEncoder();
+          const dec = new TextDecoder();
+          const reader = upstreamBody.getReader();
+          const push = (obj: unknown) => sink.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+          let buf = "";
+          let tokens = 0;
+          let failed = false;
+          const cites: Citation[] = [];
+          try {
+            outer: for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += dec.decode(value, { stream: true });
+              let nl: number;
+              while ((nl = buf.indexOf("\n")) !== -1) {
+                const line = buf.slice(0, nl).trim();
+                buf = buf.slice(nl + 1);
+                if (!line || line.startsWith(":") || !line.startsWith("data:")) continue;
+                const raw = line.slice(5).trim();
+                if (raw === "[DONE]") continue;
+                try {
+                  const j = JSON.parse(raw) as {
+                    error?: unknown;
+                    choices?: {
+                      delta?: {
+                        content?: string;
+                        annotations?: { type?: string; url_citation?: { url?: string; title?: string } }[];
+                      };
+                      message?: {
+                        annotations?: { type?: string; url_citation?: { url?: string; title?: string } }[];
+                      };
+                    }[];
+                    usage?: { total_tokens?: number };
+                  };
+                  // OpenRouter can report a mid-stream failure as an IN-BAND data
+                  // frame rather than closing the socket. Treat it as an error so a
+                  // truncated answer is never finalized as if it were complete.
+                  if (j.error) {
+                    failed = true;
+                    break outer;
+                  }
+                  const choice = j.choices?.[0];
+                  const content = choice?.delta?.content;
+                  if (typeof content === "string" && content) push({ t: "d", c: content });
+                  const anns = choice?.delta?.annotations ?? choice?.message?.annotations;
+                  if (Array.isArray(anns)) {
+                    for (const a of anns) {
+                      if (a?.type === "url_citation" && a.url_citation?.url) {
+                        cites.push({ url: a.url_citation.url, title: a.url_citation.title });
+                      }
+                    }
+                  }
+                  if (j.usage?.total_tokens) tokens = Number(j.usage.total_tokens);
+                } catch {
+                  /* skip an unparseable SSE line */
+                }
+              }
+            }
+          } catch {
+            // Socket dropped / aborted mid-answer.
+            failed = true;
+          } finally {
+            clearTimeout(timeout);
+            const seen = new Set<string>();
+            const uniq = cites
+              .filter((c) => c.url && !seen.has(c.url) && (seen.add(c.url), true))
+              .slice(0, 5);
+            try {
+              await recordTokens(name, tokens); // PRIVACY: only { name, timestamp, count }
+              await recordBudgetTokens(tokens);
+            } catch {
+              /* best-effort accounting — never block the stream close */
+            }
+            // Emit error XOR done — NEVER a `done` after an `error`, or a client
+            // that treats `done` as "complete" would show a truncated answer.
+            try {
+              push(failed ? { t: "error" } : { t: "done", citations: uniq, tokens });
+            } catch {
+              /* sink already closed (client disconnected) */
+            }
+            try {
+              sink.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        },
+        cancel() {
+          // The viewer closed the tab mid-answer — stop burning upstream tokens.
+          try {
+            ac.abort();
+          } catch {
+            /* ignore */
+          }
+          clearTimeout(timeout);
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Accel-Buffering": "no",
+        },
+      });
+    }
+
+    // ---- NON-STREAMING path (unchanged behavior; the default for any caller that
+    // doesn't opt into streaming, so nothing breaks before LiveChat is updated). ----
     const data = (await orRes.json()) as {
       choices?: {
         message?: {
@@ -273,14 +465,17 @@ export async function POST(req: Request) {
 
     const tokens = Number(data.usage?.total_tokens ?? 0);
     await recordTokens(name, tokens); // PRIVACY: only { name, timestamp, count }
+    await recordBudgetTokens(tokens);
+    // Cache a reframe so the rest of the room reuses it for free (#10).
+    if (explainMode) await setExplainCache(explainKey, answer);
 
+    clearTimeout(timeout);
     return NextResponse.json({ answer, citations, tokens });
   } catch (err) {
+    clearTimeout(timeout);
     if (err instanceof Error && err.name === "AbortError") {
       return NextResponse.json({ error: "timeout" }, { status: 504 });
     }
     return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
   }
 }

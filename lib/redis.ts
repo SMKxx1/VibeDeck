@@ -16,6 +16,7 @@ export type RedisClient = {
   ltrim: (key: string, start: number, stop: number) => Promise<unknown>;
   zincrby: (key: string, increment: number, member: string) => Promise<unknown>;
   incr: (key: string) => Promise<number>;
+  incrby: (key: string, increment: number) => Promise<number>;
   expire: (key: string, seconds: number) => Promise<unknown>;
 };
 
@@ -68,6 +69,7 @@ export function getRedis(): Promise<RedisClient | null> {
           zincrby: (key: string, increment: number, member: string) =>
             client.zincrby(key, increment, member),
           incr: (key: string) => client.incr(key),
+          incrby: (key: string, increment: number) => client.incrby(key, increment),
           expire: (key: string, seconds: number) => client.expire(key, seconds),
         };
         return wrapped;
