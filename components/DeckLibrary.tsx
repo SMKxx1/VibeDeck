@@ -186,6 +186,29 @@ function statusLineStyle(overlay: boolean, isError: boolean): React.CSSPropertie
   };
 }
 
+// A block-level notice inside the upload panel. The validator issue list, the
+// success warnings note, and every boot-check status all share this one shape so
+// the panel reads as a single system. The "error" tone is byte-for-byte the
+// panel's existing inline error box (see UploadPanel) — this just parameterises
+// its colour by tone so ok/warn/muted variants can sit beside it without
+// inventing a second visual language.
+function noticeStyle(tone: "error" | "warn" | "ok" | "muted"): React.CSSProperties {
+  const palette = {
+    error: { color: "#C23B27", background: "rgba(194,59,39,0.08)" },
+    warn: { color: "#9A6A00", background: "rgba(180,120,0,0.10)" },
+    ok: { color: "#2E8B5B", background: "rgba(46,139,91,0.10)" }, // the runtime's own pinboard-success green
+    muted: { color: "#6E6A62", background: "rgba(40,38,32,0.05)" },
+  }[tone];
+  return {
+    fontSize: 13,
+    fontWeight: 500,
+    lineHeight: 1.5,
+    borderRadius: 10,
+    padding: "8px 12px",
+    ...palette,
+  };
+}
+
 function SegIcon({ kind }: { kind: PublishStatus }) {
   if (kind === "main") {
     return (
@@ -744,6 +767,39 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {/* Discoverable entry to the "Build a deck with AI" guide (/build) —
+                the copy-paste author prompt + pre-upload self-check. A labelled
+                frosted pill matching the search box so it reads as first-class
+                navigation, not decoration. */}
+            <Link
+              href="/build"
+              className="lm-build"
+              title="Get the AI prompt and a pre-upload checklist"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                height: 44,
+                padding: "0 15px",
+                borderRadius: 14,
+                textDecoration: "none",
+                color: "#4A4750",
+                fontSize: 13.5,
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                background: "rgba(255,255,255,0.5)",
+                border: "1px solid rgba(255,255,255,0.7)",
+                backdropFilter: "blur(14px)",
+                WebkitBackdropFilter: "blur(14px)",
+                boxShadow: "0 6px 18px -12px rgba(60,55,45,0.35)",
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#8A857C" strokeWidth={1.3} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M8 1.5l1.4 3.6L13 6.5l-3.6 1.4L8 11.5 6.6 7.9 3 6.5l3.6-1.4z" />
+                <path d="M12.5 10.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" />
+              </svg>
+              Build with AI
+            </Link>
             <div
               style={{
                 display: "flex",
@@ -881,6 +937,7 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
 
       <style>{`
         .lm-card:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(60,55,45,0.55) !important; }
+        .lm-build:hover { background: rgba(255,255,255,0.66) !important; }
         .lm-new:hover { background: rgba(255,255,255,0.6) !important; }
         .lm-edit:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
         .lm-pub-seg-o:hover { background: rgba(255,255,255,0.16) !important; }
@@ -1464,19 +1521,41 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
   const [date, setDate] = useState("");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [html, setHtml] = useState("");
-  const [status, setStatus] = useState<"idle" | "saving">("idle");
+  // idle → saving → done. "done" holds the panel open on a result view AFTER a
+  // successful store so the boot check can run and warnings can show; the panel
+  // no longer auto-closes on success (see submit / dismiss).
+  const [status, setStatus] = useState<"idle" | "saving" | "done">("idle");
   const [error, setError] = useState<string | null>(null);
+  // The validator's 422 invalid_deck issues — the "here's exactly what to fix"
+  // list, the primary Phase-2 feedback loop. Kept apart from `error` (a one-line
+  // generic failure) so each renders with the right shape.
+  const [issues, setIssues] = useState<string[]>([]);
+  // Non-blocking warnings returned alongside a SUCCESSFUL store (201/200).
+  const [warnings, setWarnings] = useState<string[]>([]);
+  // The slug the store actually landed on — POST auto-derives it from the title,
+  // so we read it back from the response to point the boot check at the right deck.
+  const [resultSlug, setResultSlug] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // One close path for every dismissal (backdrop, Esc, ✕, Cancel/Done). Never
+  // mid-save. Once the deck is stored ("done"), a close MUST refresh the grid so
+  // the new/updated card appears — route through onDone; before that a plain
+  // onClose (nothing changed server-side yet, so no refresh needed).
+  const dismiss = useCallback(() => {
+    if (status === "saving") return;
+    if (status === "done") onDone();
+    else onClose();
+  }, [status, onClose, onDone]);
 
   // Esc closes, matching the backdrop click — but never mid-save (a close would
   // strand an in-flight request the presenter can't see the result of).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape" && status !== "saving") onClose();
+      if (e.key === "Escape") dismiss();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [status, onClose]);
+  }, [dismiss]);
 
   function pickFile(file: File | undefined) {
     if (!file) return;
@@ -1491,6 +1570,7 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
 
   async function submit() {
     setError(null);
+    setIssues([]);
     if (!title.trim() || !html.trim()) {
       setError("Title and HTML are both required.");
       return;
@@ -1516,12 +1596,31 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
               ...(description.trim() ? { description: description.trim() } : {}),
             }),
           });
+      // POST(201) and PUT(200) both return { slug, warnings }; both reject non-
+      // conformance with 422 { error:"invalid_deck", issues, warnings }. Parse
+      // once and branch on ok so the create/replace paths share this handler.
+      const data = (await res.json().catch(() => ({}))) as {
+        slug?: string;
+        warnings?: string[];
+        issues?: string[];
+        error?: string;
+      };
       if (res.ok) {
-        onDone();
+        // Stored. DON'T close yet — switch to the result view so the boot check
+        // can run and any warnings show; the presenter dismisses it (→ refresh).
+        setResultSlug(data.slug ?? (replacing ? existing!.slug : null));
+        setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+        setStatus("done");
         return;
       }
-      const data = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(adminErrorMessage(res.status, data.error));
+      // 422 invalid_deck is the Phase-2 contract's primary feedback: surface the
+      // structural issues verbatim (leading over the generic line) so the
+      // presenter knows exactly what to fix, then drop back to idle to retry.
+      if (res.status === 422 && Array.isArray(data.issues) && data.issues.length > 0) {
+        setIssues(data.issues);
+      } else {
+        setError(adminErrorMessage(res.status, data.error));
+      }
       setStatus("idle");
     } catch {
       setError("Network error — try again.");
@@ -1530,6 +1629,7 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
   }
 
   const saving = status === "saving";
+  const done = status === "done";
   const label: React.CSSProperties = { fontSize: 11, fontWeight: 500, letterSpacing: "0.1em", textTransform: "uppercase", color: "#9A958A" };
   const field: React.CSSProperties = {
     width: "100%",
@@ -1550,7 +1650,7 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
       role="dialog"
       aria-modal="true"
       aria-label={replacing ? "Replace deck" : "Upload a new deck"}
-      onClick={() => !saving && onClose()}
+      onClick={dismiss}
       style={{
         position: "fixed",
         inset: 0,
@@ -1582,11 +1682,11 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em", color: "#262229" }}>
-            {replacing ? "Replace deck content" : "Upload a deck"}
+            {done ? (replacing ? "Deck replaced" : "Deck uploaded") : replacing ? "Replace deck content" : "Upload a deck"}
           </div>
           <button
             type="button"
-            onClick={() => !saving && onClose()}
+            onClick={dismiss}
             aria-label="Close"
             style={{ width: 32, height: 32, borderRadius: 10, border: "1px solid rgba(60,55,45,0.14)", background: "rgba(255,255,255,0.6)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
           >
@@ -1596,85 +1696,301 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
           </button>
         </div>
 
-        {replacing && (
-          <div style={{ fontSize: 13, lineHeight: 1.5, color: "#6E6A62" }}>
-            Replacing <strong style={{ color: "#2C2932" }}>{existing!.title}</strong> swaps its HTML only — its
-            publish status and link (<code>/d/{existing!.slug}</code>) stay exactly as they are.
-          </div>
-        )}
+        {done ? (
+          // RESULT VIEW — the deck is already stored; confirm it, surface any
+          // non-blocking warnings, and run the live boot check. The presenter
+          // dismisses via Done / ✕ / Esc / backdrop (all → dismiss → refresh).
+          <>
+            <div style={noticeStyle("ok")}>
+              {replacing
+                ? "Content replaced — the deck's link and publish status are unchanged."
+                : "Saved as a hidden deck — set it Public or Live from its card when you're ready."}
+            </div>
+            {warnings.length > 0 && (
+              <div style={noticeStyle("warn")}>
+                <div style={{ marginBottom: 4 }}>{replacing ? "Replaced. Note:" : "Uploaded. Note:"}</div>
+                <ul style={{ margin: 0, paddingLeft: 18, fontWeight: 400 }}>
+                  {warnings.map((w, i) => (
+                    <li key={i} style={{ marginTop: 2 }}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {resultSlug && <BootCheck slug={resultSlug} />}
+          </>
+        ) : (
+          <>
+            {replacing && (
+              <div style={{ fontSize: 13, lineHeight: 1.5, color: "#6E6A62" }}>
+                Replacing <strong style={{ color: "#2C2932" }}>{existing!.title}</strong> swaps its HTML only — its
+                publish status and link (<code>/d/{existing!.slug}</code>) stay exactly as they are.
+              </div>
+            )}
 
-        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={label}>Title</span>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Deck title" style={field} autoFocus />
-        </label>
-
-        {!replacing && (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
             <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={label}>Slug (optional)</span>
-              <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="auto from title" style={field} />
+              <span style={label}>Title</span>
+              <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Deck title" style={field} autoFocus />
             </label>
+
+            {!replacing && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={label}>Slug (optional)</span>
+                  <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="auto from title" style={field} />
+                </label>
+                <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={label}>Date (optional)</span>
+                  <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={field} />
+                </label>
+              </div>
+            )}
+
+            {!replacing && (
+              <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <span style={label}>Description (optional)</span>
+                <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="One-line summary" style={field} />
+              </label>
+            )}
+
             <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={label}>Date (optional)</span>
-              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={field} />
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={label}>HTML{replacing ? " (new content)" : ""}</span>
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  style={{ fontFamily: "inherit", fontSize: 11.5, fontWeight: 500, color: "#4A4750", background: "rgba(255,255,255,0.7)", border: "1px solid rgba(60,55,45,0.14)", borderRadius: 8, padding: "4px 9px", cursor: "pointer" }}
+                >
+                  Choose .html file
+                </button>
+                <input ref={fileRef} type="file" accept=".html,.htm,text/html" onChange={(e) => pickFile(e.target.files?.[0])} style={{ display: "none" }} />
+              </div>
+              <textarea
+                value={html}
+                onChange={(e) => setHtml(e.target.value)}
+                placeholder="<!doctype html> … paste a self-contained HTML deck"
+                spellCheck={false}
+                style={{ ...field, height: 200, padding: 12, resize: "vertical", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, lineHeight: 1.5 }}
+              />
             </label>
-          </div>
-        )}
 
-        {!replacing && (
-          <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <span style={label}>Description (optional)</span>
-            <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="One-line summary" style={field} />
-          </label>
-        )}
+            {/* The validator's structural rejection (422) — the primary Phase-2
+                feedback loop. Lead with the exact fix list; the generic one-liner
+                below only shows for the OTHER failure modes (auth/slug/size/…). */}
+            {issues.length > 0 && (
+              <div style={noticeStyle("error")}>
+                <div style={{ marginBottom: 4 }}>This deck can't be used yet:</div>
+                <ul style={{ margin: 0, paddingLeft: 18, fontWeight: 400 }}>
+                  {issues.map((it, i) => (
+                    <li key={i} style={{ marginTop: 2 }}>{it}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
-        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <span style={label}>HTML{replacing ? " (new content)" : ""}</span>
-            <button
-              type="button"
-              onClick={() => fileRef.current?.click()}
-              style={{ fontFamily: "inherit", fontSize: 11.5, fontWeight: 500, color: "#4A4750", background: "rgba(255,255,255,0.7)", border: "1px solid rgba(60,55,45,0.14)", borderRadius: 8, padding: "4px 9px", cursor: "pointer" }}
-            >
-              Choose .html file
-            </button>
-            <input ref={fileRef} type="file" accept=".html,.htm,text/html" onChange={(e) => pickFile(e.target.files?.[0])} style={{ display: "none" }} />
-          </div>
-          <textarea
-            value={html}
-            onChange={(e) => setHtml(e.target.value)}
-            placeholder="<!doctype html> … paste a self-contained HTML deck"
-            spellCheck={false}
-            style={{ ...field, height: 200, padding: 12, resize: "vertical", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, lineHeight: 1.5 }}
-          />
-        </label>
-
-        {error && (
-          <div style={{ fontSize: 13, fontWeight: 500, color: "#C23B27", background: "rgba(194,59,39,0.08)", borderRadius: 10, padding: "8px 12px" }}>
-            {error}
-          </div>
+            {error && <div style={noticeStyle("error")}>{error}</div>}
+          </>
         )}
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 2 }}>
-          <button
-            type="button"
-            onClick={() => !saving && onClose()}
-            disabled={saving}
-            style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 400, color: "#4A4750", background: "transparent", border: "1px solid rgba(60,55,45,0.18)", borderRadius: 11, padding: "0 18px", height: 42, cursor: saving ? "default" : "pointer" }}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="lm-panel-btn"
-            onClick={submit}
-            disabled={saving}
-            style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 500, color: "#F4F2EC", background: "#2C2A31", border: "none", borderRadius: 11, padding: "0 22px", height: 42, cursor: saving ? "default" : "pointer", opacity: saving ? 0.75 : 1 }}
-          >
-            {saving ? "Saving…" : replacing ? "Replace content" : "Upload deck"}
-          </button>
+          {done ? (
+            // The store already succeeded; the only action left is to leave —
+            // which refreshes the grid so the new/updated card shows (via onDone).
+            <button
+              type="button"
+              className="lm-panel-btn"
+              onClick={onDone}
+              style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 500, color: "#F4F2EC", background: "#2C2A31", border: "none", borderRadius: 11, padding: "0 22px", height: 42, cursor: "pointer" }}
+            >
+              Done
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={dismiss}
+                disabled={saving}
+                style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 400, color: "#4A4750", background: "transparent", border: "1px solid rgba(60,55,45,0.18)", borderRadius: 11, padding: "0 18px", height: 42, cursor: saving ? "default" : "pointer" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="lm-panel-btn"
+                onClick={submit}
+                disabled={saving}
+                style={{ fontFamily: "inherit", fontSize: 14, fontWeight: 500, color: "#F4F2EC", background: "#2C2A31", border: "none", borderRadius: 11, padding: "0 22px", height: 42, cursor: saving ? "default" : "pointer", opacity: saving ? 0.75 : 1 }}
+              >
+                {saving ? "Saving…" : replacing ? "Replace content" : "Upload deck"}
+              </button>
+            </>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---- post-upload boot check -------------------------------------------------
+
+// After a deck is stored, prove it actually RUNS: mint a signed preview URL, load
+// the real cross-origin /d-content deck in a HIDDEN, hard-sandboxed iframe, and
+// wait for the shared runtime's bridge to report a slide count. Server-side
+// validation checks structure; this is the "does it really boot in a browser"
+// confirmation that structural checks can't give. Advisory only — the deck is
+// already stored (unpublished), so a failure here is a warning, not a hard error.
+//
+// SECURITY — this reuses UploadedDeckFrame's trust model verbatim (see its header
+// §1), and the two invariants below are NON-NEGOTIABLE:
+//   1. sandbox="allow-scripts" with NO allow-same-origin → the deck runs in an
+//      opaque origin, contained exactly as it is for real viewers. `src` is the
+//      REAL /d-content URL. We NEVER use srcdoc, a blob: URL, or a same-origin
+//      document to load the deck HTML — any of those would execute untrusted
+//      uploaded HTML on the APP (dashboard) origin, recreating the very same-
+//      origin-XSS hole the separate DECK_ORIGIN mechanism exists to prevent.
+//   2. We accept a message ONLY when event.source === our iframe's contentWindow
+//      (unforgeable window identity) AND event.data.source === "deck". We do NOT
+//      check event.origin — it's the literal string "null" for an opaque-origin
+//      sandbox, so checking it would reject every real message.
+type BootState =
+  | { kind: "checking" }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "runs"; total: number }
+  | { kind: "failed" };
+
+// The bridge fires `ready` (no total) then its first `slidechange` (with total)
+// within a few frames of boot; 6s is generous headroom for a slow cold start
+// while staying short enough that "didn't boot" feels prompt.
+const BOOT_TIMEOUT_MS = 6000;
+
+function BootCheck({ slug }: { slug: string }) {
+  const [boot, setBoot] = useState<BootState>({ kind: "checking" });
+
+  useEffect(() => {
+    // One `settled` guard + one cleanup closure shared by every async exit, so
+    // the listener / iframe / timer are torn down exactly once — whether we
+    // succeed, time out, or the panel unmounts mid-check (React runs the returned
+    // fn then). No leaked iframes or dangling message listeners.
+    let settled = false;
+    let iframe: HTMLIFrameElement | null = null;
+    let timer: number | undefined;
+    let onMessage: ((e: MessageEvent) => void) | null = null;
+
+    function cleanup() {
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (onMessage) window.removeEventListener("message", onMessage);
+      if (iframe && iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      timer = undefined;
+      onMessage = null;
+      iframe = null;
+    }
+
+    void (async () => {
+      // 1. Mint the signed preview URL (same-origin fetch → cookie + Origin sent
+      //    automatically, so the presenter gate + CSRF check pass). A non-200
+      //    (e.g. 503 deck_origin_unset) means the live check just isn't available
+      //    — NOT that the deck is bad; it's already stored. Degrade to a neutral
+      //    note, never an error.
+      let url: string | undefined;
+      try {
+        const res = await fetch(`/api/admin/decks/${slug}/preview`);
+        const data = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+        if (!res.ok || !data.url) {
+          if (!settled) {
+            settled = true;
+            setBoot({
+              kind: "unavailable",
+              reason: data.error === "deck_origin_unset" ? "deck origin not configured" : "the live check isn't available",
+            });
+          }
+          return;
+        }
+        url = data.url;
+      } catch {
+        if (!settled) {
+          settled = true;
+          setBoot({ kind: "unavailable", reason: "the live check isn't available" });
+        }
+        return;
+      }
+      if (settled) return; // panel closed while the token minted
+
+      // 2. Hidden, hard-sandboxed iframe pointed at the REAL cross-origin deck.
+      //    allow-scripts WITHOUT allow-same-origin = opaque origin, the exact
+      //    containment real viewers get. `src` is the /d-content URL — never
+      //    srcdoc/blob: (that would run untrusted HTML on the app origin).
+      const frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.setAttribute("aria-hidden", "true");
+      frame.setAttribute("tabindex", "-1");
+      frame.title = "Deck boot check";
+      frame.style.cssText = "position:absolute; left:-9999px; top:0; width:0; height:0; border:0; opacity:0; pointer-events:none;";
+      frame.src = url;
+      // onLoad nudge: the deck may fire its first report before our listener is
+      // live (boot race) — ask it to re-emit. Empty control ping, targetOrigin
+      // "*" (an opaque frame has no specific origin to target). Mirrors
+      // UploadedDeckFrame's requestReport.
+      frame.addEventListener("load", () => {
+        try {
+          frame.contentWindow?.postMessage({ type: "deck:report" }, "*");
+        } catch {
+          /* ignore */
+        }
+      });
+      iframe = frame;
+
+      onMessage = (e: MessageEvent) => {
+        const d = (e.data ?? {}) as { source?: string; type?: string; total?: number };
+        // SECURITY GUARD — our OWN frame's window (unforgeable object identity)
+        // AND the deck marker. NOT event.origin (it's "null" for the sandbox).
+        if (!(e.source === frame.contentWindow && d.source === "deck")) return;
+        // SUCCESS: a slidechange (or ready) reporting a real slide count. The
+        // bridge's `ready` carries no total, so in practice this trips on the
+        // first slidechange — exactly the "booted and enumerated slides" proof.
+        if ((d.type === "slidechange" || d.type === "ready") && typeof d.total === "number" && d.total > 0) {
+          if (!settled) {
+            settled = true;
+            setBoot({ kind: "runs", total: d.total });
+          }
+          cleanup();
+        }
+      };
+      window.addEventListener("message", onMessage);
+      document.body.appendChild(frame);
+
+      // 3. Bounded wait: nothing reported a slide count in time → the deck didn't
+      //    boot under the runtime. Advisory warning — it's still stored.
+      timer = window.setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          setBoot({ kind: "failed" });
+        }
+        cleanup();
+      }, BOOT_TIMEOUT_MS);
+    })();
+
+    return () => {
+      settled = true;
+      cleanup();
+    };
+  }, [slug]);
+
+  if (boot.kind === "checking") {
+    return <div style={noticeStyle("muted")}>Checking it runs in a browser…</div>;
+  }
+  if (boot.kind === "unavailable") {
+    // The deck stored fine; the live check just couldn't run. Neutral, not an error.
+    return <div style={noticeStyle("muted")}>Preview unavailable ({boot.reason}) — the deck is stored either way.</div>;
+  }
+  if (boot.kind === "runs") {
+    return (
+      <div style={noticeStyle("ok")}>
+        Runs ✓ — {boot.total} {boot.total === 1 ? "slide" : "slides"}
+      </div>
+    );
+  }
+  return (
+    <div style={noticeStyle("warn")}>
+      This deck didn't boot in a browser — check the structure and use Replace.
     </div>
   );
 }

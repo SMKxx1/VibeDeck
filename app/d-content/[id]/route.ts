@@ -1,5 +1,6 @@
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { verifyPreviewToken } from "@/lib/auth";
+import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
 
 // Serves untrusted deck HTML on the isolated deck origin (see middleware.ts).
 // This route is only ever reachable when the request arrives on DECK_HOST — the
@@ -85,7 +86,10 @@ export async function GET(
     return notFound();
   }
 
-  return new Response(row.html, {
+  // Inline-inject the shared platform runtime (lib/deck-runtime) so the deck
+  // renders and reports slide changes without shipping its own engine.
+  const body = await renderUploadedDeckHtml(row.html);
+  return new Response(body, {
     status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",

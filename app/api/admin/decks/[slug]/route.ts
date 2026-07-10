@@ -7,6 +7,8 @@ import {
   getUploadedDeckDeletionInfo,
   replaceUploadedDeckHtml,
 } from "@/lib/uploaded-decks";
+import { validateDeckHtml } from "@/lib/deck-validator";
+import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { clearSession } from "@/lib/session";
 import { clearPinboard } from "@/lib/pinboard";
 
@@ -63,8 +65,16 @@ export async function PUT(req: Request, { params }: { params: Promise<{ slug: st
   if (Buffer.byteLength(html, "utf8") > MAX_BYTES) {
     return NextResponse.json({ error: "payload_too_large" }, { status: 413 });
   }
-  if (!html.includes("<")) {
-    return NextResponse.json({ error: "not_html" }, { status: 400 });
+
+  // Same conformance gate as upload (see app/api/admin/decks/route.ts): the new
+  // content must be a valid VibeDeck bundle. A malformed replacement is rejected
+  // and the deck's existing stored html is left untouched.
+  const validation = validateDeckHtml(html);
+  if (!validation.ok) {
+    return NextResponse.json(
+      { error: "invalid_deck", issues: validation.issues, warnings: validation.warnings },
+      { status: 422 },
+    );
   }
 
   const { slug } = await params;
@@ -82,7 +92,12 @@ export async function PUT(req: Request, { params }: { params: Promise<{ slug: st
   if (result === "not_found") {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
-  return NextResponse.json({ slug });
+
+  // Re-derive the deck's grounding from the new bundle (and drop any grounding for
+  // slides the replacement removed). Best-effort, same as upload.
+  await replaceUploadedDeckSlides(slug, validation.slides);
+
+  return NextResponse.json({ slug, warnings: validation.warnings });
 }
 
 export async function DELETE(req: Request, { params }: { params: Promise<{ slug: string }> }) {
