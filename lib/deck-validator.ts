@@ -244,3 +244,41 @@ export function validateDeckHtml(html: string): DeckValidationResult {
 
   return { ok: true, issues, warnings, slideCount, slides };
 }
+
+// One slide's visible text, for AI grounding GENERATION (feature #8). Distinct
+// from DeckSlideMeta: that carries the AUTHOR's declared grounding (manifest +
+// data-*), whereas this is the slide's rendered TEXT — the raw material the model
+// summarizes into an aiContext/speakerNotes suggestion.
+export interface SlideText {
+  index: number;
+  label: string;
+  text: string;
+}
+
+const MAX_EXTRACT = 4000; // cap the text fed to the model per slide
+
+/**
+ * Extract each slide's visible text from stored deck HTML. Re-parses (keeping
+ * validateDeckHtml pure) and, per slide, strips <script>/<style> descendants so
+ * inline runtime/CSS source never contaminates the grounding text, then collapses
+ * whitespace and caps length. Returns [] for a non-conforming bundle (no single
+ * <deck-stage>) — the caller then has nothing to generate from. Never throws.
+ */
+export function extractSlideTexts(html: string): SlideText[] {
+  let root: HTMLElement;
+  try {
+    root = parse(html, { comment: false });
+  } catch {
+    return [];
+  }
+  const stages = root.querySelectorAll("deck-stage");
+  if (stages.length !== 1) return [];
+  const sections = directSections(stages[0]);
+  return sections.map((sec, i) => {
+    sec.querySelectorAll("script").forEach((n) => n.remove());
+    sec.querySelectorAll("style").forEach((n) => n.remove());
+    const text = sec.text.replace(/\s+/g, " ").trim().slice(0, MAX_EXTRACT);
+    const label = (sec.getAttribute("data-label") || "").slice(0, MAX_LABEL);
+    return { index: i, label, text };
+  });
+}

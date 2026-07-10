@@ -1492,10 +1492,37 @@ function actionPillStyle(danger: boolean): React.CSSProperties {
 // stray click can't destroy a deck. Replace defers to the shared upload panel.
 function UploadedActions({ deck, variant = "overlay" }: { deck: DeckCard; variant?: "overlay" | "inline" }) {
   const admin = useAdmin();
-  const [busy, setBusy] = useState<null | "preview" | "delete">(null);
+  const [busy, setBusy] = useState<null | "preview" | "delete" | "duplicate">(null);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const overlay = variant === "overlay";
+
+  async function duplicate() {
+    setError(null);
+    setBusy("duplicate");
+    try {
+      const res = await fetch(`/api/admin/decks/${deck.slug}/duplicate`, { method: "POST" });
+      if (res.ok) {
+        // The fork exists as a new row; re-run the server component so its card
+        // appears in the grid (this control unmounts / re-renders on refresh).
+        admin?.refresh();
+        return; // leave `busy` set — the grid repaints on refresh
+      }
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(adminErrorMessage(res.status, data.error));
+    } catch {
+      setError("Network error — try again.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // A plain GET file download: navigate to the owner-gated download route, which
+  // returns the fully self-contained deck as an attachment. No fetch()-and-blob
+  // (unnecessary) and no saving state (it's a navigation, not an in-app mutation).
+  function download() {
+    window.location.href = `/api/admin/decks/${deck.slug}/download`;
+  }
 
   async function preview() {
     setError(null);
@@ -1590,6 +1617,19 @@ function UploadedActions({ deck, variant = "overlay" }: { deck: DeckCard; varian
                 <circle cx="8" cy="8" r="1.8" />
               </svg>
               {busy === "preview" ? "Opening…" : "Preview"}
+            </button>
+            <button type="button" className="lm-act" onClick={duplicate} disabled={busy === "duplicate"} title="Duplicate this deck (a private copy you own)" style={actionPillStyle(false)}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.4" />
+                <path d="M10.5 5.5V4a1.4 1.4 0 0 0-1.4-1.4H4A1.4 1.4 0 0 0 2.6 4v5.1A1.4 1.4 0 0 0 4 10.5h1.5" />
+              </svg>
+              {busy === "duplicate" ? "Duplicating…" : "Duplicate"}
+            </button>
+            <button type="button" className="lm-act" onClick={download} title="Download a self-contained, offline copy" style={actionPillStyle(false)}>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M8 2.5v7M5 6.5 8 9.5l3-3M3 12.5h10" />
+              </svg>
+              Download
             </button>
             <button type="button" className="lm-act-danger" onClick={() => setConfirming(true)} title="Delete this deck" style={actionPillStyle(true)}>
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">

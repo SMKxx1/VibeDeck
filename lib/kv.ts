@@ -25,6 +25,105 @@ export async function recordTokens(name: string, tokens: number): Promise<void> 
   }
 }
 
+// ---- platform-key AI token budget (a global safety cap) ---------------------
+// A rolling DAILY ceiling on total platform-key token spend across every AI
+// feature that bills to OUR OpenRouter key (grounding generation, quiz drafting,
+// the tutor). It exists so a runaway loop or abuse can't quietly rack up cost —
+// distinct from the per-name rate limit (which caps ONE user's request rate). A
+// SOFT cap: checked before a call and incremented after, so a burst can overshoot
+// by at most the in-flight calls, which is fine for a cost guardrail. Redis-backed
+// (a shared counter across instances); with no Redis it can't be enforced, so it
+// fails OPEN (the app must keep working without Redis) — the per-name limit still
+// applies. Set AI_DAILY_TOKEN_BUDGET=0 to disable.
+const DAILY_TOKEN_BUDGET = Number(process.env.AI_DAILY_TOKEN_BUDGET ?? 3_000_000);
+
+function budgetKey(): string {
+  // One counter per UTC day; self-expiring so old keys never accumulate.
+  return `ai:budget:${new Date().toISOString().slice(0, 10)}`;
+}
+
+/** Is today's platform-key token spend still under the cap? Fails OPEN with no Redis. */
+export async function checkTokenBudget(): Promise<{ allowed: boolean; used: number; cap: number }> {
+  if (!DAILY_TOKEN_BUDGET || DAILY_TOKEN_BUDGET <= 0) return { allowed: true, used: 0, cap: 0 };
+  const redis = await getRedis();
+  if (!redis) return { allowed: true, used: 0, cap: DAILY_TOKEN_BUDGET }; // can't enforce → allow
+  try {
+    const used = Number(await redis.get<number>(budgetKey())) || 0;
+    return { allowed: used < DAILY_TOKEN_BUDGET, used, cap: DAILY_TOKEN_BUDGET };
+  } catch {
+    return { allowed: true, used: 0, cap: DAILY_TOKEN_BUDGET };
+  }
+}
+
+/** Add spent tokens to today's platform-key budget counter (best-effort, non-blocking). */
+export async function recordBudgetTokens(tokens: number): Promise<void> {
+  if (!tokens || tokens <= 0) return;
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    const key = budgetKey();
+    const n = await redis.incrby(key, tokens);
+    if (n === tokens) await redis.expire(key, 60 * 60 * 48); // first write today → 48h TTL
+  } catch {
+    /* best-effort — never block on the budget counter */
+  }
+}
+
+// ---- "Explain differently" answer cache (#10) -------------------------------
+// The reframe chips (ELI5 / analogy / example / deeper) ask a FIXED question about
+// a specific (deck, slide) — so the answer is reusable across every viewer in the
+// room. Caching it means the 2nd..Nth tap is instant AND free (no model call, no
+// budget spend). Keyed by (slug, slideIndex, mode). Stored wrapped in an object so
+// a prose answer that happens to look like JSON round-trips as a string.
+const EXPLAIN_TTL = 60 * 60; // 1h — slide content is stable within a session
+
+export async function getExplainCache(key: string): Promise<string | null> {
+  const redis = await getRedis();
+  if (!redis) return null;
+  try {
+    const v = await redis.get<{ a?: string }>(`explain:${key}`);
+    return v && typeof v.a === "string" ? v.a : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setExplainCache(key: string, answer: string): Promise<void> {
+  if (!answer) return;
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    await redis.set(`explain:${key}`, { a: answer }, { ex: EXPLAIN_TTL });
+  } catch {
+    /* best-effort cache */
+  }
+}
+
+// ---- Suggested-questions cache (#9) -----------------------------------------
+// The 2-3 grounded follow-up questions shown under a slide are the same for every
+// viewer on that (deck, slide), so cache them per (slug, slideIndex).
+export async function getSuggestCache(key: string): Promise<string[] | null> {
+  const redis = await getRedis();
+  if (!redis) return null;
+  try {
+    const v = await redis.get<{ q?: string[] }>(`suggest:${key}`);
+    return v && Array.isArray(v.q) ? v.q : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setSuggestCache(key: string, questions: string[]): Promise<void> {
+  if (!questions.length) return;
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    await redis.set(`suggest:${key}`, { q: questions }, { ex: 60 * 60 });
+  } catch {
+    /* best-effort cache */
+  }
+}
+
 const RATE_MAX = Number(process.env.AI_RATE_LIMIT_MAX ?? 20);
 const RATE_WINDOW = Number(process.env.AI_RATE_LIMIT_WINDOW_SECONDS ?? 60);
 const memBuckets = new Map<string, { count: number; resetAt: number }>();
