@@ -59,6 +59,20 @@ interface SessionState {
   live: boolean;
 }
 
+// The viewer-safe projection of a live poll (#3), delivered on the SAME session
+// poll. Pre-reveal: correctIndex/tally/total are null — viewers never see the
+// answer or counts until the presenter reveals.
+interface ViewerPoll {
+  id: string;
+  question: string;
+  options: string[];
+  revealed: boolean;
+  correctIndex: number | null;
+  tally: number[] | null;
+  total: number | null;
+  at: number;
+}
+
 export function LiveDeck({
   slug,
   embedUrl,
@@ -83,6 +97,12 @@ export function LiveDeck({
   const [controlsShown, setControlsShown] = useState(true);
   // Live headcount from the presence heartbeat (#1) — powers the "N watching" chip.
   const [watching, setWatching] = useState(0);
+  // Live poll (#3): the presenter's current poll (or null), delivered on the
+  // session poll. `myVote` tracks THIS viewer's own choice, keyed by poll id so it
+  // resets the moment a new poll opens.
+  const [poll, setPoll] = useState<ViewerPoll | null>(null);
+  const [myVote, setMyVote] = useState<{ pollId: string; optionIndex: number } | null>(null);
+  const [reduceMotion, setReduceMotion] = useState(false);
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -94,6 +114,8 @@ export function LiveDeck({
   const deckRef = useRef(deck);
   deckRef.current = deck;
   const channelRef = useRef<SyncChannel | null>(null);
+  // In-flight vote request — aborted when superseded by a newer tap or on unmount.
+  const voteCtrlRef = useRef<AbortController | null>(null);
 
   const send = useCallback((msg: Record<string, unknown>) => {
     iframeRef.current?.contentWindow?.postMessage(msg, "*");
@@ -192,6 +214,38 @@ export function LiveDeck({
     [slug],
   );
 
+  // Cast (or change) this viewer's poll vote (#3). Optimistically marks the choice,
+  // then reconciles: a new tap aborts the previous in-flight vote (only the latest
+  // matters), and any error — 409 stale/closed, 429 rate-limited, or network —
+  // clears the optimistic mark so the next session poll can reconcile.
+  const castVote = useCallback(
+    async (pollId: string, optionIndex: number) => {
+      const who = nameRef.current;
+      if (!who) return;
+      voteCtrlRef.current?.abort();
+      const ctrl = new AbortController();
+      voteCtrlRef.current = ctrl;
+      setMyVote({ pollId, optionIndex });
+      try {
+        const res = await fetch("/api/poll/vote", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, pollId, optionIndex, name: who }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) {
+          // Stale/closed (409) or rate-limited (429): drop the mark for THIS poll.
+          setMyVote((m) => (m && m.pollId === pollId ? null : m));
+        }
+      } catch (err) {
+        // Superseded by a newer tap → that call now owns the mark; leave it.
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setMyVote((m) => (m && m.pollId === pollId ? null : m));
+      }
+    },
+    [slug],
+  );
+
   // Load stored viewer name.
   useEffect(() => {
     if (role !== "viewer") return;
@@ -205,6 +259,25 @@ export function LiveDeck({
       /* ignore */
     }
   }, [role]);
+
+  // A fresh poll id means a brand-new question — drop any prior "your choice".
+  const pollId = poll?.id ?? null;
+  useEffect(() => {
+    setMyVote(null);
+  }, [pollId]);
+
+  // Honor prefers-reduced-motion for the result-bar growth.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const apply = () => setReduceMotion(mq.matches);
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, []);
+
+  // Abort any in-flight vote when the deck unmounts.
+  useEffect(() => () => voteCtrlRef.current?.abort(), []);
 
   // Messages from the deck bridge.
   useEffect(() => {
@@ -280,12 +353,14 @@ export function LiveDeck({
           signal: ctrl.signal,
         });
         if (!res.ok || !alive) return;
-        const s = (await res.json()) as SessionState;
+        const s = (await res.json()) as SessionState & { poll?: ViewerPoll | null };
         lastLive = s.live;
         setSession(s);
         // Presenter windows sync with each other instantly via BroadcastChannel,
         // never via this poll — polling here would fight local navigation.
         if (role === "presenter") return;
+        // The live poll (#3) rides on this same session read — no extra request.
+        setPoll(s.poll ?? null);
         // Heartbeat presence on every viewer tick (live or free-roam browsing).
         void beat();
         if (!s.live) {
@@ -546,6 +621,19 @@ export function LiveDeck({
           )}
           <LogoutButton role={role} onClick={logout} />
         </div>
+
+        {/* Live poll overlay (#3) — a viewer card over the slide (bottom-left, so it
+            never covers the top-right controls). Vanishes when the poll closes. */}
+        {role === "viewer" && poll && (
+          <PollCard
+            poll={poll}
+            hasName={!!name}
+            myOptionIndex={myVote && myVote.pollId === poll.id ? myVote.optionIndex : null}
+            reduceMotion={reduceMotion}
+            onVote={(i) => void castVote(poll.id, i)}
+            onNeedName={() => setShowGate(true)}
+          />
+        )}
       </div>
 
       {chatOpen && (
@@ -860,4 +948,225 @@ function NameGate({ onSubmit }: { onSubmit: (name: string) => void }) {
       </form>
     </div>
   );
+}
+
+// The viewer's live-poll card (#3). Pre-reveal: tap an option to vote (the mark is
+// optimistic; re-tap to change until reveal). Revealed: horizontal bars sized by
+// each option's share, the correct answer flagged green, and this viewer's pick
+// tagged. Styled to match the glass control chips.
+function PollCard({
+  poll,
+  hasName,
+  myOptionIndex,
+  reduceMotion,
+  onVote,
+  onNeedName,
+}: {
+  poll: ViewerPoll;
+  hasName: boolean;
+  myOptionIndex: number | null;
+  reduceMotion: boolean;
+  onVote: (optionIndex: number) => void;
+  onNeedName: () => void;
+}) {
+  const revealed = poll.revealed;
+  const tally = poll.tally ?? [];
+  const total = poll.total ?? 0;
+  const max = Math.max(1, ...(tally.length ? tally : [0]));
+
+  return (
+    <div style={pollCardWrap} role="group" aria-label="Live poll">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>{revealed ? "Results" : "Live poll"}</span>
+        {revealed ? (
+          <span style={pollNote}>
+            {total} vote{total === 1 ? "" : "s"}
+          </span>
+        ) : (
+          myOptionIndex != null && <span style={pollNote}>Voted · waiting for results</span>
+        )}
+      </div>
+
+      <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.4 }}>{poll.question}</div>
+
+      {!revealed ? (
+        !hasName ? (
+          <button onClick={onNeedName} style={pollNameBtn}>
+            Enter a name to vote
+          </button>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {poll.options.map((opt, i) => {
+              const mine = myOptionIndex === i;
+              return (
+                <button key={i} onClick={() => onVote(i)} aria-pressed={mine} style={pollOptionBtn(mine)}>
+                  <span style={pollDot(mine)} aria-hidden />
+                  <span style={{ flex: 1, minWidth: 0 }}>{opt}</span>
+                </button>
+              );
+            })}
+          </div>
+        )
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {poll.options.map((opt, i) => {
+            const count = tally[i] ?? 0;
+            const correct = poll.correctIndex === i;
+            const mine = myOptionIndex === i;
+            const pct = Math.round((count / max) * 100);
+            return (
+              <div key={i} style={pollResultRow}>
+                <div
+                  style={{
+                    ...pollResultBar(correct, mine),
+                    width: `${pct}%`,
+                    transition: reduceMotion ? "none" : "width .45s ease",
+                  }}
+                  aria-hidden
+                />
+                <div style={pollResultText}>
+                  <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
+                    {correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                    {mine && <span style={pollTag("#6E6A62")}>your pick</span>}
+                  </span>
+                  <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>{count}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const pollCardWrap: React.CSSProperties = {
+  position: "absolute",
+  left: 16,
+  bottom: 16,
+  zIndex: 38,
+  width: "min(400px, calc(100% - 32px))",
+  maxHeight: "min(70vh, 520px)",
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: "16px 18px",
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.78)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+const pollBadge: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  fontSize: 10.5,
+  fontWeight: 700,
+  letterSpacing: "0.14em",
+  textTransform: "uppercase",
+  color: "#4B5A16",
+  background: "rgba(191,224,72,0.42)",
+  padding: "3px 9px",
+  borderRadius: 999,
+};
+
+const pollNote: React.CSSProperties = {
+  fontSize: 11.5,
+  fontWeight: 500,
+  color: "#6E6A62",
+  whiteSpace: "nowrap",
+};
+
+const pollNameBtn: React.CSSProperties = {
+  height: 40,
+  borderRadius: 11,
+  border: "none",
+  cursor: "pointer",
+  background: "#2C2A31",
+  color: "#F4F2EC",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  fontWeight: 500,
+};
+
+function pollOptionBtn(mine: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 10,
+    width: "100%",
+    textAlign: "left",
+    padding: "11px 13px",
+    borderRadius: 11,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 500,
+    color: mine ? "#F4F2EC" : "#2C2A31",
+    background: mine ? "#2C2A31" : "rgba(255,255,255,0.62)",
+    border: mine ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.16)",
+    transition: "background .15s ease, color .15s ease",
+  };
+}
+
+function pollDot(mine: boolean): React.CSSProperties {
+  return {
+    width: 15,
+    height: 15,
+    borderRadius: "50%",
+    flex: "0 0 auto",
+    boxSizing: "border-box",
+    border: mine ? "4px solid #BFE048" : "2px solid rgba(60,55,45,0.35)",
+    background: mine ? "#2C2A31" : "transparent",
+  };
+}
+
+const pollResultRow: React.CSSProperties = {
+  position: "relative",
+  borderRadius: 11,
+  overflow: "hidden",
+  background: "rgba(60,55,45,0.07)",
+  padding: "10px 12px",
+};
+
+function pollResultBar(correct: boolean, mine: boolean): React.CSSProperties {
+  return {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    borderRadius: 11,
+    background: correct
+      ? "rgba(120,176,54,0.34)"
+      : mine
+        ? "rgba(44,42,49,0.16)"
+        : "rgba(120,116,108,0.16)",
+  };
+}
+
+const pollResultText: React.CSSProperties = {
+  position: "relative",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  fontSize: 13,
+  fontWeight: 500,
+  color: "#2C2A31",
+};
+
+function pollTag(color: string): React.CSSProperties {
+  return {
+    fontSize: 9.5,
+    fontWeight: 700,
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    color,
+    whiteSpace: "nowrap",
+    flex: "0 0 auto",
+  };
 }

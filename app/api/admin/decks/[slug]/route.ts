@@ -14,6 +14,8 @@ import { clearSession } from "@/lib/session";
 import { clearPinboard } from "@/lib/pinboard";
 import { clearPresence } from "@/lib/presence";
 import { clearSignals } from "@/lib/signals";
+import { clearPoll } from "@/lib/poll";
+import { clearQna } from "@/lib/qna";
 
 // Ownership-gated REPLACE (PUT) and DELETE for an already-uploaded deck. Gate
 // order: authenticated session (401) → CSRF (403) → OWNERSHIP (checkDeckManage:
@@ -172,6 +174,8 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ slug:
     clearPinboard(slug),
     clearPresence(slug),
     clearSignals(slug),
+    clearPoll(slug),
+    clearQna(slug),
   ]);
 
   return NextResponse.json({ slug });
