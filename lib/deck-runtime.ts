@@ -27,6 +27,7 @@
 
 import { readFile } from "fs/promises";
 import path from "path";
+import { injectRuntime } from "./inject-runtime";
 
 // Bump BOTH the filename and this constant to ship a runtime v2 (semver the
 // runtime; a breaking engine change is a new file, old decks keep working
@@ -55,28 +56,9 @@ async function loadRuntime(): Promise<string | null> {
   }
 }
 
-// Inject the runtime as an inline <script> at the END of the document so it runs
-// after the deck's <deck-stage>/<section>s are parsed (the engine then registers
-// the element; the bridge boots and finds it). Injected just before </body> when
-// present (case-insensitive, last occurrence), else appended.
-//
-// CRITICAL: the runtime source contains the literal `</script>` (deck-stage.js's
-// header doc shows the standalone `<script src="deck-stage.js"></script>` usage).
-// Inside an INLINE <script> the HTML parser closes the block at the FIRST
-// `</script`, which would truncate the runtime mid-file (before
-// customElements.define('deck-stage')) and dump the rest as visible page text —
-// the deck then never boots. The standard, semantics-preserving fix: rewrite
-// `</script` to `<\/script`. In JS source `<\/script` is identical to `</script`
-// (backslash-slash is just a slash in strings/regex, and it's inert in comments),
-// but the HTML parser no longer sees a closing tag. Regenerate this escape at
-// serve time so it's applied no matter what a future runtime version contains.
-function injectRuntime(html: string, runtime: string): string {
-  const safe = runtime.replace(/<\/script/gi, "<\\/script");
-  const tag = `<script>${safe}</script>`;
-  const idx = html.toLowerCase().lastIndexOf("</body>");
-  if (idx === -1) return html + tag;
-  return html.slice(0, idx) + tag + html.slice(idx);
-}
+// The runtime injection (+ the critical </script> escape) lives in the pure,
+// client+server-safe lib/inject-runtime so the Studio preview reuses the EXACT
+// same logic. See that file for the escape rationale.
 
 /**
  * Transform an uploaded deck's stored html into the exact bytes served to the
@@ -90,4 +72,14 @@ export async function renderUploadedDeckHtml(storedHtml: string): Promise<string
   const runtime = await loadRuntime();
   if (!runtime) return storedHtml;
   return injectRuntime(storedHtml, runtime);
+}
+
+/**
+ * The raw runtime JS body (cached), or null if unreadable. Exposed so the Studio
+ * live preview can fetch it (via /api/studio/runtime) and inject it into a
+ * sandboxed srcdoc iframe with the SAME lib/inject-runtime logic the server uses
+ * — preview renders exactly like the real /d-content serve.
+ */
+export function getRuntimeText(): Promise<string | null> {
+  return loadRuntime();
 }

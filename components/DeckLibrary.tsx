@@ -800,6 +800,39 @@ export function DeckLibrary({ decks }: { decks: DeckCard[] }) {
               </svg>
               Build with AI
             </Link>
+            {/* Sibling entry to the in-browser AI Studio (/studio) — generate a deck
+                live with your own OpenRouter key. Same frosted pill as "Build with
+                AI" so the two author paths read as one row of navigation. */}
+            <Link
+              href="/studio"
+              className="lm-build"
+              title="Generate a deck in the browser with your own AI key"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                height: 44,
+                padding: "0 15px",
+                borderRadius: 14,
+                textDecoration: "none",
+                color: "#4A4750",
+                fontSize: 13.5,
+                fontWeight: 400,
+                whiteSpace: "nowrap",
+                background: "rgba(255,255,255,0.5)",
+                border: "1px solid rgba(255,255,255,0.7)",
+                backdropFilter: "blur(14px)",
+                WebkitBackdropFilter: "blur(14px)",
+                boxShadow: "0 6px 18px -12px rgba(60,55,45,0.35)",
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#8A857C" strokeWidth={1.3} strokeLinecap="round" strokeLinejoin="round">
+                <rect x="2" y="3" width="12" height="8.5" rx="1.6" />
+                <path d="M5.5 13.5h5" />
+                <path d="M6 6l2 1.75L6 9.5" />
+              </svg>
+              Studio
+            </Link>
             <div
               style={{
                 display: "flex",
