@@ -4,6 +4,7 @@ import { getSession, setPresenterIndex, resetLock, heartbeat, isLive } from "@/l
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
+import { getActivePoll, pollForViewer } from "@/lib/poll";
 
 // The live-session channel. Viewers GET the presenter's position (polled);
 // the presenter POSTs its position (and can "reset the lock"). Only a valid
@@ -29,7 +30,10 @@ export async function GET(req: Request) {
   }
 
   const state = await getSession(slug);
-  return NextResponse.json({ ...state, live: isLive(state) }, { headers: NO_STORE });
+  // Deliver the current live poll on the SAME poll viewers already run (#3) — no
+  // new viewer request. Viewer-safe projection: no correct answer/tally pre-reveal.
+  const poll = pollForViewer(await getActivePoll(slug));
+  return NextResponse.json({ ...state, live: isLive(state), poll }, { headers: NO_STORE });
 }
 
 interface PostBody {

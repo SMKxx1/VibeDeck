@@ -47,6 +47,19 @@ interface SessionState {
   live: boolean;
 }
 
+// The full poll record (#3) — the presenter sees the correct answer + the live
+// tally, unlike the viewer-safe projection delivered on /api/session.
+interface Poll {
+  id: string;
+  question: string;
+  options: string[];
+  correctIndex: number | null;
+  revealed: boolean;
+  tally: number[] | null;
+  total: number | null;
+  at: number;
+}
+
 export function PresenterConsole({
   slug,
   embedUrl,
@@ -74,12 +87,27 @@ export function PresenterConsole({
   const [rosterOpen, setRosterOpen] = useState(false);
   const [reduceMotion, setReduceMotion] = useState(false);
 
+  // Live poll (#3/#4). `livePoll` is the current open/revealed poll (null = none,
+  // so the panel shows the compose form); `liveTally`/`liveTotal` are refreshed on
+  // the same ~4s console tick as presence/reactions.
+  const [pollPanelOpen, setPollPanelOpen] = useState(false);
+  const [livePoll, setLivePoll] = useState<Poll | null>(null);
+  const [liveTally, setLiveTally] = useState<number[]>([]);
+  const [liveTotal, setLiveTotal] = useState(0);
+
   const sessionRef = useRef(session);
   sessionRef.current = session;
   const deckRef = useRef(deck);
   deckRef.current = deck;
   const channelRef = useRef<SyncChannel | null>(null);
   const previewIdxRef = useRef(-1);
+
+  // Latest poll (for the tick's race guards) + the id we just closed (so an
+  // in-flight pre-close read can't resurrect it) + the in-flight control request.
+  const livePollRef = useRef(livePoll);
+  livePollRef.current = livePoll;
+  const closedPollIdRef = useRef<string | null>(null);
+  const pollCtrlRef = useRef<AbortController | null>(null);
 
   // "New reaction" detection: the max signal timestamp already handled, so a
   // signal seen on an earlier poll is never re-animated.
@@ -139,6 +167,72 @@ export function PresenterConsole({
     },
     [post],
   );
+
+  // Poll control (#3). Each action aborts any prior in-flight control request and
+  // optimistically updates the panel from the response; the tick reconciles.
+  const pollAction = useCallback(
+    async (body: Record<string, unknown>) => {
+      pollCtrlRef.current?.abort();
+      const ctrl = new AbortController();
+      pollCtrlRef.current = ctrl;
+      return fetch("/api/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, ...body }),
+        signal: ctrl.signal,
+      });
+    },
+    [slug],
+  );
+
+  const openPollAction = useCallback(
+    async (question: string, options: string[], correctIndex: number | null): Promise<boolean> => {
+      try {
+        const res = await pollAction({ action: "open", question, options, correctIndex });
+        if (!res.ok) return false;
+        const data = (await res.json()) as { poll: Poll; tally?: number[]; total?: number };
+        closedPollIdRef.current = null;
+        setLivePoll(data.poll);
+        setLiveTally(data.tally ?? new Array(data.poll.options.length).fill(0));
+        setLiveTotal(data.total ?? 0);
+        return true;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return false;
+        return false;
+      }
+    },
+    [pollAction],
+  );
+
+  const revealPollAction = useCallback(async () => {
+    try {
+      const res = await pollAction({ action: "reveal" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { poll: Poll; tally?: number[]; total?: number };
+      setLivePoll(data.poll);
+      setLiveTally(data.tally ?? []);
+      setLiveTotal(data.total ?? 0);
+    } catch {
+      /* aborted / transient — the tick reconciles */
+    }
+  }, [pollAction]);
+
+  const closePollAction = useCallback(async () => {
+    // Remember the id so an in-flight pre-close read can't resurrect it, then
+    // optimistically clear back to the compose form.
+    closedPollIdRef.current = livePollRef.current?.id ?? null;
+    setLivePoll(null);
+    setLiveTally([]);
+    setLiveTotal(0);
+    try {
+      await pollAction({ action: "close" });
+    } catch {
+      /* aborted / transient */
+    }
+  }, [pollAction]);
+
+  // Abort any in-flight poll control request on unmount.
+  useEffect(() => () => pollCtrlRef.current?.abort(), []);
 
   // Messages from either iframe (main = driver, preview = next-slide).
   useEffect(() => {
@@ -312,9 +406,11 @@ export function PresenterConsole({
 
     async function tick() {
       try {
-        const [pRes, sRes] = await Promise.all([
+        // Fold the live-poll tally (#3) into the same tick as presence + reactions.
+        const [pRes, sRes, qRes] = await Promise.all([
           fetch(`/api/presence?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/signal?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/poll?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
         ]);
         if (alive && pRes.ok) {
           const data = (await pRes.json()) as { count?: number; viewers?: Viewer[] };
@@ -326,6 +422,22 @@ export function PresenterConsole({
           setHelp({ lost: sig.lost ?? 0, slow: sig.slow ?? 0 });
           setReactionCount(list.filter((s) => ANIMATE_KINDS.has(s.kind)).length);
           onSignals(list);
+        }
+        if (alive && qRes.ok) {
+          const data = (await qRes.json()) as { poll?: Poll | null; tally?: number[]; total?: number };
+          const incoming = data.poll ?? null;
+          const cur = livePollRef.current;
+          // Skip two stale reads: a poll we just closed (its id lingers one tick),
+          // and a pre-reveal snapshot that would un-reveal a just-revealed poll.
+          const stale =
+            !!incoming &&
+            ((incoming.id === closedPollIdRef.current) ||
+              (!!cur && cur.id === incoming.id && cur.revealed && !incoming.revealed));
+          if (!stale) {
+            setLivePoll(incoming);
+            setLiveTally(incoming ? (data.tally ?? []) : []);
+            setLiveTotal(incoming ? (data.total ?? 0) : 0);
+          }
         }
       } catch {
         /* transient / aborted — try again next tick */
@@ -407,6 +519,19 @@ export function PresenterConsole({
         </div>
         <HelpMeter lost={help.lost} slow={help.slow} />
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button
+            onClick={() => setPollPanelOpen((o) => !o)}
+            title="Live poll & AI knowledge-check"
+            aria-pressed={pollPanelOpen}
+            style={{
+              ...btn(pollPanelOpen ? "#BFE048" : "rgba(255,255,255,0.1)", pollPanelOpen ? "#1B1B20" : "#F4F2EC"),
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
+            }}
+          >
+            📊 Poll{livePoll ? (livePoll.revealed ? " · revealed" : " · live") : ""}
+          </button>
           <ConsoleTimer />
           <button onClick={() => void post({ reset: true })} title="Set the current slide as the viewers' ceiling" style={btn("#B5331F", "#fff")}>
             Reset lock
@@ -476,6 +601,22 @@ export function PresenterConsole({
             {noteText || <span style={{ color: "#7A7770" }}>No notes for this slide.</span>}
           </div>
         </div>
+
+        {/* live poll panel (#3/#4) — compose · AI draft · live results */}
+        {pollPanelOpen && (
+          <PollPanel
+            poll={livePoll}
+            tally={liveTally}
+            total={liveTotal}
+            slug={slug}
+            index={deck.index}
+            reduceMotion={reduceMotion}
+            onLaunch={openPollAction}
+            onReveal={revealPollAction}
+            onClose={closePollAction}
+            onDismiss={() => setPollPanelOpen(false)}
+          />
+        )}
       </div>
     </div>
   );
@@ -707,3 +848,478 @@ function ConsoleTimer() {
     </span>
   );
 }
+
+// The poll panel (#3/#4). No live poll → the compose form (with the ✨ AI draft
+// that FILLS it for review, never auto-launches). A live poll → results with a
+// Reveal + Close. Compose state is local; the parent owns the live poll + tally.
+function PollPanel({
+  poll,
+  tally,
+  total,
+  slug,
+  index,
+  reduceMotion,
+  onLaunch,
+  onReveal,
+  onClose,
+  onDismiss,
+}: {
+  poll: Poll | null;
+  tally: number[];
+  total: number;
+  slug: string;
+  index: number;
+  reduceMotion: boolean;
+  onLaunch: (question: string, options: string[], correctIndex: number | null) => Promise<boolean>;
+  onReveal: () => void;
+  onClose: () => void;
+  onDismiss: () => void;
+}) {
+  const [question, setQuestion] = useState("");
+  const [options, setOptions] = useState<string[]>(["", ""]);
+  const [correctIndex, setCorrectIndex] = useState<number | null>(null);
+  const [explanation, setExplanation] = useState<string | null>(null);
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const draftCtrlRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => draftCtrlRef.current?.abort(), []);
+
+  // When a live poll closes, reset the compose form to a blank slate.
+  const hadPollRef = useRef(false);
+  useEffect(() => {
+    if (poll) {
+      hadPollRef.current = true;
+      return;
+    }
+    if (hadPollRef.current) {
+      hadPollRef.current = false;
+      setQuestion("");
+      setOptions(["", ""]);
+      setCorrectIndex(null);
+      setExplanation(null);
+      setDraftError(null);
+      setLaunchError(null);
+    }
+  }, [poll]);
+
+  const setOptionAt = (i: number, val: string) => setOptions((o) => o.map((x, idx) => (idx === i ? val : x)));
+  const addOption = () => setOptions((o) => (o.length >= 6 ? o : [...o, ""]));
+  const removeOption = (i: number) => {
+    setOptions((o) => (o.length <= 2 ? o : o.filter((_, idx) => idx !== i)));
+    setCorrectIndex((c) => (c === null ? null : c === i ? null : c > i ? c - 1 : c));
+  };
+  const toggleCorrect = (i: number) => setCorrectIndex((c) => (c === i ? null : i));
+
+  async function draft() {
+    setDraftLoading(true);
+    setDraftError(null);
+    draftCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    draftCtrlRef.current = ctrl;
+    try {
+      const res = await fetch("/api/poll/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, index }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        question?: string;
+        options?: string[];
+        correctIndex?: number;
+        explanation?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setDraftError(mapDraftError(data.error));
+        return;
+      }
+      const opts = Array.isArray(data.options) ? data.options.slice(0, 6) : [];
+      setQuestion(data.question ?? "");
+      setOptions(opts.length >= 2 ? opts : ["", ""]);
+      setCorrectIndex(
+        typeof data.correctIndex === "number" && data.correctIndex >= 0 && data.correctIndex < opts.length
+          ? data.correctIndex
+          : null,
+      );
+      setExplanation(data.explanation && data.explanation.trim() ? data.explanation : null);
+      setLaunchError(null);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setDraftError("Couldn't draft — try again.");
+    } finally {
+      setDraftLoading(false);
+    }
+  }
+
+  // Drop empty options and remap the correct index to the kept list, so the
+  // backend's own empty-filtering can't shift which option is "correct".
+  const kept: string[] = [];
+  let mappedCorrect: number | null = null;
+  options.forEach((o, i) => {
+    const t = o.trim();
+    if (!t) return;
+    if (correctIndex === i) mappedCorrect = kept.length;
+    kept.push(t);
+  });
+  const canLaunch = question.trim().length > 0 && kept.length >= 2 && !launching;
+
+  async function launch() {
+    if (!canLaunch) return;
+    setLaunching(true);
+    setLaunchError(null);
+    const ok = await onLaunch(question.trim(), kept, mappedCorrect);
+    setLaunching(false);
+    if (!ok) setLaunchError("Couldn't launch — try again.");
+  }
+
+  return (
+    <div style={pollPanelWrap}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <Label>{poll ? "Live poll" : "New poll"}</Label>
+        <button onClick={onDismiss} title="Hide panel" aria-label="Hide poll panel" style={pollIconBtn}>
+          ✕
+        </button>
+      </div>
+
+      {poll ? (
+        <PollResults poll={poll} tally={tally} total={total} reduceMotion={reduceMotion} onReveal={onReveal} onClose={onClose} />
+      ) : (
+        <div style={pollScroll}>
+          <button onClick={() => void draft()} disabled={draftLoading} style={draftBtn(draftLoading)}>
+            {draftLoading ? "Drafting…" : "✨ Draft with AI"}
+          </button>
+          {draftError && <div style={pollErrorText}>{draftError}</div>}
+          {explanation && <div style={pollExplain}>{explanation}</div>}
+
+          <div>
+            <FieldLabel>Question</FieldLabel>
+            <textarea
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="Ask the room…"
+              maxLength={400}
+              rows={2}
+              style={pollTextarea}
+            />
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <FieldLabel>Options · mark the correct one (optional)</FieldLabel>
+            {options.map((opt, i) => {
+              const removable = options.length > 2;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button
+                    type="button"
+                    onClick={() => toggleCorrect(i)}
+                    title={correctIndex === i ? "Correct answer — click to unset" : "Mark as the correct answer"}
+                    aria-pressed={correctIndex === i}
+                    aria-label={`Mark option ${i + 1} correct`}
+                    style={correctDot(correctIndex === i)}
+                  />
+                  <input
+                    value={opt}
+                    onChange={(e) => setOptionAt(i, e.target.value)}
+                    placeholder={`Option ${i + 1}`}
+                    maxLength={200}
+                    style={pollInput}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeOption(i)}
+                    disabled={!removable}
+                    title="Remove option"
+                    aria-label={`Remove option ${i + 1}`}
+                    style={{ ...pollIconBtn, opacity: removable ? 1 : 0.35, cursor: removable ? "pointer" : "default" }}
+                  >
+                    –
+                  </button>
+                </div>
+              );
+            })}
+            {options.length < 6 && (
+              <button type="button" onClick={addOption} style={addOptionBtn}>
+                + Add option
+              </button>
+            )}
+          </div>
+
+          {launchError && <div style={pollErrorText}>{launchError}</div>}
+          <button onClick={() => void launch()} disabled={!canLaunch} style={launchBtn(canLaunch)}>
+            {launching ? "Launching…" : "Launch poll"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Live/revealed results with bars (#3). Pre-reveal shows the presenter the running
+// tally; after Reveal the correct option is highlighted (matching what viewers see).
+function PollResults({
+  poll,
+  tally,
+  total,
+  reduceMotion,
+  onReveal,
+  onClose,
+}: {
+  poll: Poll;
+  tally: number[];
+  total: number;
+  reduceMotion: boolean;
+  onReveal: () => void;
+  onClose: () => void;
+}) {
+  const max = Math.max(1, ...(tally.length ? tally : [0]));
+  return (
+    <div style={pollScroll}>
+      <div style={{ fontSize: 15, fontWeight: 500, color: "#F4F2EC", lineHeight: 1.4 }}>{poll.question}</div>
+      <div style={{ fontSize: 12, fontWeight: 500, color: poll.revealed ? "#BFE048" : "#9A958A" }}>
+        {poll.revealed ? "Revealed to the room" : "Live — collecting votes"} · {total} vote{total === 1 ? "" : "s"}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {poll.options.map((opt, i) => {
+          const count = tally[i] ?? 0;
+          const correct = poll.correctIndex === i;
+          const pct = Math.round((count / max) * 100);
+          const share = total > 0 ? Math.round((count / total) * 100) : 0;
+          return (
+            <div key={i} style={presRow}>
+              <div
+                style={{
+                  ...presBar(poll.revealed && correct),
+                  width: `${pct}%`,
+                  transition: reduceMotion ? "none" : "width .45s ease",
+                }}
+                aria-hidden
+              />
+              <div style={presText}>
+                <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
+                  {poll.revealed && correct && <span style={presTag}>✓ correct</span>}
+                </span>
+                <span style={{ fontWeight: 600, flex: "0 0 auto" }}>
+                  {count}
+                  {total > 0 ? ` · ${share}%` : ""}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 2 }}>
+        {!poll.revealed && (
+          <button onClick={onReveal} style={{ ...btn("#BFE048", "#1B1B20"), flex: 1, height: 40, fontWeight: 600 }}>
+            Reveal to room
+          </button>
+        )}
+        <button onClick={onClose} style={{ ...btn("rgba(255,255,255,0.1)", "#F4F2EC"), flex: poll.revealed ? 1 : "0 0 auto", height: 40 }}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: "0.1em", textTransform: "uppercase", color: "#9A958A", marginBottom: 6 }}>
+      {children}
+    </div>
+  );
+}
+
+function mapDraftError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "no_content":
+      return "This slide has no text to quiz on.";
+    case "ai_not_configured":
+      return "AI isn't configured.";
+    default:
+      return "Couldn't draft — try again.";
+  }
+}
+
+const pollPanelWrap: React.CSSProperties = {
+  flex: "0 0 330px",
+  minWidth: 0,
+  minHeight: 0,
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: 14,
+  borderRadius: 12,
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.12)",
+};
+
+const pollScroll: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+};
+
+const pollInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  height: 36,
+  padding: "0 11px",
+  borderRadius: 9,
+  border: "1px solid rgba(255,255,255,0.16)",
+  background: "rgba(255,255,255,0.06)",
+  color: "#F4F2EC",
+  fontFamily: "inherit",
+  fontSize: 13,
+  outline: "none",
+};
+
+const pollTextarea: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  padding: "9px 11px",
+  borderRadius: 9,
+  resize: "vertical",
+  border: "1px solid rgba(255,255,255,0.16)",
+  background: "rgba(255,255,255,0.06)",
+  color: "#F4F2EC",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  lineHeight: 1.4,
+  outline: "none",
+};
+
+function correctDot(on: boolean): React.CSSProperties {
+  return {
+    width: 20,
+    height: 20,
+    flex: "0 0 auto",
+    borderRadius: "50%",
+    cursor: "pointer",
+    boxSizing: "border-box",
+    padding: 0,
+    border: on ? "6px solid #BFE048" : "2px solid rgba(255,255,255,0.3)",
+    background: on ? "#1B1B20" : "transparent",
+  };
+}
+
+const pollIconBtn: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  flex: "0 0 auto",
+  borderRadius: 8,
+  border: "1px solid rgba(255,255,255,0.14)",
+  background: "rgba(255,255,255,0.06)",
+  color: "#C9C5BC",
+  cursor: "pointer",
+  fontSize: 14,
+  lineHeight: 1,
+  padding: 0,
+};
+
+const addOptionBtn: React.CSSProperties = {
+  height: 34,
+  borderRadius: 9,
+  border: "1px dashed rgba(255,255,255,0.22)",
+  background: "transparent",
+  color: "#C9C5BC",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  fontSize: 12.5,
+  fontWeight: 500,
+};
+
+function draftBtn(loading: boolean): React.CSSProperties {
+  return {
+    height: 40,
+    borderRadius: 10,
+    border: "1px solid rgba(191,224,72,0.5)",
+    background: loading ? "rgba(191,224,72,0.12)" : "rgba(191,224,72,0.18)",
+    color: "#D6E88A",
+    cursor: loading ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 600,
+    opacity: loading ? 0.8 : 1,
+  };
+}
+
+function launchBtn(enabled: boolean): React.CSSProperties {
+  return {
+    height: 42,
+    borderRadius: 10,
+    border: "none",
+    background: enabled ? "#BFE048" : "#3A3838",
+    color: enabled ? "#1B1B20" : "#7A7770",
+    cursor: enabled ? "pointer" : "default",
+    fontFamily: "inherit",
+    fontSize: 14,
+    fontWeight: 600,
+  };
+}
+
+const pollErrorText: React.CSSProperties = {
+  fontSize: 12,
+  color: "#FF8A6B",
+  fontWeight: 500,
+};
+
+const pollExplain: React.CSSProperties = {
+  fontSize: 12,
+  color: "#9A958A",
+  lineHeight: 1.5,
+  fontStyle: "italic",
+  padding: "8px 10px",
+  borderRadius: 8,
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.08)",
+};
+
+const presRow: React.CSSProperties = {
+  position: "relative",
+  borderRadius: 9,
+  overflow: "hidden",
+  background: "rgba(255,255,255,0.05)",
+  padding: "9px 11px",
+};
+
+function presBar(correct: boolean): React.CSSProperties {
+  return {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    borderRadius: 9,
+    background: correct ? "rgba(191,224,72,0.32)" : "rgba(255,255,255,0.1)",
+  };
+}
+
+const presText: React.CSSProperties = {
+  position: "relative",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  fontSize: 13,
+  color: "#F4F2EC",
+};
+
+const presTag: React.CSSProperties = {
+  fontSize: 9.5,
+  fontWeight: 700,
+  letterSpacing: "0.05em",
+  textTransform: "uppercase",
+  color: "#BFE048",
+  whiteSpace: "nowrap",
+  flex: "0 0 auto",
+};
