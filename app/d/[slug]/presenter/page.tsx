@@ -56,10 +56,11 @@ export default async function PresenterPage({
   const deck = await getDeck(slug);
   if (!deck) notFound();
 
-  // Uploaded decks have no live-presenter sync in Phase 1 — they're self-contained
-  // artifacts, so the presenter route just renders the same sandboxed frame (no
-  // notes/next-slide console). Check before the embedUrl branch below.
-  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} />;
+  // Uploaded decks are now live-presentable too (#7): this route is fully
+  // presenter-gated (redirect above), so render the sandboxed frame in PRESENTER
+  // role — the presenter drives it and viewers on /d/<slug> follow. Check before
+  // the embedUrl branch below.
+  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} role="presenter" />;
 
   // The live deck's presenter view is the dedicated console.
   if (deck.embedUrl) {
