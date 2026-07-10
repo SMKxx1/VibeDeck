@@ -1,96 +1,496 @@
 "use client";
 
-// Full-bleed viewer for an uploaded deck's OWN self-contained HTML, served from
-// the isolated DECK_ORIGIN and framed here under a hard sandbox.
+// Full-bleed live viewer for an uploaded deck's OWN self-contained HTML, served
+// from the isolated DECK_ORIGIN and framed here under a hard sandbox.
 //
-// This is NOT LiveDeck. LiveDeck wraps the one trusted first-party workshop deck
-// and speaks a full two-way live-session protocol with it (role/goto/pins/
-// heartbeat) — a bridge that assumes the framed content is cooperative and
-// same-trust. Uploaded HTML is UNTRUSTED stored content, so it never gets that.
+// This is NOT LiveDeck. LiveDeck wraps the one trusted first-party workshop deck.
+// Uploaded HTML is UNTRUSTED stored content — so it gets the SAME multi-user live
+// experience (presenter drives, viewers follow, reactions/polls/Q&A) but through a
+// deliberately narrow, navigation-only bridge that never trusts the framed content
+// and never hands it anything worth stealing.
 //
-// What it DOES get (new in Phase 2): a RECEIVE-ONLY bridge + the AI tutor.
-// Uploaded decks are now served with the shared runtime injected server-side,
-// which includes the same live bridge.js. That bridge reports slide changes to
-// us (index/total/label) so the deck can (a) show its position and (b) ground
-// the AI sidebar in whatever slide is on screen — the product's signature
-// feature. We only OBSERVE; the deck drives its own navigation (keyboard/click
-// handled by its own runtime). There is no live-presenter sync for uploaded
-// decks in Phase 2 — they're single-viewer artifacts.
+// Why this stays safe for untrusted content — the trust model differs from LiveDeck
+// on two load-bearing axes:
 //
-// Why this is safe for untrusted content — the trust model differs from LiveDeck
-// on two axes, both load-bearing:
+//   1. IDENTITY, not origin. A sandboxed frame with NO `allow-same-origin` runs in
+//      an opaque origin, so `event.origin` is the literal string "null" — useless
+//      (and checking it would reject every real message). The real authenticator is
+//      `event.source === iframeRef.current.contentWindow`: the message
+//      object-identity of OUR frame's window, which untrusted code elsewhere on the
+//      page cannot forge. We accept a message ONLY when that holds AND it carries
+//      the `source:"deck"` marker; everything else is dropped. (LiveDeck trusts the
+//      `source:"deck"` marker alone — fine for a first-party deck, too weak here.)
 //
-//   1. IDENTITY, not origin. A sandboxed frame with NO `allow-same-origin` runs
-//      in an opaque origin, so `event.origin` is the literal string "null" —
-//      useless (and checking it would reject every real message). The real
-//      authenticator is `event.source === iframeRef.current.contentWindow`:
-//      the message object-identity of OUR frame's window, which untrusted code
-//      elsewhere on the page cannot forge. We accept a message ONLY when that
-//      holds AND it carries the `source:"deck"` marker; everything else is
-//      dropped. (LiveDeck trusts the `source:"deck"` marker alone — fine for a
-//      first-party deck, too weak here.)
-//
-//   2. RECEIVE-ONLY for data. The ONLY message we ever post to the frame is the
-//      EMPTY `{ type:"deck:report" }` — a control ping that asks the deck to
-//      re-emit its current slide (covers the boot race where the deck's first
-//      report fires before our listener attaches). We NEVER post deck:role,
-//      deck:pins, deck:goto, deck:advance, or any session/pin/navigation data:
-//      a sandboxed deck can navigate ITSELF to an attacker origin, and because
-//      we can't target a specific origin at an opaque frame (targetOrigin must
-//      be "*"), any data-bearing send would then leak to wherever it went. An
-//      empty control ping carries nothing worth leaking.
+//   2. SEND is NAVIGATION-ONLY, through ONE choke point. Everything we post to the
+//      frame goes through `sendToDeck`, whose argument type is a closed union of
+//      exactly four whitelisted, non-sensitive navigation messages:
+//        • { type:"deck:goto", index }      — sync the frame to a slide number
+//        • { type:"deck:role", role, max?, locked? } — set follow/clamp enforcement
+//        • { type:"deck:advance", dir }      — step the deck (unused here, whitelisted)
+//        • { type:"deck:report" }            — ask the deck to re-emit its slide
+//      targetOrigin MUST be "*" (an opaque-origin frame has no specific origin to
+//      target). Rationale: a sandboxed deck can navigate ITSELF to an attacker
+//      origin, and a "*" send would then reach WHEREVER it went — so we send ONLY
+//      navigation ints/enums (a slide index or a role), which are meaningless to
+//      leak. We NEVER post pins, viewer names, session tokens, poll/Q&A payloads,
+//      or ANY secret to the frame — exactly the pin/session data Phase 2
+//      deliberately withheld. ALL /api/* traffic happens in THIS React parent
+//      (the deck's own CSP is `connect-src 'none'`; it makes no network requests).
 //
 // Sandbox rationale (each omission is load-bearing, not an oversight):
-//   sandbox="allow-scripts"  — the deck runs its own JS engine + bridge, but
-//     with NO `allow-same-origin`, so even though it's served from DECK_ORIGIN
-//     the frame is forced into an opaque, origin-of-its-own context: it can't
-//     read cookies, localStorage, or the DOM of THIS parent, and same-origin
-//     fetches from inside it are treated cross-origin. This is the primary
-//     containment — do NOT add allow-same-origin.
-//   (no allow-top-navigation)   — untrusted content can't hijack the top frame
-//     to redirect the user off-site.
+//   sandbox="allow-scripts"  — the deck runs its own JS engine + bridge, but with
+//     NO `allow-same-origin`, so even though it's served from DECK_ORIGIN the frame
+//     is forced into an opaque, origin-of-its-own context: it can't read cookies,
+//     localStorage, or the DOM of THIS parent, and same-origin fetches from inside
+//     it are treated cross-origin. This is the primary containment — do NOT add
+//     allow-same-origin.
+//   (no allow-top-navigation)   — untrusted content can't hijack the top frame.
 //   (no allow-same-origin)      — see above; the whole point of the isolation.
 //   allow="fullscreen"          — the only capability an artifact deck legitimately
-//     needs; it's a Permissions-Policy grant, orthogonal to the sandbox trust bits.
+//     needs; a Permissions-Policy grant, orthogonal to the sandbox trust bits.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Deck } from "@/lib/types";
 import { LiveChat } from "./LiveChat";
 import { useFullscreen } from "@/lib/useFullscreen";
 
-// Reuse the workshop's stored viewer name so the AI greeting is personal for
-// anyone who already named themselves. An uploaded deck is a single-viewer
-// artifact, so there's no name gate here — stored name, or a neutral fallback.
+// Reuse the workshop's stored viewer name so a returning visitor keeps their name
+// across decks. Where a name is REQUIRED (vote / ask / presence heartbeat) we gate
+// exactly like LiveDeck — but watching itself never requires a name.
 const NAME_KEY = "presentation:name";
 
-// Only the fields we OBSERVE from the deck's `slidechange`. We don't track
-// nextLabel/notes/reason — those exist for the presenter/sync machinery an
-// uploaded deck doesn't have.
+// Viewer session cadence (mirrors LiveDeck): snappy while a presenter is live,
+// lazy when idle, near-dormant when the tab is hidden.
+const POLL_MS = Number(process.env.NEXT_PUBLIC_SESSION_POLL_MS) || 2000;
+const IDLE_POLL_MS = 10_000; // viewer, no presenter live
+const HIDDEN_POLL_MS = 60_000; // tab in the background
+const PRESENTER_POLL_MS = 5_000; // presenter: session read is a display-only fallback
+
+// Viewer Q&A panel poll — runs only while the panel is open (mirrors LiveDeck).
+const QNA_POLL_MS = 5_000;
+const QNA_HIDDEN_MS = 30_000;
+
+// Presenter live-room tick (roster + reactions + poll + Q&A on ONE ~4s timer, with
+// hidden-tab backoff — mirrors PresenterConsole).
+const PRESENCE_POLL_MS = 4_000;
+const PRESENCE_HIDDEN_MS = 30_000;
+
+type Role = "presenter" | "viewer";
+
+// Viewer→presenter backchannel reaction kinds (#2). "lost" is its own button; the
+// rest ride in a compact icon row.
+type SignalKind = "up" | "party" | "slow" | "hand" | "lost";
+const REACTIONS: { kind: SignalKind; emoji: string; label: string }[] = [
+  { kind: "up", emoji: "👍", label: "Nice" },
+  { kind: "party", emoji: "🎉", label: "Celebrate" },
+  { kind: "slow", emoji: "🐢", label: "Slow down" },
+  { kind: "hand", emoji: "🙋", label: "Raise hand" },
+];
+// Only these float over the presenter's slide; slow/lost drive the help meter.
+const ANIMATE_KINDS = new Set<SignalKind>(["up", "party", "hand"]);
+const REACTION_EMOJI: Record<string, string> = { up: "👍", party: "🎉", hand: "🙋" };
+const FLOAT_KEYFRAMES =
+  "@keyframes vibedeck-rise{0%{transform:translateY(0) scale(0.7);opacity:0}15%{opacity:1}100%{transform:translateY(-150px) scale(1.15);opacity:0}}";
+
+// SECURITY: the closed set of messages `sendToDeck` may post to the untrusted
+// frame. The union itself is the whitelist — the compiler rejects anything that
+// isn't one of these navigation-only shapes, so there is no code path that can post
+// a pin, name, token, or poll/Q&A payload to the deck. See header comment §2.
+type DeckControlMessage =
+  | { type: "deck:goto"; index: number }
+  | { type: "deck:role"; role: Role; max?: number; locked?: boolean }
+  | { type: "deck:advance"; dir: number }
+  | { type: "deck:report" };
+
+// ── receive-only slide state (what the deck reports over `slidechange`) ──
 interface DeckState {
   index: number;
   total: number;
   label: string;
 }
+interface SessionState {
+  index: number;
+  max: number;
+  // A presenter is actively presenting. When false, viewers browse freely.
+  live: boolean;
+}
 
-export function UploadedDeckFrame({ deck }: { deck: Deck }) {
+// Viewer-safe poll projection, delivered on the SAME /api/session read (#3).
+interface ViewerPoll {
+  id: string;
+  question: string;
+  options: string[];
+  revealed: boolean;
+  correctIndex: number | null;
+  tally: number[] | null;
+  total: number | null;
+  at: number;
+}
+// A question in the upvotable Q&A queue (#5).
+interface QnaQuestion {
+  id: string;
+  name: string;
+  text: string;
+  votes: number;
+  answered: boolean;
+  dismissed: boolean;
+  at: number;
+}
+// Presenter-side records (full poll incl. correct answer/tally; roster; signals).
+interface Poll {
+  id: string;
+  question: string;
+  options: string[];
+  correctIndex: number | null;
+  revealed: boolean;
+  tally: number[] | null;
+  total: number | null;
+  at: number;
+}
+interface Viewer {
+  name: string;
+  index: number;
+  follow: boolean;
+}
+interface Signal {
+  name: string;
+  kind: SignalKind;
+  at: number;
+}
+
+// `role` defaults to "viewer" so the two untouched callers (the public home page
+// and the embed-deck presenter console) keep the viewer experience; the deck page
+// (/d/[slug]) passes role="presenter" when the request carries the presenter cookie.
+export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck; role?: Role }) {
+  const slug = meta.slug;
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const { isFullscreen, toggle } = useFullscreen();
 
-  const [state, setState] = useState<DeckState>({ index: 0, total: 0, label: "" });
-  const [chatOpen, setChatOpen] = useState(false);
+  // Shared across roles.
   const [name, setName] = useState<string | null>(null);
+  const [showGate, setShowGate] = useState(false);
+  const [deck, setDeck] = useState<DeckState>({ index: 0, total: 0, label: "" });
+  const [session, setSession] = useState<SessionState>({ index: 0, max: 0, live: false });
+  const [chatOpen, setChatOpen] = useState(false);
+  const [reduceMotion, setReduceMotion] = useState(false);
 
-  // The ONE and ONLY message we ever post to an untrusted frame: an EMPTY
-  // control ping asking the deck to re-emit its current slide. It carries no
-  // data, and targetOrigin MUST be "*" (an opaque-origin frame has no specific
-  // origin to target). See the receive-only rationale in the header comment.
-  const requestReport = useCallback(() => {
-    iframeRef.current?.contentWindow?.postMessage({ type: "deck:report" }, "*");
+  // Viewer.
+  const [autoFollow, setAutoFollow] = useState(true);
+  const [watching, setWatching] = useState(0);
+  const [poll, setPoll] = useState<ViewerPoll | null>(null);
+  const [myVote, setMyVote] = useState<{ pollId: string; optionIndex: number } | null>(null);
+  const [qnaOpen, setQnaOpen] = useState(false);
+  const [questions, setQuestions] = useState<QnaQuestion[]>([]);
+  const [myVotes, setMyVotes] = useState<Record<string, boolean>>({});
+
+  // Presenter live-room panels.
+  const [roster, setRoster] = useState<{ count: number; viewers: Viewer[] }>({ count: 0, viewers: [] });
+  const [help, setHelp] = useState<{ lost: number; slow: number }>({ lost: 0, slow: 0 });
+  const [reactionCount, setReactionCount] = useState(0);
+  const [floats, setFloats] = useState<{ id: number; emoji: string; left: number }[]>([]);
+  const [rosterOpen, setRosterOpen] = useState(false);
+  const [pollPanelOpen, setPollPanelOpen] = useState(false);
+  const [livePoll, setLivePoll] = useState<Poll | null>(null);
+  const [liveTally, setLiveTally] = useState<number[]>([]);
+  const [liveTotal, setLiveTotal] = useState(0);
+
+  // Refs so the (stable) message/poll handlers always read live values.
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const autoFollowRef = useRef(autoFollow);
+  autoFollowRef.current = autoFollow;
+  const nameRef = useRef(name);
+  nameRef.current = name;
+  const deckRef = useRef(deck);
+  deckRef.current = deck;
+  const voteCtrlRef = useRef<AbortController | null>(null);
+  // Presenter tick guards (mirror PresenterConsole).
+  const livePollRef = useRef(livePoll);
+  livePollRef.current = livePoll;
+  const closedPollIdRef = useRef<string | null>(null);
+  const pollCtrlRef = useRef<AbortController | null>(null);
+  const lastAtRef = useRef(0);
+  const seededRef = useRef(false);
+  const floatIdRef = useRef(0);
+  const floatTimersRef = useRef<number[]>([]);
+  const reduceMotionRef = useRef(reduceMotion);
+  reduceMotionRef.current = reduceMotion;
+
+  // ── SECURITY choke point — the ONLY function that posts to the untrusted frame.
+  // targetOrigin is "*" (opaque frame); the DeckControlMessage union caps what can
+  // ever be sent to navigation-only ints/enums. See header comment §2.
+  const sendToDeck = useCallback((msg: DeckControlMessage) => {
+    iframeRef.current?.contentWindow?.postMessage(msg, "*");
   }, []);
 
-  // Load the stored viewer name (if the visitor already named themselves in the
-  // workshop). Best-effort — localStorage can throw in locked-down contexts.
+  // Free-roam bridge role: no clamp, no follow. Used for viewers with no live presenter.
+  const sendFree = useCallback(() => {
+    sendToDeck({ type: "deck:role", role: "viewer", max: 1e9, locked: false });
+  }, [sendToDeck]);
+
+  const pushRole = useCallback(() => {
+    if (role === "presenter") {
+      sendToDeck({ type: "deck:role", role: "presenter" });
+      return;
+    }
+    const s = sessionRef.current;
+    if (!s.live) sendFree();
+    else sendToDeck({ type: "deck:role", role: "viewer", max: s.max, locked: autoFollowRef.current });
+  }, [role, sendToDeck, sendFree]);
+
+  // Sync THIS frame to `index` (a follow) — the deck reports it with reason 'api',
+  // so it never re-drives the session. See the slidechange handler for loop-safety.
+  const followTo = useCallback(
+    (index: number) => {
+      if (index !== deckRef.current.index) sendToDeck({ type: "deck:goto", index });
+    },
+    [sendToDeck],
+  );
+
+  // Presenter → broadcast a position, reset the lock, or just heartbeat.
+  const postPresenter = useCallback(
+    async (opts: { index?: number; reset?: boolean; heartbeat?: boolean }) => {
+      try {
+        const res = await fetch("/api/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, ...opts }),
+        });
+        if (res.ok) setSession((await res.json()) as SessionState);
+      } catch {
+        /* ignore — presenter keeps presenting */
+      }
+    },
+    [slug],
+  );
+
+  // SECURITY (untrusted content): the deck reports slide changes, and the presenter
+  // path turns a user-nav report into a POST /api/session. But an uploaded deck is
+  // UNTRUSTED — a malicious one opened by a presenter can forge slidechange
+  // {reason:"click", index} in a tight loop. Unlike LiveDeck's first-party deck, we
+  // can't trust the report rate or `index`. The deck can't POST /api/session itself
+  // (sandboxed opaque origin → cross-origin, no presenter cookie, assertSameOrigin
+  // rejects it), so EVERY session write goes through this parent — which makes
+  // coalescing HERE authoritative. We trailing-debounce to at most one write per
+  // 250ms, drop duplicate indices, and clamp the (untrusted) index to a sane range.
+  const pendingIdxRef = useRef<number | null>(null);
+  const lastPostedIdxRef = useRef<number>(-1);
+  const postTimerRef = useRef<number | null>(null);
+  const schedulePresenterPost = useCallback(
+    (rawIdx: number) => {
+      pendingIdxRef.current = Math.max(0, Math.min(9999, Math.floor(rawIdx) || 0));
+      if (postTimerRef.current != null) return; // a trailing write is already queued
+      postTimerRef.current = window.setTimeout(() => {
+        postTimerRef.current = null;
+        const next = pendingIdxRef.current;
+        pendingIdxRef.current = null;
+        if (next == null || next === lastPostedIdxRef.current) return;
+        lastPostedIdxRef.current = next;
+        void postPresenter({ index: next });
+      }, 250);
+    },
+    [postPresenter],
+  );
+  useEffect(
+    () => () => {
+      if (postTimerRef.current != null) window.clearTimeout(postTimerRef.current);
+    },
+    [],
+  );
+
+  // ── viewer backchannel actions (ported from LiveDeck) ──
+  const sendSignal = useCallback(
+    async (kind: SignalKind) => {
+      const who = nameRef.current;
+      if (!who) return;
+      try {
+        await fetch("/api/signal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, name: who, kind }),
+        });
+      } catch {
+        /* best-effort */
+      }
+    },
+    [slug],
+  );
+
+  const castVote = useCallback(
+    async (pollId: string, optionIndex: number) => {
+      const who = nameRef.current;
+      if (!who) return;
+      voteCtrlRef.current?.abort();
+      const ctrl = new AbortController();
+      voteCtrlRef.current = ctrl;
+      setMyVote({ pollId, optionIndex });
+      try {
+        const res = await fetch("/api/poll/vote", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, pollId, optionIndex, name: who }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) setMyVote((m) => (m && m.pollId === pollId ? null : m));
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setMyVote((m) => (m && m.pollId === pollId ? null : m));
+      }
+    },
+    [slug],
+  );
+
+  const upvoteQuestion = useCallback(
+    async (qid: string) => {
+      const who = nameRef.current;
+      if (!who) {
+        setShowGate(true);
+        return;
+      }
+      setMyVotes((m) => (m[qid] ? m : { ...m, [qid]: true }));
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action: "upvote", qid, name: who }),
+        });
+        if (res.ok) {
+          const { votes } = (await res.json()) as { votes?: number };
+          if (typeof votes === "number") {
+            setQuestions((qs) => qs.map((q) => (q.id === qid ? { ...q, votes } : q)));
+          }
+        } else {
+          setMyVotes((m) => {
+            const n = { ...m };
+            delete n[qid];
+            return n;
+          });
+        }
+      } catch {
+        setMyVotes((m) => {
+          const n = { ...m };
+          delete n[qid];
+          return n;
+        });
+      }
+    },
+    [slug],
+  );
+
+  const askQuestion = useCallback(
+    async (text: string): Promise<string | null> => {
+      const who = nameRef.current;
+      if (!who) {
+        setShowGate(true);
+        return "Enter a name to ask.";
+      }
+      const t = text.trim();
+      if (!t) return null;
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action: "ask", name: who, text: t }),
+        });
+        if (res.ok) {
+          const { question } = (await res.json()) as { question?: QnaQuestion };
+          if (question) {
+            setQuestions((qs) => (qs.some((q) => q.id === question.id) ? qs : [...qs, question]));
+          }
+          return null;
+        }
+        if (res.status === 429) return "You're doing that too fast.";
+        return "Couldn't post — the queue may be full.";
+      } catch {
+        return "Couldn't post — try again.";
+      }
+    },
+    [slug],
+  );
+
+  // ── presenter poll control (ported from PresenterConsole) ──
+  const pollAction = useCallback(
+    async (body: Record<string, unknown>) => {
+      pollCtrlRef.current?.abort();
+      const ctrl = new AbortController();
+      pollCtrlRef.current = ctrl;
+      return fetch("/api/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, ...body }),
+        signal: ctrl.signal,
+      });
+    },
+    [slug],
+  );
+
+  const openPollAction = useCallback(
+    async (question: string, options: string[], correctIndex: number | null): Promise<boolean> => {
+      try {
+        const res = await pollAction({ action: "open", question, options, correctIndex });
+        if (!res.ok) return false;
+        const data = (await res.json()) as { poll: Poll; tally?: number[]; total?: number };
+        closedPollIdRef.current = null;
+        setLivePoll(data.poll);
+        setLiveTally(data.tally ?? new Array(data.poll.options.length).fill(0));
+        setLiveTotal(data.total ?? 0);
+        return true;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return false;
+        return false;
+      }
+    },
+    [pollAction],
+  );
+
+  const revealPollAction = useCallback(async () => {
+    try {
+      const res = await pollAction({ action: "reveal" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { poll: Poll; tally?: number[]; total?: number };
+      setLivePoll(data.poll);
+      setLiveTally(data.tally ?? []);
+      setLiveTotal(data.total ?? 0);
+    } catch {
+      /* aborted / transient — the tick reconciles */
+    }
+  }, [pollAction]);
+
+  const closePollAction = useCallback(async () => {
+    closedPollIdRef.current = livePollRef.current?.id ?? null;
+    setLivePoll(null);
+    setLiveTally([]);
+    setLiveTotal(0);
+    try {
+      await pollAction({ action: "close" });
+    } catch {
+      /* aborted / transient */
+    }
+  }, [pollAction]);
+
+  // ── presenter Q&A control (ported from PresenterConsole) ──
+  const qnaAction = useCallback(
+    async (action: "answer" | "dismiss" | "undismiss", qid: string) => {
+      try {
+        const res = await fetch("/api/qna", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, action, qid }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { questions?: QnaQuestion[] };
+          if (data.questions) setQuestions(data.questions);
+        }
+      } catch {
+        /* transient — the tick will refresh */
+      }
+    },
+    [slug],
+  );
+
+  // Load stored viewer name (best-effort — localStorage can throw). Presenter chats
+  // as "Presenter", but a stored name is still harmless to read.
   useEffect(() => {
     try {
       const n = localStorage.getItem(NAME_KEY);
@@ -100,87 +500,404 @@ export function UploadedDeckFrame({ deck }: { deck: Deck }) {
     }
   }, []);
 
-  // Receive-only bridge: track the current slide from the deck's `slidechange`.
+  // A fresh poll id means a brand-new question — drop any prior "your choice".
+  const pollId = poll?.id ?? null;
   useEffect(() => {
-    function onMessage(event: MessageEvent) {
-      const data = (event.data ?? {}) as { source?: string; type?: string } & Partial<DeckState>;
-      // SECURITY GUARD — accept a message ONLY from our OWN frame's window
-      // (object identity, unforgeable) AND carrying the deck marker. We do NOT
-      // check event.origin: it's the string "null" for an opaque-origin sandbox,
-      // so checking it would reject everything. See header comment §1.
-      if (!(event.source === iframeRef.current?.contentWindow && data.source === "deck")) return;
-      if (data.type === "slidechange") {
-        setState({
-          index: data.index ?? 0,
-          total: data.total ?? 0,
-          label: data.label ?? "",
-        });
-      }
-      // `ready`/`activity` are ignored — an uploaded deck has no role handshake
-      // to push on ready, and no auto-hiding presenter overlay to wake.
-    }
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
+    setMyVote(null);
+  }, [pollId]);
+
+  // Honor prefers-reduced-motion (viewer poll bars + presenter reaction floats).
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const apply = () => setReduceMotion(mq.matches);
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
   }, []);
 
-  // Cover the boot race: the deck may fire its first `slidechange` before this
-  // component's listener attached (or before the bridge finished booting). The
-  // iframe's onLoad also pings once, but keep asking until we actually have a
-  // slide count — mirrors how LiveDeck polls deck:report.
-  useEffect(() => {
-    if (!deck.contentUrl || state.total > 0) return;
-    requestReport();
-    const id = window.setInterval(requestReport, 350);
-    return () => window.clearInterval(id);
-  }, [deck.contentUrl, state.total, requestReport]);
+  // Abort any in-flight vote / poll-control request when the deck unmounts.
+  useEffect(() => () => voteCtrlRef.current?.abort(), []);
+  useEffect(() => () => pollCtrlRef.current?.abort(), []);
+  useEffect(
+    () => () => {
+      floatTimersRef.current.forEach((t) => window.clearTimeout(t));
+      floatTimersRef.current = [];
+    },
+    [],
+  );
 
-  // contentUrl is undefined when DECK_ORIGIN is unset. We can't guess an origin
-  // for untrusted content, and we must never fall back to serving it from the
-  // app's own origin (that would defeat the isolation entirely) — so surface a
-  // neutral "unavailable" state rather than crash or leak the deck onto the
-  // first-party origin. (Hooks above run unconditionally so this early return
-  // never changes hook order for a given deck.)
-  if (!deck.contentUrl) {
+  // Viewer Q&A queue poll (#5): runs only while the panel is open (spares Redis).
+  useEffect(() => {
+    if (role !== "viewer" || !qnaOpen || showGate) return;
+    let alive = true;
+    let timer: number | undefined;
+    const ctrl = new AbortController();
+
+    async function pull() {
+      try {
+        const res = await fetch(`/api/qna?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { questions?: QnaQuestion[] };
+        if (alive) setQuestions(data.questions ?? []);
+      } catch {
+        /* transient / aborted */
+      }
+    }
+    function nextDelay(): number {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return QNA_HIDDEN_MS;
+      return QNA_POLL_MS;
+    }
+    async function loop() {
+      if (!alive) return;
+      await pull();
+      if (!alive) return;
+      timer = window.setTimeout(loop, nextDelay());
+    }
+    void loop();
+    const onVisible = () => {
+      if (!alive || document.visibilityState !== "visible") return;
+      window.clearTimeout(timer);
+      void loop();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [role, qnaOpen, showGate, slug]);
+
+  // Messages from the deck bridge (receive guard: our frame's window + deck marker).
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      const d = (e.data ?? {}) as { source?: string; type?: string; reason?: string } & Partial<DeckState>;
+      // SECURITY GUARD — object-identity of OUR frame + the deck marker. We do NOT
+      // check event.origin ("null" for an opaque sandbox). See header comment §1.
+      if (!(e.source === iframeRef.current?.contentWindow && d.source === "deck")) return;
+      if (d.type === "ready") {
+        pushRole();
+        if (role === "viewer" && autoFollowRef.current && sessionRef.current.live) {
+          followTo(sessionRef.current.index);
+        }
+      } else if (d.type === "slidechange") {
+        const idx = d.index ?? 0;
+        setDeck({ index: idx, total: d.total ?? 0, label: d.label ?? "" });
+        // LOOP-SAFETY: only the PRESENTER's OWN navigation drives the session. A
+        // followed move is reported with reason 'api' (init/sync for boot pings) —
+        // never re-POSTed. Viewers never drive at all.
+        const userNav = d.reason !== "api" && d.reason !== "init" && d.reason !== "sync";
+        // Debounced + clamped: a forged slidechange flood can't amplify into
+        // unbounded authenticated session writes. See schedulePresenterPost.
+        if (role === "presenter" && userNav) schedulePresenterPost(idx);
+      }
+      // `activity` is ignored — no auto-hiding presenter overlay here.
+    }
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [role, pushRole, followTo, schedulePresenterPost]);
+
+  // Poll the shared session. Viewers lock/follow while a presenter is live and
+  // browse freely otherwise; presenters read it for the "viewers unlocked" display.
+  useEffect(() => {
+    if (role === "viewer" && showGate) return;
+    let alive = true;
+    let timer: number | undefined;
+    let lastLive = false;
+    const ctrl = new AbortController();
+
+    // Viewer presence heartbeat (#1) on the SAME tick as the session read — name-gated.
+    async function beat() {
+      const who = nameRef.current;
+      if (role !== "viewer" || !who) return;
+      try {
+        const res = await fetch("/api/presence", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            slug,
+            name: who,
+            index: deckRef.current.index,
+            follow: autoFollowRef.current,
+          }),
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { watching?: number };
+        if (alive && typeof data.watching === "number") setWatching(data.watching);
+      } catch {
+        /* transient / aborted */
+      }
+    }
+
+    async function pull() {
+      try {
+        const res = await fetch(`/api/session?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !alive) return;
+        const s = (await res.json()) as SessionState & { poll?: ViewerPoll | null };
+        lastLive = s.live;
+        setSession(s);
+        if (role === "presenter") return; // presenter drives locally, never from this poll
+        setPoll(s.poll ?? null);
+        void beat();
+        if (!s.live) {
+          sendFree();
+          return;
+        }
+        sendToDeck({ type: "deck:role", role: "viewer", max: s.max, locked: autoFollowRef.current });
+        if (autoFollowRef.current) followTo(s.index);
+      } catch {
+        /* transient */
+      }
+    }
+
+    function nextDelay(): number {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return HIDDEN_POLL_MS;
+      if (role === "presenter") return PRESENTER_POLL_MS;
+      return lastLive ? POLL_MS : IDLE_POLL_MS;
+    }
+    async function loop() {
+      if (!alive) return;
+      await pull();
+      if (!alive) return;
+      timer = window.setTimeout(loop, nextDelay());
+    }
+    void loop();
+    const onVisible = () => {
+      if (!alive || document.visibilityState !== "visible") return;
+      window.clearTimeout(timer);
+      void loop();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [role, showGate, slug, sendToDeck, sendFree, followTo]);
+
+  // Viewer: react to the auto-follow toggle (only meaningful while live).
+  useEffect(() => {
+    if (role !== "viewer") return;
+    const s = sessionRef.current;
+    if (!s.live) {
+      sendFree();
+      return;
+    }
+    sendToDeck({ type: "deck:role", role: "viewer", max: s.max, locked: autoFollow });
+    if (autoFollow) followTo(s.index);
+  }, [autoFollow, role, sendToDeck, sendFree, followTo]);
+
+  // Presenter: heartbeat so viewers know a session is live even between moves.
+  useEffect(() => {
+    if (role !== "presenter") return;
+    void postPresenter({ heartbeat: true });
+    const id = window.setInterval(() => void postPresenter({ heartbeat: true }), 10_000);
+    return () => window.clearInterval(id);
+  }, [role, postPresenter]);
+
+  // Presenter live-room tick (#1 roster / #2 reactions + help meter / #3 poll /
+  // #5 Q&A) — one ~4s timer, hidden-tab backoff, abort-on-unmount. Ported from
+  // PresenterConsole. Presenter-gated GETs (this page carries the presenter cookie).
+  useEffect(() => {
+    if (role !== "presenter") return;
+    let alive = true;
+    let timer: number | undefined;
+    const ctrl = new AbortController();
+    const enc = encodeURIComponent(slug);
+
+    function spawnFloat(emoji: string) {
+      if (!alive) return;
+      const id = ++floatIdRef.current;
+      const left = 10 + Math.random() * 66;
+      setFloats((f) => [...f, { id, emoji, left }]);
+      const t = window.setTimeout(() => {
+        floatTimersRef.current = floatTimersRef.current.filter((x) => x !== t);
+        if (!alive) return;
+        setFloats((f) => f.filter((x) => x.id !== id));
+      }, 2100);
+      floatTimersRef.current.push(t);
+    }
+
+    function onSignals(list: Signal[]) {
+      const maxAt = list.length ? list[0].at : lastAtRef.current; // newest-first
+      if (!seededRef.current) {
+        seededRef.current = true;
+        lastAtRef.current = list.length ? maxAt : 0;
+        return;
+      }
+      const fresh = list.filter((s) => s.at > lastAtRef.current && ANIMATE_KINDS.has(s.kind));
+      if (list.length) lastAtRef.current = Math.max(lastAtRef.current, maxAt);
+      if (!fresh.length || reduceMotionRef.current) return;
+      fresh
+        .slice()
+        .reverse()
+        .forEach((s, i) => {
+          const t = window.setTimeout(() => {
+            floatTimersRef.current = floatTimersRef.current.filter((x) => x !== t);
+            spawnFloat(REACTION_EMOJI[s.kind] ?? "✨");
+          }, i * 140);
+          floatTimersRef.current.push(t);
+        });
+    }
+
+    async function tick() {
+      try {
+        const [pRes, sRes, qRes, qaRes] = await Promise.all([
+          fetch(`/api/presence?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/signal?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/poll?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/qna?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+        ]);
+        if (alive && pRes.ok) {
+          const data = (await pRes.json()) as { count?: number; viewers?: Viewer[] };
+          setRoster({ count: data.count ?? 0, viewers: data.viewers ?? [] });
+        }
+        if (alive && sRes.ok) {
+          const sig = (await sRes.json()) as { signals?: Signal[]; lost?: number; slow?: number };
+          const list = sig.signals ?? [];
+          setHelp({ lost: sig.lost ?? 0, slow: sig.slow ?? 0 });
+          setReactionCount(list.filter((s) => ANIMATE_KINDS.has(s.kind)).length);
+          onSignals(list);
+        }
+        if (alive && qRes.ok) {
+          const data = (await qRes.json()) as { poll?: Poll | null; tally?: number[]; total?: number };
+          const incoming = data.poll ?? null;
+          const cur = livePollRef.current;
+          const stale =
+            !!incoming &&
+            (incoming.id === closedPollIdRef.current ||
+              (!!cur && cur.id === incoming.id && cur.revealed && !incoming.revealed));
+          if (!stale) {
+            setLivePoll(incoming);
+            setLiveTally(incoming ? data.tally ?? [] : []);
+            setLiveTotal(incoming ? data.total ?? 0 : 0);
+          }
+        }
+        if (alive && qaRes.ok) {
+          const data = (await qaRes.json()) as { questions?: QnaQuestion[] };
+          setQuestions(data.questions ?? []);
+        }
+      } catch {
+        /* transient / aborted */
+      }
+    }
+
+    function nextDelay(): number {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return PRESENCE_HIDDEN_MS;
+      return PRESENCE_POLL_MS;
+    }
+    async function loop() {
+      if (!alive) return;
+      await tick();
+      if (!alive) return;
+      timer = window.setTimeout(loop, nextDelay());
+    }
+    void loop();
+    const onVisible = () => {
+      if (!alive || document.visibilityState !== "visible") return;
+      window.clearTimeout(timer);
+      void loop();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [role, slug]);
+
+  // Cover the boot race: the deck may fire its first `slidechange` before this
+  // component's listener attached. Keep pinging deck:report until we have a count.
+  useEffect(() => {
+    if (!meta.contentUrl || deck.total > 0) return;
+    sendToDeck({ type: "deck:report" });
+    const id = window.setInterval(() => sendToDeck({ type: "deck:report" }), 350);
+    return () => window.clearInterval(id);
+  }, [meta.contentUrl, deck.total, sendToDeck]);
+
+  const saveName = (n: string) => {
+    const clean = n.trim().slice(0, 40);
+    if (!clean) return;
+    try {
+      localStorage.setItem(NAME_KEY, clean);
+    } catch {
+      /* ignore */
+    }
+    setName(clean);
+    setShowGate(false);
+  };
+
+  // contentUrl is undefined when DECK_ORIGIN is unset — we must NEVER serve untrusted
+  // content from the app's own origin, so surface a neutral "unavailable" state. All
+  // hooks above run unconditionally, so this early return never changes hook order.
+  if (!meta.contentUrl) {
     return (
-      <main
-        style={{
-          minHeight: "100dvh",
-          display: "grid",
-          placeItems: "center",
-          padding: "2rem",
-          textAlign: "center",
-        }}
-      >
-        <p style={{ opacity: 0.7, fontSize: "1.1rem" }}>
-          This deck can’t be displayed right now.
-        </p>
+      <main style={{ minHeight: "100dvh", display: "grid", placeItems: "center", padding: "2rem", textAlign: "center" }}>
+        <p style={{ opacity: 0.7, fontSize: "1.1rem" }}>This deck can’t be displayed right now.</p>
       </main>
     );
   }
 
+  const behind = role === "viewer" && session.live && !autoFollow ? session.index - deck.index : 0;
+  const unlockedTo = session.max; // 0-based
+  const chatName = role === "presenter" ? "Presenter" : name ?? "Viewer";
+
+  // Presenter roster breakdown against the presenter's CURRENT slide (#1).
+  const presenterIdx = deck.index;
+  let following = 0;
+  let rosterBehind = 0;
+  let exploring = 0;
+  for (const v of roster.viewers) {
+    if (v.follow) following += 1;
+    else if (v.index < presenterIdx) rosterBehind += 1;
+    else exploring += 1;
+  }
+  const qnaActiveCount = questions.reduce((n, q) => (q.dismissed ? n : n + 1), 0);
+
   return (
     <div ref={stageRef} style={{ position: "fixed", inset: 0, background: "#ECEAE3", display: "flex" }}>
+      {role === "presenter" && <style>{FLOAT_KEYFRAMES}</style>}
       <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
         <iframe
           ref={iframeRef}
-          src={deck.contentUrl}
-          title={deck.title}
+          src={meta.contentUrl}
+          title={meta.title}
           sandbox="allow-scripts"
           allow="fullscreen"
-          // Ping for the current slide once the frame has loaded, in case the
-          // deck's first report fired before this frame's listener was live.
-          onLoad={requestReport}
-          style={{
-            position: "absolute",
-            inset: 0,
-            width: "100%",
-            height: "100%",
-            border: 0,
-            display: "block",
-          }}
+          onLoad={() => sendToDeck({ type: "deck:report" })}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: 0, display: "block" }}
         />
 
-        {/* top-right control cluster: fullscreen + the AI tutor toggle */}
+        {/* Presenter: floating viewer reactions (#2) rise + fade over the slide. */}
+        {role === "presenter" && (
+          <div style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "hidden", zIndex: 5 }} aria-hidden>
+            {!reduceMotion && floats.map((f) => (
+              <span key={f.id} style={floatStyle(f.left)}>
+                {f.emoji}
+              </span>
+            ))}
+            {reduceMotion && reactionCount > 0 && (
+              <span style={reactionBadge}>
+                {reactionCount} reaction{reactionCount === 1 ? "" : "s"}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Presenter help meter (#2) — top-left so it clears the right cluster. */}
+        {role === "presenter" && <HelpMeter lost={help.lost} slow={help.slow} />}
+
+        {/* top-right control cluster */}
         <div
           style={{
             position: "absolute",
@@ -190,27 +907,143 @@ export function UploadedDeckFrame({ deck }: { deck: Deck }) {
             display: "flex",
             alignItems: "center",
             gap: 8,
+            flexWrap: "wrap",
+            justifyContent: "flex-end",
+            maxWidth: "calc(100% - 32px)",
           }}
         >
           <FullscreenButton active={isFullscreen} onClick={() => void toggle(stageRef.current)} />
-          <ChatButton open={chatOpen} onClick={() => setChatOpen((o) => !o)} />
+          {role === "viewer" ? (
+            <>
+              {session.live ? (
+                <>
+                  {behind > 0 && (
+                    <button onClick={() => setAutoFollow(true)} style={pill("#2C2A31", "#F4F2EC")} title="Jump to the presenter">
+                      {behind} {behind === 1 ? "slide" : "slides"} behind · catch up
+                    </button>
+                  )}
+                  <FollowToggle on={autoFollow} onChange={setAutoFollow} />
+                </>
+              ) : (
+                <span style={glassChip()} title="No one is presenting — page through freely">
+                  Browsing freely
+                </span>
+              )}
+              {name && watching >= 1 && (
+                <span style={glassChip()} title="People watching this deck right now">
+                  👁 {watching} watching
+                </span>
+              )}
+              {name && <ReactionBar onSend={sendSignal} />}
+              <QnaButton open={qnaOpen} count={questions.length} onClick={() => setQnaOpen((o) => !o)} />
+              <ChatButton open={chatOpen} onClick={() => setChatOpen((o) => !o)} />
+              {name && <span style={glassChip()}>{name}</span>}
+            </>
+          ) : (
+            <>
+              <PresenceChip
+                watching={roster.count}
+                following={following}
+                exploring={exploring}
+                behind={rosterBehind}
+                viewers={roster.viewers}
+                open={rosterOpen}
+                onOpenChange={setRosterOpen}
+              />
+              <span style={glassChip()}>Unlocked → slide {unlockedTo + 1}</span>
+              <button
+                onClick={() => setPollPanelOpen((o) => !o)}
+                aria-pressed={pollPanelOpen}
+                title="Live poll & AI knowledge-check"
+                style={pill(pollPanelOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", pollPanelOpen ? "#F4F2EC" : "#2C2A31")}
+              >
+                📊 Poll{livePoll ? (livePoll.revealed ? " · revealed" : " · live") : ""}
+              </button>
+              <button
+                onClick={() => setQnaOpen((o) => !o)}
+                aria-pressed={qnaOpen}
+                title="Audience questions & AI confusion digest"
+                style={pill(qnaOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", qnaOpen ? "#F4F2EC" : "#2C2A31")}
+              >
+                ❓ Questions{qnaActiveCount > 0 ? ` · ${qnaActiveCount}` : ""}
+              </button>
+              <button onClick={() => void postPresenter({ reset: true })} style={pill("#B5331F", "#FFF")} title="Set the current slide as the viewers' ceiling">
+                Reset lock
+              </button>
+              <ChatButton open={chatOpen} onClick={() => setChatOpen((o) => !o)} />
+            </>
+          )}
         </div>
+
+        {/* Viewer live-poll card (#3) — bottom-left so it clears the top controls. */}
+        {role === "viewer" && poll && (
+          <PollCard
+            poll={poll}
+            hasName={!!name}
+            myOptionIndex={myVote && myVote.pollId === poll.id ? myVote.optionIndex : null}
+            reduceMotion={reduceMotion}
+            onVote={(i) => void castVote(poll.id, i)}
+            onNeedName={() => setShowGate(true)}
+          />
+        )}
+
+        {/* Viewer Q&A queue (#5) — right column below the top controls. */}
+        {role === "viewer" && qnaOpen && (
+          <QnaPanel
+            questions={questions}
+            hasName={!!name}
+            myVotes={myVotes}
+            onUpvote={(qid) => void upvoteQuestion(qid)}
+            onAsk={askQuestion}
+            onNeedName={() => setShowGate(true)}
+            onClose={() => setQnaOpen(false)}
+          />
+        )}
+
+        {/* Presenter poll panel (#3/#4) — compose · AI draft · live results (left). */}
+        {role === "presenter" && pollPanelOpen && (
+          <PresenterPollPanel
+            poll={livePoll}
+            tally={liveTally}
+            total={liveTotal}
+            slug={slug}
+            index={deck.index}
+            reduceMotion={reduceMotion}
+            onLaunch={openPollAction}
+            onReveal={revealPollAction}
+            onClose={closePollAction}
+            onDismiss={() => setPollPanelOpen(false)}
+          />
+        )}
+
+        {/* Presenter Q&A panel (#5) — digest · queue · answer/dismiss · AI answer (right). */}
+        {role === "presenter" && qnaOpen && (
+          <PresenterQnaPanel
+            questions={questions}
+            slug={slug}
+            index={deck.index}
+            onAction={qnaAction}
+            onDismiss={() => setQnaOpen(false)}
+          />
+        )}
       </div>
 
       {chatOpen && (
         <LiveChat
-          slug={deck.slug}
-          slideIndex={state.index}
-          slideLabel={state.label}
-          name={name ?? "Viewer"}
+          slug={slug}
+          slideIndex={deck.index}
+          slideLabel={deck.label}
+          name={chatName}
           onClose={() => setChatOpen(false)}
         />
       )}
+
+      {showGate && <NameGate onSubmit={saveName} />}
     </div>
   );
 }
 
-// ---- pieces -----------------------------------------------------------------
+// ---- shared chip / button primitives (light palette) ------------------------
 
 function glassChip(): React.CSSProperties {
   return {
@@ -258,15 +1091,7 @@ function FullscreenButton({ active, onClick }: { active: boolean; onClick: () =>
       aria-pressed={active}
       aria-label={active ? "Exit fullscreen" : "Enter fullscreen"}
       title={active ? "Exit fullscreen" : "Fullscreen"}
-      style={{
-        ...glassChip(),
-        width: 34,
-        padding: 0,
-        justifyContent: "center",
-        cursor: "pointer",
-        fontSize: 15,
-        lineHeight: 1,
-      }}
+      style={{ ...glassChip(), width: 34, padding: 0, justifyContent: "center", cursor: "pointer", fontSize: 15, lineHeight: 1 }}
     >
       {active ? "✕" : "⛶"}
     </button>
@@ -287,4 +1112,1360 @@ function ChatButton({ open, onClick }: { open: boolean; onClick: () => void }) {
       Ask
     </button>
   );
+}
+
+function QnaButton({ open, count, onClick }: { open: boolean; count: number; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={open}
+      title="See the room's questions, upvote, or ask your own"
+      style={{ ...pill(open ? "#2C2A31" : "rgba(255,255,255,0.62)", open ? "#F4F2EC" : "#2C2A31"), border: open ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 6 }}
+    >
+      <span aria-hidden style={{ fontSize: 13, lineHeight: 1 }}>❓</span>
+      Questions{count > 0 ? ` (${count})` : ""}
+    </button>
+  );
+}
+
+function FollowToggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={() => onChange(!on)}
+      title={on ? "Following the presenter — click to explore on your own" : "Explore mode — click to follow the presenter"}
+      style={{ ...pill(on ? "#2C2A31" : "rgba(255,255,255,0.62)", on ? "#F4F2EC" : "#2C2A31"), border: on ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 8 }}
+    >
+      <span style={{ width: 26, height: 15, borderRadius: 999, background: on ? "#BFE048" : "rgba(60,55,45,0.25)", position: "relative", transition: "background .16s", flex: "0 0 auto" }}>
+        <span style={{ position: "absolute", top: 2, left: on ? 13 : 2, width: 11, height: 11, borderRadius: "50%", background: "#fff", transition: "left .16s", boxShadow: "0 1px 3px rgba(0,0,0,.28)" }} />
+      </span>
+      Auto-follow
+    </button>
+  );
+}
+
+// A compact reaction row (#2). Each tap fires one signal, pulses, and starts a ~3s
+// local cooldown (the server also rate-limits). "I'm lost" is styled to stand out.
+function ReactionBar({ onSend }: { onSend: (kind: SignalKind) => void }) {
+  const [cooling, setCooling] = useState<Record<string, boolean>>({});
+  const [pulse, setPulse] = useState<SignalKind | null>(null);
+  const timers = useRef<number[]>([]);
+  useEffect(() => () => timers.current.forEach((t) => window.clearTimeout(t)), []);
+
+  const tap = (kind: SignalKind) => {
+    if (cooling[kind]) return;
+    onSend(kind);
+    setPulse(kind);
+    setCooling((c) => ({ ...c, [kind]: true }));
+    timers.current.push(
+      window.setTimeout(() => setPulse((p) => (p === kind ? null : p)), 420),
+      window.setTimeout(() => setCooling((c) => ({ ...c, [kind]: false })), 3000),
+    );
+  };
+
+  return (
+    <div style={{ ...glassChip(), gap: 3, padding: "0 6px" }} role="group" aria-label="Send a reaction to the presenter">
+      {REACTIONS.map((r) => (
+        <button key={r.kind} onClick={() => tap(r.kind)} disabled={!!cooling[r.kind]} title={r.label} aria-label={r.label} style={reactionBtn(pulse === r.kind, !!cooling[r.kind])}>
+          {r.emoji}
+        </button>
+      ))}
+      <button onClick={() => tap("lost")} disabled={!!cooling.lost} title="I'm lost — let the presenter know" aria-label="I'm lost" style={lostBtn(pulse === "lost", !!cooling.lost)}>
+        😕 I&rsquo;m lost
+      </button>
+    </div>
+  );
+}
+
+function reactionBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    width: 30,
+    height: 30,
+    borderRadius: 9,
+    border: "none",
+    background: pulsing ? "rgba(191,224,72,0.55)" : "transparent",
+    cursor: disabled ? "default" : "pointer",
+    fontSize: 16,
+    lineHeight: 1,
+    padding: 0,
+    opacity: disabled && !pulsing ? 0.4 : 1,
+    transform: pulsing ? "scale(1.28)" : "scale(1)",
+    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
+  };
+}
+
+function lostBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    height: 26,
+    padding: "0 10px",
+    borderRadius: 8,
+    border: "1px solid rgba(210,120,40,0.5)",
+    background: pulsing ? "#E07B39" : "rgba(224,123,57,0.16)",
+    color: pulsing ? "#fff" : "#9A4B12",
+    fontFamily: '"Outfit", system-ui, sans-serif',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: disabled ? "default" : "pointer",
+    opacity: disabled && !pulsing ? 0.55 : 1,
+    transform: pulsing ? "scale(1.06)" : "scale(1)",
+    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
+    whiteSpace: "nowrap",
+  };
+}
+
+// The name gate (#1/#3/#5): only shown when a name-required action needs one.
+function NameGate({ onSubmit }: { onSubmit: (name: string) => void }) {
+  const [value, setValue] = useState("");
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 100,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(236,234,227,0.72)",
+        backdropFilter: "blur(6px)",
+        WebkitBackdropFilter: "blur(6px)",
+      }}
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSubmit(value);
+        }}
+        style={{
+          width: "min(380px, 100%)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 14,
+          padding: "30px 30px 26px",
+          borderRadius: 22,
+          background: "rgba(255,255,255,0.7)",
+          border: "1px solid rgba(255,255,255,0.85)",
+          boxShadow: "0 24px 60px -30px rgba(60,55,45,0.55)",
+          fontFamily: '"Outfit", system-ui, sans-serif',
+        }}
+      >
+        <div style={{ fontSize: 20, fontWeight: 500, color: "#262229", letterSpacing: "-0.01em" }}>Join the session</div>
+        <div style={{ fontSize: 13.5, fontWeight: 300, color: "#6E6A62", lineHeight: 1.5 }}>
+          What should we call you? Your name appears when you ask a question or vote.
+        </div>
+        <input
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="Your name"
+          autoFocus
+          maxLength={40}
+          style={{ height: 46, padding: "0 14px", borderRadius: 12, border: "1px solid rgba(60,55,45,0.18)", background: "rgba(255,255,255,0.8)", fontFamily: "inherit", fontSize: 15, color: "#2C2A31", outline: "none" }}
+        />
+        <button
+          type="submit"
+          disabled={!value.trim()}
+          style={{ height: 46, borderRadius: 12, border: "none", background: value.trim() ? "#2C2A31" : "#B7B2A8", color: "#F4F2EC", fontFamily: "inherit", fontSize: 15, fontWeight: 500, cursor: value.trim() ? "pointer" : "default" }}
+        >
+          Join the room
+        </button>
+      </form>
+    </div>
+  );
+}
+
+// ---- viewer poll card (#3) — ported verbatim from LiveDeck --------------------
+
+function PollCard({
+  poll,
+  hasName,
+  myOptionIndex,
+  reduceMotion,
+  onVote,
+  onNeedName,
+}: {
+  poll: ViewerPoll;
+  hasName: boolean;
+  myOptionIndex: number | null;
+  reduceMotion: boolean;
+  onVote: (optionIndex: number) => void;
+  onNeedName: () => void;
+}) {
+  const revealed = poll.revealed;
+  const tally = poll.tally ?? [];
+  const total = poll.total ?? 0;
+  const max = Math.max(1, ...(tally.length ? tally : [0]));
+
+  return (
+    <div style={pollCardWrap} role="group" aria-label="Live poll">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>{revealed ? "Results" : "Live poll"}</span>
+        {revealed ? (
+          <span style={pollNote}>
+            {total} vote{total === 1 ? "" : "s"}
+          </span>
+        ) : (
+          myOptionIndex != null && <span style={pollNote}>Voted · waiting for results</span>
+        )}
+      </div>
+
+      <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.4 }}>{poll.question}</div>
+
+      {!revealed ? (
+        !hasName ? (
+          <button onClick={onNeedName} style={pollNameBtn}>
+            Enter a name to vote
+          </button>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {poll.options.map((opt, i) => {
+              const mine = myOptionIndex === i;
+              return (
+                <button key={i} onClick={() => onVote(i)} aria-pressed={mine} style={pollOptionBtn(mine)}>
+                  <span style={pollDot(mine)} aria-hidden />
+                  <span style={{ flex: 1, minWidth: 0 }}>{opt}</span>
+                </button>
+              );
+            })}
+          </div>
+        )
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {poll.options.map((opt, i) => {
+            const count = tally[i] ?? 0;
+            const correct = poll.correctIndex === i;
+            const mine = myOptionIndex === i;
+            const pct = Math.round((count / max) * 100);
+            return (
+              <div key={i} style={pollResultRow}>
+                <div style={{ ...pollResultBar(correct, mine), width: `${pct}%`, transition: reduceMotion ? "none" : "width .45s ease" }} aria-hidden />
+                <div style={pollResultText}>
+                  <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
+                    {correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                    {mine && <span style={pollTag("#6E6A62")}>your pick</span>}
+                  </span>
+                  <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>{count}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const pollCardWrap: React.CSSProperties = {
+  position: "absolute",
+  left: 16,
+  bottom: 16,
+  zIndex: 38,
+  width: "min(400px, calc(100% - 32px))",
+  maxHeight: "min(70vh, 520px)",
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: "16px 18px",
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.78)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+const pollBadge: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  fontSize: 10.5,
+  fontWeight: 700,
+  letterSpacing: "0.14em",
+  textTransform: "uppercase",
+  color: "#4B5A16",
+  background: "rgba(191,224,72,0.42)",
+  padding: "3px 9px",
+  borderRadius: 999,
+};
+
+const pollNote: React.CSSProperties = { fontSize: 11.5, fontWeight: 500, color: "#6E6A62", whiteSpace: "nowrap" };
+
+const pollNameBtn: React.CSSProperties = {
+  height: 40,
+  borderRadius: 11,
+  border: "none",
+  cursor: "pointer",
+  background: "#2C2A31",
+  color: "#F4F2EC",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  fontWeight: 500,
+};
+
+function pollOptionBtn(mine: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 10,
+    width: "100%",
+    textAlign: "left",
+    padding: "11px 13px",
+    borderRadius: 11,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 500,
+    color: mine ? "#F4F2EC" : "#2C2A31",
+    background: mine ? "#2C2A31" : "rgba(255,255,255,0.62)",
+    border: mine ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.16)",
+    transition: "background .15s ease, color .15s ease",
+  };
+}
+
+function pollDot(mine: boolean): React.CSSProperties {
+  return {
+    width: 15,
+    height: 15,
+    borderRadius: "50%",
+    flex: "0 0 auto",
+    boxSizing: "border-box",
+    border: mine ? "4px solid #BFE048" : "2px solid rgba(60,55,45,0.35)",
+    background: mine ? "#2C2A31" : "transparent",
+  };
+}
+
+const pollResultRow: React.CSSProperties = {
+  position: "relative",
+  borderRadius: 11,
+  overflow: "hidden",
+  background: "rgba(60,55,45,0.07)",
+  padding: "10px 12px",
+};
+
+function pollResultBar(correct: boolean, mine: boolean): React.CSSProperties {
+  return {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    borderRadius: 11,
+    background: correct ? "rgba(120,176,54,0.34)" : mine ? "rgba(44,42,49,0.16)" : "rgba(120,116,108,0.16)",
+  };
+}
+
+const pollResultText: React.CSSProperties = {
+  position: "relative",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  fontSize: 13,
+  fontWeight: 500,
+  color: "#2C2A31",
+};
+
+function pollTag(color: string): React.CSSProperties {
+  return { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color, whiteSpace: "nowrap", flex: "0 0 auto" };
+}
+
+// ---- viewer Q&A queue panel (#5) — ported verbatim from LiveDeck --------------
+
+function QnaPanel({
+  questions,
+  hasName,
+  myVotes,
+  onUpvote,
+  onAsk,
+  onNeedName,
+  onClose,
+}: {
+  questions: QnaQuestion[];
+  hasName: boolean;
+  myVotes: Record<string, boolean>;
+  onUpvote: (qid: string) => void;
+  onAsk: (text: string) => Promise<string | null>;
+  onNeedName: () => void;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const t = text.trim();
+    if (!t || asking) return;
+    setAsking(true);
+    setError(null);
+    const err = await onAsk(t);
+    setAsking(false);
+    if (err) setError(err);
+    else setText("");
+  };
+
+  return (
+    <div style={qnaCardWrap} role="group" aria-label="Question queue">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>Questions</span>
+        <button onClick={onClose} title="Hide questions" aria-label="Hide questions" style={qnaCloseBtn}>
+          ✕
+        </button>
+      </div>
+
+      <div style={qnaList}>
+        {questions.length === 0 ? (
+          <div style={qnaEmpty}>No questions yet — be the first to ask.</div>
+        ) : (
+          questions.map((q) => {
+            const voted = !!myVotes[q.id];
+            return (
+              <div key={q.id} style={qnaItem}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 13.5, color: "#2C2A31", lineHeight: 1.4 }}>{q.text}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: "#6E6A62", minWidth: 0 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 150 }}>{q.name}</span>
+                    {q.answered && <span style={qnaAnsweredTag}>✓ answered</span>}
+                  </div>
+                </div>
+                <button onClick={() => (hasName ? onUpvote(q.id) : onNeedName())} disabled={voted} aria-pressed={voted} title={voted ? "You upvoted this" : "Upvote this question"} style={qnaVoteBtn(voted)}>
+                  👍 {q.votes}
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {hasName ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {error && <div style={qnaErrorText}>{error}</div>}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+              placeholder="Ask a question…"
+              maxLength={280}
+              style={qnaInput}
+            />
+            <button onClick={() => void submit()} disabled={!text.trim() || asking} style={qnaAskBtn(!!text.trim() && !asking)}>
+              {asking ? "…" : "Ask"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={onNeedName} style={pollNameBtn}>
+          Enter a name to ask
+        </button>
+      )}
+    </div>
+  );
+}
+
+const qnaCardWrap: React.CSSProperties = {
+  position: "absolute",
+  right: 16,
+  top: 60,
+  bottom: 16,
+  zIndex: 38,
+  width: "min(360px, calc(100% - 32px))",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: 16,
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.82)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+const qnaList: React.CSSProperties = { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 };
+
+const qnaItem: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 10,
+  padding: "10px 11px",
+  borderRadius: 12,
+  background: "rgba(255,255,255,0.6)",
+  border: "1px solid rgba(60,55,45,0.1)",
+};
+
+const qnaEmpty: React.CSSProperties = { fontSize: 12.5, color: "#6E6A62", padding: "10px 2px" };
+
+const qnaAnsweredTag: React.CSSProperties = {
+  fontSize: 9.5,
+  fontWeight: 700,
+  letterSpacing: "0.05em",
+  textTransform: "uppercase",
+  color: "#3F7A12",
+  whiteSpace: "nowrap",
+  flex: "0 0 auto",
+};
+
+function qnaVoteBtn(voted: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    flex: "0 0 auto",
+    height: 30,
+    padding: "0 11px",
+    borderRadius: 999,
+    cursor: voted ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 12.5,
+    fontWeight: 600,
+    color: voted ? "#F4F2EC" : "#2C2A31",
+    background: voted ? "#2C2A31" : "rgba(255,255,255,0.7)",
+    border: voted ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.18)",
+    transition: "background .15s ease, color .15s ease",
+  };
+}
+
+const qnaInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  height: 40,
+  padding: "0 13px",
+  borderRadius: 11,
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.85)",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  color: "#2C2A31",
+  outline: "none",
+};
+
+function qnaAskBtn(enabled: boolean): React.CSSProperties {
+  return {
+    flex: "0 0 auto",
+    height: 40,
+    padding: "0 16px",
+    borderRadius: 11,
+    border: "none",
+    cursor: enabled ? "pointer" : "default",
+    background: enabled ? "#2C2A31" : "#B7B2A8",
+    color: "#F4F2EC",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 500,
+  };
+}
+
+const qnaErrorText: React.CSSProperties = { fontSize: 12, color: "#B5331F", fontWeight: 500 };
+
+const qnaCloseBtn: React.CSSProperties = {
+  width: 28,
+  height: 28,
+  flex: "0 0 auto",
+  borderRadius: 8,
+  border: "1px solid rgba(60,55,45,0.16)",
+  background: "rgba(255,255,255,0.6)",
+  color: "#6E6A62",
+  cursor: "pointer",
+  fontSize: 13,
+  lineHeight: 1,
+  padding: 0,
+};
+
+// ---- presenter presence roster (#1) — light adaptation of PresenterConsole ----
+
+function PresenceChip({
+  watching,
+  following,
+  exploring,
+  behind,
+  viewers,
+  open,
+  onOpenChange,
+}: {
+  watching: number;
+  following: number;
+  exploring: number;
+  behind: number;
+  viewers: Viewer[];
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+}) {
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) onOpenChange(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open, onOpenChange]);
+
+  return (
+    <span ref={wrapRef} style={{ position: "relative", display: "inline-flex" }}>
+      <button onClick={() => onOpenChange(!open)} title="Show who's watching" aria-expanded={open} style={{ ...glassChip(), cursor: "pointer", gap: 5 }}>
+        👁 {watching} watching
+        {watching > 0 && (
+          <span style={{ color: "#6E6A62", fontWeight: 400 }}>
+            {" · "}
+            {following} following · {exploring} exploring · {behind} behind
+          </span>
+        )}
+      </button>
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            top: "calc(100% + 10px)",
+            right: 0,
+            zIndex: 60,
+            minWidth: 230,
+            maxHeight: 320,
+            overflowY: "auto",
+            padding: "10px 12px",
+            borderRadius: 14,
+            background: "rgba(255,255,255,0.92)",
+            border: "1px solid rgba(255,255,255,0.85)",
+            backdropFilter: "blur(16px)",
+            WebkitBackdropFilter: "blur(16px)",
+            boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            fontFamily: '"Outfit", system-ui, sans-serif',
+          }}
+        >
+          {viewers.length === 0 ? (
+            <div style={{ color: "#6E6A62", fontSize: 12 }}>No one watching yet.</div>
+          ) : (
+            viewers.map((v, i) => (
+              <div key={`${v.name}-${i}`} style={{ display: "flex", justifyContent: "space-between", gap: 14, fontSize: 12.5, color: "#2C2A31" }}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.name}</span>
+                <span style={{ color: "#6E6A62", whiteSpace: "nowrap" }}>
+                  slide {v.index + 1}
+                  {v.follow ? " · following" : ""}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </span>
+  );
+}
+
+// Persistent "help" meter (#2): decaying counts of viewers who feel lost / want you
+// to slow down. Amber/red so it catches the eye; hidden when both are 0.
+function HelpMeter({ lost, slow }: { lost: number; slow: number }) {
+  if (lost <= 0 && slow <= 0) return null;
+  return (
+    <div style={{ position: "absolute", top: 14, left: 16, zIndex: 39, display: "flex", alignItems: "center", gap: 8 }}>
+      {lost > 0 && (
+        <span style={helpChip("#9A2A15", "rgba(181,51,31,0.16)", "rgba(181,51,31,0.45)")}>
+          ❓ {lost} feel{lost === 1 ? "s" : ""} lost
+        </span>
+      )}
+      {slow > 0 && (
+        <span style={helpChip("#9A4B12", "rgba(224,123,57,0.18)", "rgba(210,120,40,0.5)")}>
+          🐢 {slow} want{slow === 1 ? "s" : ""} you to slow down
+        </span>
+      )}
+    </div>
+  );
+}
+
+function helpChip(fg: string, bg: string, border: string): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    height: 30,
+    padding: "0 12px",
+    borderRadius: 999,
+    background: bg,
+    color: fg,
+    border: `1px solid ${border}`,
+    fontFamily: '"Outfit", system-ui, sans-serif',
+    fontSize: 12.5,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+    backdropFilter: "blur(14px)",
+    WebkitBackdropFilter: "blur(14px)",
+    boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
+  };
+}
+
+function floatStyle(left: number): React.CSSProperties {
+  return {
+    position: "absolute",
+    bottom: 20,
+    left: `${left}%`,
+    fontSize: 30,
+    lineHeight: 1,
+    animation: "vibedeck-rise 2s ease-out forwards",
+    willChange: "transform, opacity",
+    userSelect: "none",
+  };
+}
+
+const reactionBadge: React.CSSProperties = {
+  position: "absolute",
+  top: 12,
+  left: 12,
+  padding: "4px 11px",
+  borderRadius: 999,
+  background: "#2C2A31",
+  color: "#F4F2EC",
+  fontSize: 12,
+  fontWeight: 700,
+};
+
+// ---- presenter poll panel (#3/#4) — light adaptation of PresenterConsole ------
+
+function PresenterPollPanel({
+  poll,
+  tally,
+  total,
+  slug,
+  index,
+  reduceMotion,
+  onLaunch,
+  onReveal,
+  onClose,
+  onDismiss,
+}: {
+  poll: Poll | null;
+  tally: number[];
+  total: number;
+  slug: string;
+  index: number;
+  reduceMotion: boolean;
+  onLaunch: (question: string, options: string[], correctIndex: number | null) => Promise<boolean>;
+  onReveal: () => void;
+  onClose: () => void;
+  onDismiss: () => void;
+}) {
+  const [question, setQuestion] = useState("");
+  const [options, setOptions] = useState<string[]>(["", ""]);
+  const [correctIndex, setCorrectIndex] = useState<number | null>(null);
+  const [explanation, setExplanation] = useState<string | null>(null);
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const draftCtrlRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => draftCtrlRef.current?.abort(), []);
+
+  // When a live poll closes, reset the compose form to a blank slate.
+  const hadPollRef = useRef(false);
+  useEffect(() => {
+    if (poll) {
+      hadPollRef.current = true;
+      return;
+    }
+    if (hadPollRef.current) {
+      hadPollRef.current = false;
+      setQuestion("");
+      setOptions(["", ""]);
+      setCorrectIndex(null);
+      setExplanation(null);
+      setDraftError(null);
+      setLaunchError(null);
+    }
+  }, [poll]);
+
+  const setOptionAt = (i: number, val: string) => setOptions((o) => o.map((x, idx) => (idx === i ? val : x)));
+  const addOption = () => setOptions((o) => (o.length >= 6 ? o : [...o, ""]));
+  const removeOption = (i: number) => {
+    setOptions((o) => (o.length <= 2 ? o : o.filter((_, idx) => idx !== i)));
+    setCorrectIndex((c) => (c === null ? null : c === i ? null : c > i ? c - 1 : c));
+  };
+  const toggleCorrect = (i: number) => setCorrectIndex((c) => (c === i ? null : i));
+
+  async function draft() {
+    setDraftLoading(true);
+    setDraftError(null);
+    draftCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    draftCtrlRef.current = ctrl;
+    try {
+      const res = await fetch("/api/poll/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, index }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        question?: string;
+        options?: string[];
+        correctIndex?: number;
+        explanation?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setDraftError(mapDraftError(data.error));
+        return;
+      }
+      const opts = Array.isArray(data.options) ? data.options.slice(0, 6) : [];
+      setQuestion(data.question ?? "");
+      setOptions(opts.length >= 2 ? opts : ["", ""]);
+      setCorrectIndex(
+        typeof data.correctIndex === "number" && data.correctIndex >= 0 && data.correctIndex < opts.length ? data.correctIndex : null,
+      );
+      setExplanation(data.explanation && data.explanation.trim() ? data.explanation : null);
+      setLaunchError(null);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setDraftError("Couldn't draft — try again.");
+    } finally {
+      setDraftLoading(false);
+    }
+  }
+
+  // Drop empty options and remap the correct index to the kept list.
+  const kept: string[] = [];
+  let mappedCorrect: number | null = null;
+  options.forEach((o, i) => {
+    const t = o.trim();
+    if (!t) return;
+    if (correctIndex === i) mappedCorrect = kept.length;
+    kept.push(t);
+  });
+  const canLaunch = question.trim().length > 0 && kept.length >= 2 && !launching;
+
+  async function launch() {
+    if (!canLaunch) return;
+    setLaunching(true);
+    setLaunchError(null);
+    const ok = await onLaunch(question.trim(), kept, mappedCorrect);
+    setLaunching(false);
+    if (!ok) setLaunchError("Couldn't launch — try again.");
+  }
+
+  const max = Math.max(1, ...(tally.length ? tally : [0]));
+
+  return (
+    <div style={presenterPollWrap}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>{poll ? "Live poll" : "New poll"}</span>
+        <button onClick={onDismiss} title="Hide panel" aria-label="Hide poll panel" style={qnaCloseBtn}>
+          ✕
+        </button>
+      </div>
+
+      {poll ? (
+        <div style={presenterPanelScroll}>
+          <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.4 }}>{poll.question}</div>
+          <div style={{ fontSize: 12, fontWeight: 500, color: poll.revealed ? "#4B5A16" : "#6E6A62" }}>
+            {poll.revealed ? "Revealed to the room" : "Live — collecting votes"} · {total} vote{total === 1 ? "" : "s"}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {poll.options.map((opt, i) => {
+              const count = tally[i] ?? 0;
+              const correct = poll.correctIndex === i;
+              const pct = Math.round((count / max) * 100);
+              const share = total > 0 ? Math.round((count / total) * 100) : 0;
+              return (
+                <div key={i} style={pollResultRow}>
+                  <div style={{ ...pollResultBar(poll.revealed && correct, false), width: `${pct}%`, transition: reduceMotion ? "none" : "width .45s ease" }} aria-hidden />
+                  <div style={pollResultText}>
+                    <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
+                      {poll.revealed && correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                    </span>
+                    <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>
+                      {count}
+                      {total > 0 ? ` · ${share}%` : ""}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 2 }}>
+            {!poll.revealed && (
+              <button onClick={onReveal} style={{ ...pill("#2C2A31", "#F4F2EC"), flex: 1, height: 40, justifyContent: "center" }}>
+                Reveal to room
+              </button>
+            )}
+            <button onClick={onClose} style={{ ...pill("rgba(255,255,255,0.62)", "#2C2A31"), border: "1px solid rgba(255,255,255,0.85)", flex: poll.revealed ? 1 : "0 0 auto", height: 40, justifyContent: "center" }}>
+              Close
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div style={presenterPanelScroll}>
+          <button onClick={() => void draft()} disabled={draftLoading} style={draftBtn(draftLoading)}>
+            {draftLoading ? "Drafting…" : "✨ Draft with AI"}
+          </button>
+          {draftError && <div style={qnaErrorText}>{draftError}</div>}
+          {explanation && <div style={pollExplain}>{explanation}</div>}
+
+          <div>
+            <FieldLabel>Question</FieldLabel>
+            <textarea value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Ask the room…" maxLength={400} rows={2} style={lightTextarea} />
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <FieldLabel>Options · mark the correct one (optional)</FieldLabel>
+            {options.map((opt, i) => {
+              const removable = options.length > 2;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button type="button" onClick={() => toggleCorrect(i)} title={correctIndex === i ? "Correct answer — click to unset" : "Mark as the correct answer"} aria-pressed={correctIndex === i} aria-label={`Mark option ${i + 1} correct`} style={correctDot(correctIndex === i)} />
+                  <input value={opt} onChange={(e) => setOptionAt(i, e.target.value)} placeholder={`Option ${i + 1}`} maxLength={200} style={lightInput} />
+                  <button type="button" onClick={() => removeOption(i)} disabled={!removable} title="Remove option" aria-label={`Remove option ${i + 1}`} style={{ ...qnaCloseBtn, opacity: removable ? 1 : 0.35, cursor: removable ? "pointer" : "default" }}>
+                    –
+                  </button>
+                </div>
+              );
+            })}
+            {options.length < 6 && (
+              <button type="button" onClick={addOption} style={addOptionBtn}>
+                + Add option
+              </button>
+            )}
+          </div>
+
+          {launchError && <div style={qnaErrorText}>{launchError}</div>}
+          <button onClick={() => void launch()} disabled={!canLaunch} style={{ ...pill(canLaunch ? "#2C2A31" : "#B7B2A8", "#F4F2EC"), height: 42, justifyContent: "center", cursor: canLaunch ? "pointer" : "default" }}>
+            {launching ? "Launching…" : "Launch poll"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- presenter Q&A panel (#5) — light adaptation of PresenterConsole ----------
+
+interface AiAnswerState {
+  loading: boolean;
+  open: boolean;
+  answer?: string;
+  error?: string;
+}
+
+function PresenterQnaPanel({
+  questions,
+  slug,
+  index,
+  onAction,
+  onDismiss,
+}: {
+  questions: QnaQuestion[];
+  slug: string;
+  index: number;
+  onAction: (action: "answer" | "dismiss" | "undismiss", qid: string) => void;
+  onDismiss: () => void;
+}) {
+  const [ai, setAi] = useState<Record<string, AiAnswerState>>({});
+  const [themes, setThemes] = useState<string[] | null>(null);
+  const [digestLoading, setDigestLoading] = useState(false);
+  const [digestError, setDigestError] = useState<string | null>(null);
+  const aiCtrlsRef = useRef<Record<string, AbortController>>({});
+  const digestCtrlRef = useRef<AbortController | null>(null);
+  const indexRef = useRef(index);
+  indexRef.current = index;
+
+  useEffect(
+    () => () => {
+      Object.values(aiCtrlsRef.current).forEach((c) => c.abort());
+      digestCtrlRef.current?.abort();
+    },
+    [],
+  );
+
+  async function aiAnswer(qid: string, questionText: string) {
+    aiCtrlsRef.current[qid]?.abort();
+    const ctrl = new AbortController();
+    aiCtrlsRef.current[qid] = ctrl;
+    setAi((m) => ({ ...m, [qid]: { loading: true, open: true } }));
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, name: "presenter", question: questionText, slideIndex: indexRef.current, stream: false }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as { answer?: string; error?: string };
+      if (!res.ok) {
+        setAi((m) => ({ ...m, [qid]: { loading: false, open: true, error: mapAskError(data.error) } }));
+        return;
+      }
+      const answer = (data.answer ?? "").trim() || "No answer was generated.";
+      setAi((m) => ({ ...m, [qid]: { loading: false, open: true, answer } }));
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setAi((m) => ({ ...m, [qid]: { loading: false, open: true, error: "Couldn't draft an answer — try again." } }));
+    } finally {
+      if (aiCtrlsRef.current[qid] === ctrl) delete aiCtrlsRef.current[qid];
+    }
+  }
+
+  const toggleAi = (qid: string) => setAi((m) => (m[qid] ? { ...m, [qid]: { ...m[qid], open: !m[qid].open } } : m));
+
+  async function runDigest() {
+    setDigestLoading(true);
+    setDigestError(null);
+    digestCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    digestCtrlRef.current = ctrl;
+    try {
+      const res = await fetch("/api/qna/digest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as { themes?: string[] };
+      setThemes(Array.isArray(data.themes) ? data.themes.slice(0, 3) : []);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setDigestError("Couldn't summarize — try again.");
+    } finally {
+      setDigestLoading(false);
+    }
+  }
+
+  return (
+    <div style={presenterQnaWrap}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>Questions</span>
+        <button onClick={onDismiss} title="Hide panel" aria-label="Hide questions panel" style={qnaCloseBtn}>
+          ✕
+        </button>
+      </div>
+
+      {/* AI confusion digest */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <button onClick={() => void runDigest()} disabled={digestLoading} style={draftBtn(digestLoading)}>
+          {digestLoading ? "Summarizing…" : "✨ Summarize confusion"}
+        </button>
+        {digestError && <div style={qnaErrorText}>{digestError}</div>}
+        {themes &&
+          (themes.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontSize: 11.5, color: "#6E6A62" }}>The room is stuck on:</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {themes.map((t, i) => (
+                  <span key={i} style={digestChip}>
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: "#8A867E" }}>Not enough questions yet.</div>
+          ))}
+      </div>
+
+      {/* the queue */}
+      <div style={presenterPanelScroll}>
+        {questions.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#8A867E" }}>No questions from the room yet.</div>
+        ) : (
+          questions.map((q) => {
+            const a = ai[q.id];
+            const hasDraft = !!(a && (a.answer || a.error));
+            return (
+              <div key={q.id} style={qnaRow(q.dismissed)}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={qnaVotes}>
+                    <span style={{ fontSize: 15, fontWeight: 700, lineHeight: 1, color: "#2C2A31" }}>{q.votes}</span>
+                    <span style={{ fontSize: 8.5, color: "#6E6A62", textTransform: "uppercase", letterSpacing: "0.06em" }}>votes</span>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+                    <div style={{ fontSize: 13.5, color: q.dismissed ? "#8A867E" : "#2C2A31", lineHeight: 1.4 }}>{q.text}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, color: "#6E6A62", flexWrap: "wrap", minWidth: 0 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 130 }}>{q.name}</span>
+                      {q.answered && <span style={qnaStateTag("#3F7A12")}>✓ answered</span>}
+                      {q.dismissed && <span style={qnaStateTag("#8A867E")}>dismissed</span>}
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 2 }}>
+                      {!q.dismissed && (
+                        <button onClick={() => onAction("answer", q.id)} style={qnaActionBtn} title={q.answered ? "Already answered — click to re-mark" : "Mark as answered"}>
+                          {q.answered ? "✓ Answered" : "✓ Answer"}
+                        </button>
+                      )}
+                      {q.dismissed ? (
+                        <button onClick={() => onAction("undismiss", q.id)} style={qnaActionBtn} title="Restore to the queue">
+                          ↩ Restore
+                        </button>
+                      ) : (
+                        <button onClick={() => onAction("dismiss", q.id)} style={qnaActionBtn} title="Dismiss from the queue">
+                          Dismiss
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          if (hasDraft) toggleAi(q.id);
+                          else void aiAnswer(q.id, q.text);
+                        }}
+                        disabled={a?.loading}
+                        style={qnaAiBtn(!!a?.loading)}
+                        title="Draft an answer with AI from the current slide"
+                      >
+                        {a?.loading ? "✨ Drafting…" : hasDraft ? (a?.open ? "Hide AI answer" : "Show AI answer") : "✨ AI answer"}
+                      </button>
+                      {hasDraft && !a?.loading && (
+                        <button onClick={() => void aiAnswer(q.id, q.text)} style={qnaActionBtn} title="Redraft with AI">
+                          ↻
+                        </button>
+                      )}
+                    </div>
+
+                    {a && a.open && (a.loading || a.answer || a.error) && (
+                      <div style={qnaAiBlock}>
+                        {a.loading ? (
+                          <span style={{ color: "#6E6A62", fontSize: 12.5 }}>Drafting an answer…</span>
+                        ) : a.error ? (
+                          <span style={qnaErrorText}>{a.error}</span>
+                        ) : (
+                          <div style={{ fontSize: 12.5, lineHeight: 1.55, color: "#3A372F", whiteSpace: "pre-wrap" }}>{a.answer}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- presenter panel shared styles + helpers (light) --------------------------
+
+const presenterPollWrap: React.CSSProperties = {
+  position: "absolute",
+  left: 16,
+  top: 60,
+  bottom: 16,
+  zIndex: 38,
+  width: "min(360px, calc(100% - 32px))",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: 16,
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.82)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+const presenterQnaWrap: React.CSSProperties = {
+  ...presenterPollWrap,
+  left: "auto",
+  right: 16,
+  width: "min(380px, calc(100% - 32px))",
+};
+
+const presenterPanelScroll: React.CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+};
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: "0.1em", textTransform: "uppercase", color: "#6E6A62", marginBottom: 6 }}>{children}</div>;
+}
+
+const lightInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  height: 36,
+  padding: "0 11px",
+  borderRadius: 9,
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.85)",
+  color: "#2C2A31",
+  fontFamily: "inherit",
+  fontSize: 13,
+  outline: "none",
+};
+
+const lightTextarea: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  padding: "9px 11px",
+  borderRadius: 9,
+  resize: "vertical",
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.85)",
+  color: "#2C2A31",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  lineHeight: 1.4,
+  outline: "none",
+};
+
+function correctDot(on: boolean): React.CSSProperties {
+  return {
+    width: 20,
+    height: 20,
+    flex: "0 0 auto",
+    borderRadius: "50%",
+    cursor: "pointer",
+    boxSizing: "border-box",
+    padding: 0,
+    border: on ? "6px solid #BFE048" : "2px solid rgba(60,55,45,0.3)",
+    background: on ? "#2C2A31" : "transparent",
+  };
+}
+
+const addOptionBtn: React.CSSProperties = {
+  height: 34,
+  borderRadius: 9,
+  border: "1px dashed rgba(60,55,45,0.28)",
+  background: "transparent",
+  color: "#6E6A62",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  fontSize: 12.5,
+  fontWeight: 500,
+};
+
+function draftBtn(loading: boolean): React.CSSProperties {
+  return {
+    height: 40,
+    borderRadius: 11,
+    border: "1px solid rgba(120,150,30,0.45)",
+    background: loading ? "rgba(191,224,72,0.18)" : "rgba(191,224,72,0.3)",
+    color: "#4B5A16",
+    cursor: loading ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 13.5,
+    fontWeight: 600,
+    opacity: loading ? 0.8 : 1,
+  };
+}
+
+const pollExplain: React.CSSProperties = {
+  fontSize: 12,
+  color: "#6E6A62",
+  lineHeight: 1.5,
+  fontStyle: "italic",
+  padding: "8px 10px",
+  borderRadius: 9,
+  background: "rgba(60,55,45,0.05)",
+  border: "1px solid rgba(60,55,45,0.1)",
+};
+
+const digestChip: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: "#4B5A16",
+  background: "rgba(191,224,72,0.24)",
+  border: "1px solid rgba(120,150,30,0.4)",
+  borderRadius: 999,
+  padding: "5px 11px",
+  lineHeight: 1.35,
+};
+
+function qnaRow(dismissed: boolean): React.CSSProperties {
+  return {
+    borderRadius: 12,
+    padding: "10px 11px",
+    background: dismissed ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.62)",
+    border: "1px solid rgba(60,55,45,0.12)",
+    opacity: dismissed ? 0.7 : 1,
+  };
+}
+
+const qnaVotes: React.CSSProperties = {
+  flex: "0 0 auto",
+  width: 40,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: 2,
+  padding: "5px 0",
+  borderRadius: 9,
+  background: "rgba(60,55,45,0.06)",
+};
+
+function qnaStateTag(color: string): React.CSSProperties {
+  return { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color, whiteSpace: "nowrap", flex: "0 0 auto" };
+}
+
+const qnaActionBtn: React.CSSProperties = {
+  height: 28,
+  padding: "0 10px",
+  borderRadius: 8,
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.7)",
+  color: "#2C2A31",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  fontSize: 12,
+  fontWeight: 500,
+};
+
+function qnaAiBtn(loading: boolean): React.CSSProperties {
+  return {
+    height: 28,
+    padding: "0 10px",
+    borderRadius: 8,
+    border: "1px solid rgba(120,150,30,0.4)",
+    background: "rgba(191,224,72,0.24)",
+    color: "#4B5A16",
+    cursor: loading ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 12,
+    fontWeight: 600,
+    opacity: loading ? 0.75 : 1,
+  };
+}
+
+const qnaAiBlock: React.CSSProperties = {
+  marginTop: 4,
+  padding: "9px 11px",
+  borderRadius: 9,
+  background: "rgba(60,55,45,0.05)",
+  border: "1px solid rgba(60,55,45,0.1)",
+};
+
+function mapDraftError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "no_content":
+      return "This slide has no text to quiz on.";
+    case "ai_not_configured":
+      return "AI isn't configured.";
+    default:
+      return "Couldn't draft — try again.";
+  }
+}
+
+function mapAskError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "unknown_deck":
+      return "This deck isn't available.";
+    default:
+      return "Couldn't draft an answer — try again.";
+  }
 }

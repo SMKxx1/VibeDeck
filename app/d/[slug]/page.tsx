@@ -66,7 +66,7 @@ export default async function DeckPage({
   // Uploaded decks render as an isolated, bridge-less sandboxed artifact — check
   // this BEFORE the embedUrl branch (an uploaded deck has no embedUrl and must
   // never be routed through the trusted-first-party LiveDeck path).
-  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} />;
+  if (deck.kind === "uploaded") return <UploadedDeckFrame deck={deck} role={presenter ? "presenter" : "viewer"} />;
 
   // Self-contained live decks: the presenter (valid session cookie) drives;
   // everyone else is a viewer. Reading the cookie renders this path dynamically.
