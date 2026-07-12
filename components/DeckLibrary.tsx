@@ -1,14 +1,16 @@
 "use client";
 
-// The deck library / dashboard — a faithful port of the Claude Design handoff
-// "Deck Library.dc.html" (the "Lumen" concept), fixed to the warm-light "Solis"
-// palette (the dark "Lunae" toggle branch is intentionally dropped).
+// The deck library / dashboard — a calm, information-forward layout on the warm
+// "Solis" palette (#ECEAE3 ground, #2C2A31 ink, #BFE048 lime).
 //
-// Layout: a hero (greeting + orbital stat motif + resume strip) beside a bento
-// grid of gradient deck cards, over a warm paper + dot-grid + grain background,
-// with a left nav rail and a top bar (search + avatar). Real decks fill the
-// prominent bento slots newest-first; design sample cards complete the grid so
-// it always reads as full. Typing in search swaps to a filtered results grid.
+// Layout: a compact header (greeting + a single real deck count + an optional
+// "continue" link) above a uniform, responsive grid of light deck cards, over a
+// warm paper + dot-grid background, with a left nav rail and a top bar (Build
+// with AI / Import Markdown / search / avatar). Each card shows only the
+// necessary info — title, slide count, publish status, date — plus the owner-only
+// controls (publish / edit / uploaded actions). Typing in search filters the
+// same grid. No decorative sample decks: the grid shows only real decks + the
+// "New deck" tile.
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
@@ -343,218 +345,62 @@ function PublishControl({ slug, isAdmin, variant = "overlay" }: { slug: string; 
   );
 }
 
-// The dashed outline drawn OVER an unpublished card. It's a sibling of the card
-// (not the card's own border) so it stays crisp even though the card itself is
-// desaturated — signalling "this isn't public" at a glance.
-function hiddenOutlineStyle(radius: number): React.CSSProperties {
-  return {
-    position: "absolute",
-    inset: 0,
-    borderRadius: radius,
-    border: "2px dashed rgba(44,42,49,0.4)",
-    pointerEvents: "none",
-    zIndex: 1,
-  };
-}
-
 const NAME_KEY = "presentation:name";
-
-const NUMBER_WORDS = [
-  "No", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
-  "Ten", "Eleven", "Twelve",
-];
-function numberWord(n: number): string {
-  return NUMBER_WORDS[n] ?? String(n);
-}
-
-// Design sample decks used only to complete the bento grid when the real
-// library has fewer than five decks. Decorative — they don't link anywhere.
-interface SampleDeck {
-  title: string;
-  meta: string;
-  slideCount: number;
-}
-const SAMPLE_DECKS: SampleDeck[] = [
-  { title: "The French Revolution in 12 Minutes", meta: "Seminar", slideCount: 12 },
-  { title: "Photosynthesis, Visually", meta: "Lecture 3", slideCount: 9 },
-];
 
 // ---- shared card chrome -----------------------------------------------------
 
-function ArrowGlyph({ size = 16 }: { size?: number }) {
+// A small status-tinted chip shown on every deck card (Live / Public / Hidden).
+// It reads the live status straight from the caller, so it repaints when a
+// publish action changes it. Colours mirror the active PublishControl segment.
+function StatusChip({ status }: { status: PublishStatus }) {
+  const map: Record<PublishStatus, { label: string; background: string; color: string }> = {
+    main: { label: "Live", background: "#BFE048", color: "#2C2A31" },
+    normal: { label: "Public", background: "rgba(40,38,32,0.06)", color: "#6E6A62" },
+    unpublished: { label: "Hidden", background: "rgba(44,42,49,0.9)", color: "#F4F2EC" },
+  };
+  const s = map[status];
   return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="rgba(255,255,255,0.9)"
-      strokeWidth={1.3}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M4.5 11.5L11.5 4.5M6 4.5h5.5V10" />
-    </svg>
-  );
-}
-
-// ---- generative motifs (verbatim from the design) ---------------------------
-
-function WaveformMotif() {
-  return (
-    <div
+    <span
       style={{
-        position: "absolute",
-        left: 0,
-        right: 0,
-        top: "48%",
-        transform: "translateY(-50%)",
-        display: "flex",
-        justifyContent: "center",
-        pointerEvents: "none",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        height: 22,
+        padding: "0 9px",
+        borderRadius: 7,
+        fontSize: 11,
+        fontWeight: 600,
+        whiteSpace: "nowrap",
+        background: s.background,
+        color: s.color,
       }}
     >
-      <svg
-        width="92%"
-        height="170"
-        viewBox="0 0 520 170"
-        fill="none"
-        preserveAspectRatio="xMidYMid meet"
-        style={{ overflow: "visible" }}
-      >
-        <line x1="28" y1="120" x2="492" y2="120" stroke="rgba(255,255,255,0.28)" strokeWidth={1} />
-        <g stroke="rgba(255,255,255,0.62)" strokeWidth={1} vectorEffect="non-scaling-stroke">
-          <path d="M28 120 C 150 30 300 60 360 86 C 420 108 470 96 492 72" />
-          <path d="M28 120 C 150 72 300 150 360 108 C 420 80 470 60 492 72" />
-          <path d="M28 120 C 162 22 280 168 380 120 C 440 92 472 82 492 72" />
-          <path d="M28 120 C 140 110 300 30 372 80 C 430 118 470 104 492 72" />
-          <path d="M28 120 C 172 150 290 40 360 104 C 420 150 470 70 492 72" />
-        </g>
-        <circle cx="28" cy="120" r="5.5" fill="#FFFFFF" />
-        <circle cx="492" cy="72" r="6.5" fill="#CBE94A" />
-      </svg>
-    </div>
+      <SegIcon kind={status} />
+      {s.label}
+    </span>
   );
 }
 
-function SphereMotifRight() {
-  return (
-    <div
-      style={{
-        position: "absolute",
-        right: 14,
-        top: "50%",
-        transform: "translateY(-50%)",
-        pointerEvents: "none",
-        opacity: 0.9,
-      }}
-    >
-      <svg width="118" height="118" viewBox="0 0 120 120" fill="none" stroke="rgba(255,255,255,0.55)" strokeWidth={1} vectorEffect="non-scaling-stroke">
-        <circle cx="60" cy="60" r="50" />
-        <ellipse cx="60" cy="60" rx="40" ry="50" />
-        <ellipse cx="60" cy="60" rx="24" ry="50" />
-        <ellipse cx="60" cy="60" rx="50" ry="28" />
-        <circle cx="60" cy="60" r="3.5" fill="#CBE94A" stroke="none" />
-      </svg>
-    </div>
-  );
+// A subtle status-tinted stripe down the card's left edge — the only decorative
+// touch that survives, and it earns its place by encoding status at a glance.
+function stripeColor(status: PublishStatus): string {
+  if (status === "main") return "#BFE048";
+  if (status === "unpublished") return "rgba(44,42,49,0.35)";
+  return "rgba(60,55,45,0.12)";
 }
 
-function VortexMotif() {
-  return (
-    <div style={{ position: "absolute", left: "50%", top: "46%", transform: "translate(-50%,-50%)", pointerEvents: "none" }}>
-      <svg width="150" height="190" viewBox="0 0 170 210" fill="none" stroke="rgba(255,255,255,0.5)" strokeWidth={1} vectorEffect="non-scaling-stroke">
-        <ellipse cx="96" cy="34" rx="68" ry="11" />
-        <ellipse cx="92" cy="52" rx="60" ry="10" />
-        <ellipse cx="89" cy="70" rx="52" ry="9" />
-        <ellipse cx="86" cy="88" rx="44" ry="8.5" />
-        <ellipse cx="84" cy="106" rx="36" ry="8" />
-        <ellipse cx="82" cy="124" rx="28" ry="7" />
-        <ellipse cx="81" cy="142" rx="21" ry="6" />
-        <ellipse cx="80" cy="160" rx="14" ry="5" />
-        <ellipse cx="80" cy="176" rx="8" ry="4" />
-        <circle cx="80" cy="176" r="3.6" fill="#CBE94A" stroke="none" />
-      </svg>
-    </div>
-  );
-}
-
-function ArcMotif() {
-  return (
-    <div style={{ position: "absolute", left: 14, right: 14, top: 42, pointerEvents: "none" }}>
-      <svg width="100%" height="48" viewBox="0 0 200 56" preserveAspectRatio="xMidYMid meet" fill="none" stroke="rgba(255,255,255,0.55)" strokeWidth={1} vectorEffect="non-scaling-stroke">
-        <path d="M14 52 Q 100 -6 186 52" />
-        <path d="M14 52 Q 100 12 186 52" />
-        <path d="M14 52 Q 100 30 186 52" />
-        <circle cx="14" cy="52" r="3.4" fill="#CBE94A" stroke="none" />
-      </svg>
-    </div>
-  );
-}
-
-function SphereMotifInline() {
-  return (
-    <div style={{ position: "relative", pointerEvents: "none", opacity: 0.9, flex: "0 0 auto" }}>
-      <svg width="116" height="100" viewBox="0 0 120 104" fill="none" stroke="rgba(255,255,255,0.55)" strokeWidth={1} vectorEffect="non-scaling-stroke">
-        <ellipse cx="60" cy="52" rx="50" ry="44" />
-        <ellipse cx="60" cy="52" rx="38" ry="44" />
-        <ellipse cx="60" cy="52" rx="22" ry="44" />
-        <ellipse cx="60" cy="52" rx="50" ry="26" />
-        <circle cx="60" cy="52" r="3.6" fill="#CBE94A" stroke="none" />
-      </svg>
-    </div>
-  );
-}
-
-const NOISE_OVERLAY =
-  "url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22120%22 height=%22120%22%3E%3Cfilter id=%22g%22%3E%3CfeTurbulence type=%22fractalNoise%22 baseFrequency=%220.85%22 numOctaves=%222%22/%3E%3C/filter%3E%3Crect width=%22120%22 height=%22120%22 filter=%22url(%23g)%22/%3E%3C/svg%3E')";
-
-function CardNoise() {
-  return (
-    <div
-      style={{
-        position: "absolute",
-        inset: 0,
-        backgroundImage: NOISE_OVERLAY,
-        opacity: 0.08,
-        mixBlendMode: "overlay",
-        pointerEvents: "none",
-      }}
-    />
-  );
-}
-
-// A frosted "Edit notes & AI" pill anchored to a card. Rendered as a SIBLING of
-// the card's <Link> (never nested inside it — nested anchors are invalid HTML)
-// and links to the presenter-only editor.
+// The "Edit notes & AI" affordance for a manageable deck — a link to the
+// presenter-only editor. A SIBLING of the card's <Link> (never nested inside it
+// — nested anchors are invalid HTML), styled to match the uploaded-action pills
+// so a manageable card's controls read as one cluster.
 function EditPill({ href }: { href: string }) {
   return (
     <Link
       href={href}
-      className="lm-edit"
+      className="lm-act"
       title="Edit speaker notes & AI context"
       onClick={(e) => e.stopPropagation()}
-      style={{
-        position: "absolute",
-        bottom: 10,
-        right: 10,
-        zIndex: 2,
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 5,
-        height: 26,
-        padding: "0 10px",
-        borderRadius: 9,
-        background: "rgba(30,28,26,0.34)",
-        border: "1px solid rgba(255,255,255,0.35)",
-        backdropFilter: "blur(8px)",
-        WebkitBackdropFilter: "blur(8px)",
-        color: "rgba(255,255,255,0.95)",
-        fontSize: 11.5,
-        fontWeight: 500,
-        textDecoration: "none",
-        whiteSpace: "nowrap",
-      }}
+      style={{ ...actionPillStyle(false), textDecoration: "none", marginTop: 12 }}
     >
       <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
         <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
@@ -564,73 +410,74 @@ function EditPill({ href }: { href: string }) {
   );
 }
 
-// A bento card — links to /d/<slug> when real, decorative otherwise. Real cards
-// also get an EditPill overlay linking to the editor and, when `publishSlug` is
-// set, a 3-state publish control. An unpublished deck's card is desaturated and
-// dashed-outlined so it visibly reads as not-public.
-function BentoCard(props: {
-  href?: string;
-  editHref?: string;
-  publishSlug?: string;
-  // Set only for uploaded (DB-backed) decks — drives the Replace/Delete/Preview
-  // overlay. Registry/sample cards leave it undefined and show none of those.
-  uploaded?: DeckCard;
-  // Phase 4 — may the current session manage this deck? Gates the interactive
-  // owner-only overlays (EditPill / PublishControl / UploadedActions). Note that
-  // `publishSlug` is still threaded even when this is false so the card's own
-  // hidden/desaturation styling reflects the live status; only the interactive
-  // controls are withheld.
-  canManage?: boolean;
-  // Admin-only "Live" segment gating — forwarded to PublishControl.
-  isAdmin?: boolean;
-  gridColumn: string;
-  gridRow: string;
-  background: string;
-  boxShadow: string;
-  radius?: number;
-  children: React.ReactNode;
-}) {
-  const { href, editHref, publishSlug, uploaded, canManage, isAdmin, gridColumn, gridRow, background, boxShadow, radius = 22, children } = props;
+// A single uniform deck card. The <Link> fills it and navigates to /d/<slug>;
+// the owner-only controls (publish / edit / uploaded actions) render beneath it
+// as SIBLINGS (never nested — no anchor in an anchor) so their clicks don't also
+// trigger the card's navigation. An unpublished deck is desaturated + dashed so
+// it visibly reads as not-public; the controls are only shown when the session
+// may manage the deck, but the status chip + hidden styling always reflect the
+// live status. Used by BOTH the main grid and the search results.
+function DeckTile({ deck, isAdmin }: { deck: DeckCard; isAdmin: boolean }) {
   const ctx = usePublish();
-  const status = publishSlug && ctx ? ctx.statusOf(publishSlug) : "normal";
+  const canManage = deck.canManage === true;
+  const status = ctx ? ctx.statusOf(deck.slug) : deck.publishStatus;
   const hidden = status === "unpublished";
-  const cardStyle: React.CSSProperties = {
-    position: "relative",
-    width: "100%",
-    height: "100%",
-    borderRadius: radius,
-    overflow: "hidden",
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-    background,
-    boxShadow,
-    textDecoration: "none",
-    color: "inherit",
-    // Desaturate an unpublished card. Applied to the card only — the overlay
-    // controls are siblings, so they stay full-contrast and legible.
-    filter: hidden ? "saturate(0.6) brightness(0.98)" : undefined,
-    transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
-  };
-  const card = href ? (
-    <Link href={href} style={cardStyle} className="lm-card">
-      {children}
-    </Link>
-  ) : (
-    <div style={cardStyle}>{children}</div>
-  );
-  // Wrap in a positioned grid item so the overlays can sit on top as siblings.
   return (
-    <div style={{ gridColumn, gridRow, position: "relative" }}>
-      {card}
-      {hidden && <div aria-hidden style={hiddenOutlineStyle(radius)} />}
-      {/* Owner-only interactive overlays render ONLY when the session may manage
-          this deck. The `hidden`/desaturation styling above still tracks
-          `publishSlug` regardless, so a presenter viewing a non-manageable deck
-          sees its status but no controls. */}
-      {canManage && editHref && <EditPill href={editHref} />}
-      {canManage && publishSlug && <PublishControl slug={publishSlug} isAdmin={!!isAdmin} />}
-      {canManage && uploaded && <UploadedActions deck={uploaded} />}
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      <Link
+        href={`/d/${deck.slug}`}
+        className="lm-card"
+        style={{
+          position: "relative",
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 150,
+          padding: "18px 20px 18px 22px",
+          borderRadius: 18,
+          overflow: "hidden",
+          textDecoration: "none",
+          color: "#2C2A31",
+          background: "rgba(255,255,255,0.55)",
+          border: hidden ? "1px dashed rgba(44,42,49,0.4)" : "1px solid rgba(255,255,255,0.72)",
+          filter: hidden ? "saturate(0.7) brightness(0.99)" : undefined,
+          backdropFilter: "blur(16px)",
+          WebkitBackdropFilter: "blur(16px)",
+          boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
+          transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
+        }}
+      >
+        <span aria-hidden style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: 3, background: stripeColor(status) }} />
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <span style={{ fontSize: 12, fontWeight: 400, color: "#9A958A" }}>{shortDate(deck.date) || "Deck"}</span>
+          <StatusChip status={status} />
+        </div>
+        <div style={{ fontSize: 18, fontWeight: 500, letterSpacing: "-0.01em", lineHeight: 1.25, color: "#2C2A31", margin: "12px 0 6px" }}>
+          {deck.title}
+        </div>
+        {deck.description && (
+          <div
+            style={{
+              fontSize: 13,
+              fontWeight: 300,
+              lineHeight: 1.45,
+              color: "#8A857C",
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+            }}
+          >
+            {deck.description}
+          </div>
+        )}
+        <div style={{ flex: 1 }} />
+        <div style={{ fontSize: 12.5, fontWeight: 400, color: "#6E6A62", marginTop: 12 }}>
+          {deck.slideCount} {deck.slideCount === 1 ? "slide" : "slides"}
+        </div>
+      </Link>
+      {canManage && <PublishControl slug={deck.slug} isAdmin={isAdmin} variant="inline" />}
+      {canManage && <EditPill href={`/dashboard/edit/${deck.slug}`} />}
+      {canManage && deck.kind === "uploaded" && <UploadedActions deck={deck} variant="inline" />}
     </div>
   );
 }
@@ -761,9 +608,7 @@ export function DeckLibrary({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: bo
     window.location.href = "/login";
   }
 
-  const totalSlides = useMemo(() => decks.reduce((n, d) => n + d.slideCount, 0), [decks]);
   const resume = decks[0];
-  const cardCount = Math.min(decks.length, 5) + Math.max(0, Math.min(5 - decks.length, SAMPLE_DECKS.length));
   const searching = q.trim().length > 0;
 
   return (
@@ -1033,10 +878,10 @@ export function DeckLibrary({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: bo
             {searching ? (
               <SearchResults results={filtered} query={q} isAdmin={isAdmin} />
             ) : (
-              <div style={{ display: "grid", gridTemplateColumns: "minmax(0,0.92fr) minmax(0,1.5fr)", gap: 22, alignItems: "stretch" }}>
-                <Hero name={name} deckWord={numberWord(cardCount)} totalSlides={totalSlides} resume={resume} />
-                <Bento decks={decks} isAdmin={isAdmin} />
-              </div>
+              <>
+                <DashboardHeader name={name} deckCount={decks.length} resume={resume} />
+                <DeckGrid decks={decks} isAdmin={isAdmin} />
+              </>
             )}
           </div>
         </div>
@@ -1045,8 +890,7 @@ export function DeckLibrary({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: bo
       <style>{`
         .lm-card:hover { transform: translateY(-3px); box-shadow: 0 22px 46px -22px rgba(60,55,45,0.55) !important; }
         .lm-build:hover { background: rgba(255,255,255,0.66) !important; }
-        .lm-new:hover { background: rgba(255,255,255,0.6) !important; }
-        .lm-edit:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
+        .lm-new:hover { background: rgba(255,255,255,0.52) !important; }
         .lm-pub-seg-o:hover { background: rgba(255,255,255,0.16) !important; }
         .lm-pub-seg-i:hover { background: rgba(40,38,32,0.07) !important; }
         .lm-act:hover { background: rgba(30,28,26,0.52) !important; border-color: rgba(255,255,255,0.55) !important; }
@@ -1078,365 +922,83 @@ export function DeckLibrary({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: bo
   );
 }
 
-// ---- hero -------------------------------------------------------------------
+// ---- header -----------------------------------------------------------------
 
-function Hero({
-  name,
-  deckWord,
-  totalSlides,
-  resume,
-}: {
-  name: string | null;
-  deckWord: string;
-  totalSlides: number;
-  resume?: DeckCard;
-}) {
+// A compact greeting header: the eyebrow, the greeting, a single REAL deck count,
+// and an unobtrusive "continue" link to the most recent deck. No fake analytics,
+// no decorative motif — just what the presenter needs to orient.
+function DashboardHeader({ name, deckCount, resume }: { name: string | null; deckCount: number; resume?: DeckCard }) {
   return (
-    <div style={{ position: "relative", display: "flex", flexDirection: "column", justifyContent: "space-between", minHeight: 520, padding: "6px 8px" }}>
+    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 20, flexWrap: "wrap", margin: "2px 2px 6px" }}>
       <div>
-        <div style={{ fontSize: 12, fontWeight: 500, letterSpacing: "0.22em", textTransform: "uppercase", color: "#9A958A", marginBottom: 18 }}>
+        <div style={{ fontSize: 12, fontWeight: 500, letterSpacing: "0.22em", textTransform: "uppercase", color: "#9A958A", marginBottom: 12 }}>
           Library
         </div>
-        <h1 style={{ fontSize: 44, fontWeight: 300, lineHeight: 1.06, letterSpacing: "-0.025em", margin: 0, color: "#262229" }}>
-          {name ? (
-            <>
-              Good to see you,
-              <br />
-              {name}.
-            </>
-          ) : (
-            <>
-              Good to see you
-              <br />
-              again.
-            </>
-          )}
+        <h1 style={{ fontSize: 32, fontWeight: 300, lineHeight: 1.1, letterSpacing: "-0.02em", margin: 0, color: "#262229" }}>
+          {name ? `Good to see you, ${name}.` : "Good to see you again."}
         </h1>
-        <p style={{ fontSize: 16, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62", margin: "18px 0 0", maxWidth: "32ch" }}>
-          {deckWord} decks ready to present — pick up where you left off, or open the floor to a new room.
+        <p style={{ fontSize: 14.5, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62", margin: "10px 0 0" }}>
+          {deckCount === 0
+            ? "No decks yet — create one to begin."
+            : `${deckCount} ${deckCount === 1 ? "deck" : "decks"} ready to present.`}
         </p>
       </div>
 
-      {/* orbital motif + annotated stats */}
-      <div style={{ position: "relative", flex: 1, display: "flex", alignItems: "center", justifyContent: "center", margin: "6px 0" }}>
-        <svg width="290" height="290" viewBox="0 0 300 300" fill="none" stroke="rgba(42,40,46,0.22)" strokeWidth={1} style={{ overflow: "visible" }}>
-          <circle cx="150" cy="150" r="128" />
-          <ellipse cx="150" cy="150" rx="118" ry="128" />
-          <ellipse cx="150" cy="150" rx="96" ry="128" />
-          <ellipse cx="150" cy="150" rx="68" ry="128" />
-          <ellipse cx="150" cy="150" rx="36" ry="128" />
-          <ellipse cx="150" cy="150" rx="128" ry="118" stroke="rgba(42,40,46,0.13)" />
-          <ellipse cx="150" cy="150" rx="128" ry="74" stroke="rgba(42,40,46,0.13)" />
-          <ellipse cx="150" cy="150" rx="128" ry="32" stroke="rgba(42,40,46,0.13)" />
-          <line x1="150" y1="22" x2="150" y2="278" stroke="rgba(42,40,46,0.10)" />
-        </svg>
-
-        {/* focal dot 1 — questions answered */}
-        <div style={{ position: "absolute", left: "62%", top: "30%" }}>
-          <div style={{ width: 11, height: 11, borderRadius: "50%", background: "#CBE94A", boxShadow: "0 0 0 5px rgba(203,233,74,0.22)" }} />
-          <svg width="74" height="34" viewBox="0 0 74 34" style={{ position: "absolute", left: 6, top: -2 }} fill="none" stroke="rgba(42,40,46,0.3)" strokeWidth={1}>
-            <path d="M2 30 L40 30 L70 4" />
-          </svg>
-          <div style={{ position: "absolute", left: 72, top: -26, whiteSpace: "nowrap" }}>
-            <div style={{ fontSize: 21, fontWeight: 300, lineHeight: 1, color: "#2A2730" }}>240</div>
-            <div style={{ fontSize: 11, fontWeight: 400, color: "#8A857C", marginTop: 2 }}>questions answered</div>
-          </div>
-        </div>
-
-        {/* focal dot 2 — slides in library */}
-        <div style={{ position: "absolute", left: "30%", top: "66%" }}>
-          <div style={{ width: 9, height: 9, borderRadius: "50%", background: "#FFFFFF", boxShadow: "0 0 0 4px rgba(255,255,255,0.5),0 1px 4px rgba(0,0,0,0.12)" }} />
-          <svg width="58" height="30" viewBox="0 0 58 30" style={{ position: "absolute", left: -54, top: 4 }} fill="none" stroke="rgba(42,40,46,0.3)" strokeWidth={1}>
-            <path d="M56 4 L20 4 L2 26" />
-          </svg>
-          <div style={{ position: "absolute", left: -150, top: 18, whiteSpace: "nowrap", textAlign: "right", width: 96 }}>
-            <div style={{ fontSize: 21, fontWeight: 300, lineHeight: 1, color: "#2A2730" }}>{totalSlides}</div>
-            <div style={{ fontSize: 11, fontWeight: 400, color: "#8A857C", marginTop: 2 }}>slides in library</div>
-          </div>
-        </div>
-      </div>
-
-      {/* resume strip */}
-      <ResumeStrip resume={resume} />
+      {resume && (
+        <Link
+          href={`/d/${resume.slug}`}
+          title={`Continue: ${resume.title}`}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 10,
+            maxWidth: 320,
+            height: 42,
+            padding: "0 16px",
+            borderRadius: 13,
+            textDecoration: "none",
+            background: "rgba(255,255,255,0.5)",
+            border: "1px solid rgba(255,255,255,0.7)",
+            backdropFilter: "blur(14px)",
+            WebkitBackdropFilter: "blur(14px)",
+            boxShadow: "0 6px 18px -12px rgba(60,55,45,0.35)",
+          }}
+          className="lm-build"
+        >
+          <span style={{ fontSize: 10.5, fontWeight: 500, letterSpacing: "0.14em", textTransform: "uppercase", color: "#A29D92", flex: "0 0 auto" }}>
+            Continue
+          </span>
+          <span style={{ fontSize: 13.5, fontWeight: 400, color: "#2C2932", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {resume.title}
+          </span>
+          <span style={{ fontSize: 12, color: "#8A857C", flex: "0 0 auto" }}>▸</span>
+        </Link>
+      )}
     </div>
   );
 }
 
-function ResumeStrip({ resume }: { resume?: DeckCard }) {
-  const inner = (
-    <>
-      <div
-        style={{
-          width: 50,
-          height: 50,
-          borderRadius: 12,
-          flex: "0 0 auto",
-          background:
-            "radial-gradient(100% 110% at 25% 20%, #D8C57E 0%, transparent 55%),radial-gradient(110% 120% at 85% 85%, #A8B87E 0%, transparent 55%),linear-gradient(150deg,#C7B873,#B6B57E)",
-        }}
-      />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 10.5, fontWeight: 500, letterSpacing: "0.16em", textTransform: "uppercase", color: "#A29D92" }}>Resume</div>
-        <div style={{ fontSize: 14.5, fontWeight: 400, color: "#2C2932", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          {resume ? resume.title : "Nothing yet"}
-        </div>
-        <div style={{ fontSize: 12, fontWeight: 300, color: "#8A857C" }}>
-          {resume ? `${resume.slideCount} ${resume.slideCount === 1 ? "slide" : "slides"}` : "add a deck to begin"}
-        </div>
-      </div>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 9,
-          height: 40,
-          padding: "0 18px",
-          borderRadius: 12,
-          background: "#2C2A31",
-          color: "#F4F2EC",
-          fontSize: 13.5,
-          fontWeight: 400,
-        }}
-      >
-        Resume <span style={{ fontSize: 11 }}>▸</span>
-      </div>
-    </>
-  );
+// ---- deck grid --------------------------------------------------------------
 
-  const shell: React.CSSProperties = {
-    display: "flex",
-    alignItems: "center",
-    gap: 16,
-    padding: "14px 16px",
-    borderRadius: 18,
-    background: "rgba(255,255,255,0.5)",
-    border: "1px solid rgba(255,255,255,0.72)",
-    backdropFilter: "blur(16px)",
-    WebkitBackdropFilter: "blur(16px)",
-    boxShadow: "0 10px 28px -16px rgba(60,55,45,0.4)",
-    textDecoration: "none",
-    color: "inherit",
-  };
-
-  return resume ? (
-    <Link href={`/d/${resume.slug}`} style={shell}>
-      {inner}
-    </Link>
-  ) : (
-    <div style={shell}>{inner}</div>
-  );
-}
-
-// ---- bento ------------------------------------------------------------------
-
-function Bento({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: boolean }) {
-  // Fill the five deck slots newest-first with real decks, then sample decks so
-  // the grid always reads as full. items[0]=featured, [1]=wide, [2]=tall,
-  // [3]=small, [4]=wide.
-  const real = decks.slice(0, 5);
-  const fillers = SAMPLE_DECKS.slice(0, Math.max(0, 5 - real.length));
-  const items: Item[] = [...real, ...fillers.map((f) => ({ ...f, sample: true as const }))];
-  const [c0, c1, c2, c3, c4] = items;
-
+// A uniform, responsive grid of real decks (newest-first, as the server orders
+// them) plus the "New deck" tile. No sample/filler cards — an empty library
+// simply shows the "New deck" tile on its own.
+function DeckGrid({ decks, isAdmin }: { decks: DeckCard[]; isAdmin: boolean }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gridTemplateRows: "repeat(3,158px)", gap: 14 }}>
-      {c0 && <FeaturedCard item={c0} isAdmin={isAdmin} />}
-      {c1 && <WideGreenCard item={c1} isAdmin={isAdmin} />}
-      {c2 && <TallGoldCard item={c2} isAdmin={isAdmin} />}
-      {c3 && <SmallCoralCard item={c3} isAdmin={isAdmin} />}
-      {c4 && <WideLimeCard item={c4} isAdmin={isAdmin} />}
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 16, alignItems: "start" }}>
+      {decks.map((d) => (
+        <DeckTile key={d.slug} deck={d} isAdmin={isAdmin} />
+      ))}
       <NewDeckCard />
     </div>
   );
 }
 
-type Item = DeckCard | (SampleDeck & { sample: true });
-function isSample(i: Item): i is SampleDeck & { sample: true } {
-  return (i as { sample?: boolean }).sample === true;
-}
-function hrefOf(i: Item): string | undefined {
-  return !isSample(i) && (i as DeckCard).slug ? `/d/${(i as DeckCard).slug}` : undefined;
-}
-// The presenter-only editor link for a real deck (undefined for sample cards).
-function editHrefOf(i: Item): string | undefined {
-  return !isSample(i) && (i as DeckCard).slug ? `/dashboard/edit/${(i as DeckCard).slug}` : undefined;
-}
-// The slug a publish control acts on — undefined for decorative sample cards.
-function slugOf(i: Item): string | undefined {
-  return !isSample(i) ? (i as DeckCard).slug : undefined;
-}
-// The DeckCard when this item is an UPLOADED (DB-backed) deck — the only kind
-// that gets Replace/Delete/Preview. Undefined for sample and registry cards.
-function uploadedOf(i: Item): DeckCard | undefined {
-  if (isSample(i)) return undefined;
-  const d = i as DeckCard;
-  return d.kind === "uploaded" ? d : undefined;
-}
-// Phase 4 — may the current session manage this item? Only real decks flagged
-// canManage qualify; sample/decorative cards are never manageable.
-function canManageOf(i: Item): boolean {
-  return !isSample(i) && (i as DeckCard).canManage === true;
-}
+// Formats a deck's ISO date as a short "Mon D" label for the card's meta row.
 function shortDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-// Contextual tag shown top-left of a card (matches the design's "Week 1",
-// "Lecture 7", "Seminar" tags): sample decks carry their own; real decks show
-// their date.
-function metaOf(i: Item): string {
-  if (isSample(i)) return i.meta;
-  return shortDate((i as DeckCard).date) || "Deck";
-}
-
-function CardTopRow({ label, arrowSize = 16 }: { label: string; arrowSize?: number }) {
-  return (
-    <div style={{ position: "relative", display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
-      <div style={{ fontSize: 13, fontWeight: 400, color: "rgba(255,255,255,0.9)" }}>{label}</div>
-      <ArrowGlyph size={arrowSize} />
-    </div>
-  );
-}
-
-function FeaturedCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
-  return (
-    <BentoCard
-      href={hrefOf(item)}
-      editHref={editHrefOf(item)}
-      publishSlug={slugOf(item)}
-      uploaded={uploadedOf(item)}
-      canManage={canManageOf(item)}
-      isAdmin={isAdmin}
-      gridColumn="span 2"
-      gridRow="span 2"
-      radius={24}
-      background="radial-gradient(90% 120% at 12% 16%, #ECC98A 0%, rgba(236,201,138,0) 55%),radial-gradient(100% 120% at 90% 24%, #E89B72 0%, rgba(232,155,114,0) 55%),radial-gradient(130% 130% at 70% 112%, #E7C26A 0%, rgba(231,194,106,0) 60%),linear-gradient(150deg,#E0A878,#E6B96E)"
-      boxShadow="0 16px 38px -20px rgba(150,100,60,0.5)"
-    >
-      <CardNoise />
-      <div style={{ position: "relative", padding: "24px 26px 0" }}>
-        <CardTopRow label={isSample(item) ? item.meta : "Most recent"} />
-      </div>
-      <WaveformMotif />
-      <div style={{ position: "relative", padding: "0 26px 24px" }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <div style={{ fontSize: 66, fontWeight: 200, lineHeight: 0.9, letterSpacing: "-0.03em", color: "#FFFFFF" }}>{item.slideCount}</div>
-          <div style={{ fontSize: 15, fontWeight: 300, color: "rgba(255,255,255,0.85)" }}>slides</div>
-        </div>
-        <div style={{ fontSize: 24, fontWeight: 400, lineHeight: 1.12, letterSpacing: "-0.01em", color: "#FFFFFF", marginTop: 8, maxWidth: "16ch" }}>
-          {item.title}
-        </div>
-      </div>
-    </BentoCard>
-  );
-}
-
-function WideGreenCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
-  return (
-    <BentoCard
-      href={hrefOf(item)}
-      editHref={editHrefOf(item)}
-      publishSlug={slugOf(item)}
-      uploaded={uploadedOf(item)}
-      canManage={canManageOf(item)}
-      isAdmin={isAdmin}
-      gridColumn="span 2"
-      gridRow="span 1"
-      background="radial-gradient(90% 130% at 18% 20%, #B7CE9E 0%, transparent 55%),radial-gradient(110% 130% at 88% 85%, #9DBE93 0%, transparent 55%),radial-gradient(120% 120% at 60% 0%, #C9D5A3 0%, transparent 50%),linear-gradient(160deg,#A8C291,#93B488)"
-      boxShadow="0 14px 32px -20px rgba(90,120,80,0.5)"
-    >
-      <div style={{ position: "relative", padding: "20px 22px 0" }}>
-        <CardTopRow label={metaOf(item)} arrowSize={15} />
-      </div>
-      <SphereMotifRight />
-      <div style={{ position: "relative", padding: "0 22px 20px", fontSize: 18, fontWeight: 400, letterSpacing: "-0.01em", color: "#FFFFFF", maxWidth: "18ch" }}>
-        {item.title}
-      </div>
-    </BentoCard>
-  );
-}
-
-function TallGoldCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
-  return (
-    <BentoCard
-      href={hrefOf(item)}
-      editHref={editHrefOf(item)}
-      publishSlug={slugOf(item)}
-      uploaded={uploadedOf(item)}
-      canManage={canManageOf(item)}
-      isAdmin={isAdmin}
-      gridColumn="span 1"
-      gridRow="span 2"
-      background="radial-gradient(100% 110% at 22% 14%, #D8C57E 0%, transparent 55%),radial-gradient(120% 120% at 82% 88%, #A8B87E 0%, transparent 55%),linear-gradient(160deg,#C9B873,#B4B47C)"
-      boxShadow="0 14px 32px -20px rgba(130,120,70,0.5)"
-    >
-      <div style={{ position: "relative", padding: "20px 20px 0" }}>
-        <CardTopRow label={metaOf(item)} arrowSize={15} />
-      </div>
-      <VortexMotif />
-      <div style={{ position: "relative", padding: "0 20px 20px" }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-          <div style={{ fontSize: 42, fontWeight: 200, lineHeight: 0.9, letterSpacing: "-0.03em", color: "#FFFFFF" }}>{item.slideCount}</div>
-          <div style={{ fontSize: 13, fontWeight: 300, color: "rgba(255,255,255,0.8)" }}>slides</div>
-        </div>
-        <div style={{ fontSize: 16, fontWeight: 400, lineHeight: 1.15, color: "#FFFFFF", marginTop: 6, maxWidth: "12ch" }}>{item.title}</div>
-      </div>
-    </BentoCard>
-  );
-}
-
-function SmallCoralCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
-  return (
-    <BentoCard
-      href={hrefOf(item)}
-      editHref={editHrefOf(item)}
-      publishSlug={slugOf(item)}
-      uploaded={uploadedOf(item)}
-      canManage={canManageOf(item)}
-      isAdmin={isAdmin}
-      gridColumn="span 1"
-      gridRow="span 1"
-      background="radial-gradient(100% 120% at 18% 12%, #E9A07C 0%, transparent 55%),radial-gradient(120% 120% at 92% 96%, #93A8C6 0%, transparent 60%),linear-gradient(150deg,#E0A487,#A6A9C0)"
-      boxShadow="0 14px 32px -20px rgba(150,110,110,0.5)"
-    >
-      <div style={{ position: "relative", padding: "18px 18px 0" }}>
-        <CardTopRow label={metaOf(item)} arrowSize={14} />
-      </div>
-      <ArcMotif />
-      <div style={{ position: "relative", padding: "0 18px 18px", fontSize: 13.5, fontWeight: 400, lineHeight: 1.2, color: "#FFFFFF" }}>{item.title}</div>
-    </BentoCard>
-  );
-}
-
-function WideLimeCard({ item, isAdmin }: { item: Item; isAdmin: boolean }) {
-  return (
-    <BentoCard
-      href={hrefOf(item)}
-      editHref={editHrefOf(item)}
-      publishSlug={slugOf(item)}
-      uploaded={uploadedOf(item)}
-      canManage={canManageOf(item)}
-      isAdmin={isAdmin}
-      gridColumn="span 2"
-      gridRow="span 1"
-      background="radial-gradient(90% 130% at 16% 18%, #C6D88A 0%, transparent 55%),radial-gradient(120% 130% at 86% 84%, #9BC07E 0%, transparent 55%),linear-gradient(150deg,#AEC97F,#BBD06E)"
-      boxShadow="0 14px 32px -20px rgba(110,140,70,0.5)"
-    >
-      <div style={{ position: "relative", padding: "20px 22px", display: "flex", alignItems: "center", justifyContent: "space-between", flex: 1 }}>
-        <div style={{ position: "relative" }}>
-          <div style={{ fontSize: 12.5, fontWeight: 400, color: "rgba(255,255,255,0.9)", marginBottom: 10 }}>{metaOf(item)}</div>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
-            <div style={{ fontSize: 36, fontWeight: 200, lineHeight: 0.9, letterSpacing: "-0.02em", color: "#FFFFFF" }}>
-              {String(item.slideCount).padStart(2, "0")}
-            </div>
-            <div style={{ fontSize: 18, fontWeight: 400, color: "#FFFFFF" }}>{item.title}</div>
-          </div>
-        </div>
-        <SphereMotifInline />
-      </div>
-    </BentoCard>
-  );
 }
 
 // The "New deck" tile — no longer decorative. Clicking it opens the shared
@@ -1451,19 +1013,18 @@ function NewDeckCard() {
       onClick={() => admin?.openCreate()}
       title="Upload a self-contained HTML deck"
       style={{
-        gridColumn: "span 1",
-        gridRow: "span 1",
-        borderRadius: 22,
+        minHeight: 150,
+        borderRadius: 18,
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
         gap: 10,
-        background: "rgba(255,255,255,0.42)",
-        border: "1px solid rgba(255,255,255,0.7)",
+        background: "rgba(255,255,255,0.34)",
+        border: "1px dashed rgba(60,55,45,0.28)",
         backdropFilter: "blur(16px)",
         WebkitBackdropFilter: "blur(16px)",
-        boxShadow: "0 12px 30px -18px rgba(60,55,45,0.4)",
+        boxShadow: "0 10px 28px -18px rgba(60,55,45,0.32)",
         transition: "background .18s cubic-bezier(.2,.6,.2,1)",
         cursor: "pointer",
         fontFamily: "inherit",
@@ -2502,6 +2063,9 @@ function BootCheck({ slug }: { slug: string }) {
 
 // ---- search results ---------------------------------------------------------
 
+// Search reuses the very same DeckTile cards (and their owner-only controls) in
+// the same responsive grid, under a result-count heading — so the filtered view
+// is visually identical to the library, just narrowed.
 function SearchResults({ results, query, isAdmin }: { results: DeckCard[]; query: string; isAdmin: boolean }) {
   return (
     <div>
@@ -2511,59 +2075,12 @@ function SearchResults({ results, query, isAdmin }: { results: DeckCard[]; query
       {results.length === 0 ? (
         <p style={{ color: "#6E6A62", fontSize: 16 }}>No decks match “{query}”.</p>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 16, alignItems: "start" }}>
           {results.map((d) => (
-            <SearchResultCard key={d.slug} d={d} isAdmin={isAdmin} />
+            <DeckTile key={d.slug} deck={d} isAdmin={isAdmin} />
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function SearchResultCard({ d, isAdmin }: { d: DeckCard; isAdmin: boolean }) {
-  const ctx = usePublish();
-  // Phase 4 — the owner-only overlays (publish control, replace/delete) render
-  // only when this session may manage the deck. The card's hidden styling still
-  // tracks the live status regardless.
-  const canManage = d.canManage === true;
-  const status = ctx ? ctx.statusOf(d.slug) : d.publishStatus;
-  const hidden = status === "unpublished";
-  return (
-    // The control is a SIBLING under the card link (never nested — no anchor in
-    // an anchor), so it can POST without triggering the card's navigation.
-    <div style={{ display: "flex", flexDirection: "column" }}>
-      <Link
-        href={`/d/${d.slug}`}
-        className="lm-card"
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-          padding: "22px 22px 20px",
-          borderRadius: 18,
-          textDecoration: "none",
-          color: "#2C2932",
-          background: "rgba(255,255,255,0.5)",
-          border: hidden ? "1px dashed rgba(44,42,49,0.4)" : "1px solid rgba(255,255,255,0.72)",
-          filter: hidden ? "saturate(0.6) brightness(0.99)" : undefined,
-          backdropFilter: "blur(16px)",
-          WebkitBackdropFilter: "blur(16px)",
-          boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
-          transition: "transform .18s cubic-bezier(.2,.6,.2,1), box-shadow .18s cubic-bezier(.2,.6,.2,1)",
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#9A958A" }}>
-          <span>{d.date}</span>
-          <span>
-            {d.slideCount} {d.slideCount === 1 ? "slide" : "slides"}
-          </span>
-        </div>
-        <div style={{ fontSize: 20, fontWeight: 500, letterSpacing: "-0.01em" }}>{d.title}</div>
-        {d.description && <div style={{ fontSize: 14, fontWeight: 300, lineHeight: 1.5, color: "#6E6A62" }}>{d.description}</div>}
-      </Link>
-      {canManage && <PublishControl slug={d.slug} isAdmin={isAdmin} variant="inline" />}
-      {canManage && d.kind === "uploaded" && <UploadedActions deck={d} variant="inline" />}
     </div>
   );
 }
