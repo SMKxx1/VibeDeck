@@ -60,6 +60,15 @@ export default async function EditDeckPage({
       deckTitle={deck.title}
       slides={slides}
       dbAvailable={dbAvailable}
+      // Preview needs the deck's render info: an embed deck frames embedUrl
+      // (first-party), an uploaded deck mints a signed preview URL (contentUrl is
+      // defined only when DECK_ORIGIN is set), and a Slide[]-only registry deck has
+      // neither → the editor shows a "no preview" placeholder. getDeck already
+      // resolves all of these.
+      kind={deck.kind}
+      contentUrl={deck.contentUrl}
+      embedUrl={deck.embedUrl}
+      slideCount={deck.slideCount}
     />
   );
 }

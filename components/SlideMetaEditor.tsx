@@ -26,6 +26,39 @@ export interface EditorSlide {
 
 const MAX_FIELD = 8000;
 
+// ── Live slide preview ──────────────────────────────────────────────────────
+// The editor renders the ACTUAL slide next to its notes so the presenter no longer
+// annotates blind. It reuses the existing sandboxed-deck bridge (postMessage) — no
+// new render path. Three render modes:
+//   • "embed"    — deck.embedUrl, the trusted first-party workshop deck. Framed with
+//                  sandbox="allow-scripts allow-same-origin" (same as LiveDeck).
+//   • "uploaded" — deck.kind === "uploaded". Untrusted stored HTML on the isolated
+//                  DECK_ORIGIN. Framed with sandbox="allow-scripts" ONLY — NEVER
+//                  allow-same-origin — from a short-lived SIGNED preview URL.
+//   • "none"     — a registry Slide[] deck with neither URL (or DECK_ORIGIN unset):
+//                  no renderable preview → a muted placeholder, never a crash.
+type PreviewMode = "embed" | "uploaded" | "none";
+
+// SECURITY: the closed set of messages the preview may post to the (possibly
+// untrusted) frame — the union IS the whitelist. Only navigation-only shapes; the
+// compiler rejects anything else, so no notes/label/token/name can ever be posted.
+type PreviewControlMessage = { type: "deck:goto"; index: number } | { type: "deck:report" };
+
+// Receive-only slide state the deck reports over `slidechange`.
+interface PreviewDeckState {
+  index: number;
+  total: number;
+  label: string;
+}
+
+// What the preview should currently show. `seq` bumps on every Preview click so
+// re-focusing the SAME slide (after clicking through the deck by hand) still snaps
+// the frame back to it.
+interface PreviewTarget {
+  index: number;
+  seq: number;
+}
+
 // Imperative handle each SlideCard registers with the parent so the deck-level
 // "Generate all empty" can (a) read whether a slide's AI context is currently
 // empty and (b) trigger that slide's own generate-and-fill — without lifting all
@@ -43,11 +76,19 @@ export function SlideMetaEditor({
   deckTitle,
   slides,
   dbAvailable,
+  kind,
+  contentUrl,
+  embedUrl,
+  slideCount,
 }: {
   slug: string;
   deckTitle: string;
   slides: EditorSlide[];
   dbAvailable: boolean;
+  kind?: "registry" | "uploaded";
+  contentUrl?: string;
+  embedUrl?: string;
+  slideCount?: number;
 }) {
   // Registry of live per-card handles, keyed by slide index. A card registers a
   // STABLE handle on mount whose methods read the latest values via refs, so the
@@ -66,6 +107,14 @@ export function SlideMetaEditor({
   const [bulkSkipped, setBulkSkipped] = useState(0);
   const cancelRef = useRef(false);
   const running = bulkStatus === "running";
+
+  // Which slide the live preview shows. Defaults to slide 0 on load; each slide
+  // card's "Preview" button focuses the frame on that slide (bumping `seq` so a
+  // repeat click re-snaps even after navigating inside the frame).
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget>({ index: 0, seq: 0 });
+  const focusPreview = useCallback((index: number) => {
+    setPreviewTarget((prev) => ({ index, seq: prev.seq + 1 }));
+  }, []);
 
   // Generate-all-empty: snapshot the slides whose AI context is currently empty
   // (so authored grounding is never clobbered), then generate them ONE AT A TIME
@@ -128,7 +177,8 @@ export function SlideMetaEditor({
         backgroundSize: "22px 22px",
       }}
     >
-      <div style={{ width: "100%", maxWidth: 860 }}>
+      <div className="sme-shell">
+        <div className="sme-main">
         {/* header */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
           <Link
@@ -283,14 +333,42 @@ export function SlideMetaEditor({
                 dbAvailable={dbAvailable}
                 register={register}
                 bulkRunning={running}
+                isActive={previewTarget.index === s.index}
+                onPreview={() => focusPreview(s.index)}
               />
             ))}
           </div>
         )}
+        </div>
+
+        <aside className="sme-aside">
+          <DeckPreview
+            slug={slug}
+            kind={kind}
+            contentUrl={contentUrl}
+            embedUrl={embedUrl}
+            slideCount={slideCount}
+            target={previewTarget}
+          />
+        </aside>
       </div>
 
       <style>{`
         .sme-textarea:focus { border-color: rgba(60,55,45,0.4) !important; }
+        .sme-shell {
+          display: flex;
+          gap: 28px;
+          align-items: flex-start;
+          width: 100%;
+          max-width: 1188px;
+        }
+        .sme-main { flex: 1 1 0; min-width: 0; max-width: 760px; }
+        .sme-aside { flex: 0 0 400px; width: 400px; position: sticky; top: 24px; }
+        .sme-preview-btn:hover { background: rgba(60,55,45,0.06) !important; }
+        @media (max-width: 1040px) {
+          .sme-shell { flex-direction: column; align-items: stretch; max-width: 760px; }
+          .sme-aside { position: static; width: 100%; flex: none; order: -1; }
+        }
       `}</style>
     </div>
   );
@@ -305,12 +383,16 @@ function SlideCard({
   dbAvailable,
   register,
   bulkRunning,
+  isActive,
+  onPreview,
 }: {
   slug: string;
   slide: EditorSlide;
   dbAvailable: boolean;
   register: (index: number, handle: SlideHandle) => () => void;
   bulkRunning: boolean;
+  isActive: boolean;
+  onPreview: () => void;
 }) {
   const [notes, setNotes] = useState(slide.speakerNotes);
   const [ctx, setCtx] = useState(slide.aiContext);
@@ -407,10 +489,13 @@ function SlideCard({
         padding: "20px 22px 22px",
         borderRadius: 18,
         background: "rgba(255,255,255,0.55)",
-        border: "1px solid rgba(255,255,255,0.75)",
+        border: isActive ? "1px solid rgba(140,170,40,0.85)" : "1px solid rgba(255,255,255,0.75)",
         backdropFilter: "blur(16px)",
         WebkitBackdropFilter: "blur(16px)",
-        boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
+        boxShadow: isActive
+          ? "0 10px 28px -18px rgba(60,55,45,0.4), 0 0 0 3px rgba(191,224,72,0.28)"
+          : "0 10px 28px -18px rgba(60,55,45,0.4)",
+        transition: "border-color .16s ease, box-shadow .16s ease",
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
@@ -433,6 +518,34 @@ function SlideCard({
             {slide.label || <em style={{ color: "#9A958A" }}>Untitled slide</em>}
           </span>
         </div>
+
+        <button
+          type="button"
+          onClick={onPreview}
+          aria-pressed={isActive}
+          className={isActive ? undefined : "sme-preview-btn"}
+          title={isActive ? "This slide is showing in the live preview" : "Show this slide in the live preview"}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            height: 32,
+            padding: "0 12px",
+            borderRadius: 10,
+            border: isActive ? "none" : "1px solid rgba(60,55,45,0.16)",
+            cursor: "pointer",
+            background: isActive ? "#2C2A31" : "transparent",
+            color: isActive ? "#F4F2EC" : "#5E5A52",
+            fontFamily: "inherit",
+            fontSize: 13,
+            fontWeight: 500,
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+        >
+          <EyeIcon size={13} color={isActive ? "#BFE048" : "#6E6A62"} />
+          {isActive ? "Previewing" : "Preview"}
+        </button>
 
         <button
           type="button"
@@ -628,6 +741,273 @@ function SparkleIcon({ size = 15, color = "currentColor" }: { size?: number; col
         fill={color}
         opacity={0.75}
       />
+    </svg>
+  );
+}
+
+// ── Live slide preview panel ────────────────────────────────────────────────
+// Renders the actual slide next to the editor by REUSING the existing sandboxed-
+// deck bridge — the same machinery as UploadedDeckFrame / LiveDeck. It only ever
+// posts the whitelisted `deck:goto` / `deck:report` navigation messages, and for
+// uploaded (untrusted) decks it frames a signed URL with sandbox="allow-scripts"
+// (NO allow-same-origin) and authenticates replies by frame-window identity.
+function DeckPreview({
+  slug,
+  kind,
+  contentUrl,
+  embedUrl,
+  slideCount,
+  target,
+}: {
+  slug: string;
+  kind?: "registry" | "uploaded";
+  contentUrl?: string;
+  embedUrl?: string;
+  slideCount?: number;
+  target: PreviewTarget;
+}) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [deck, setDeck] = useState<PreviewDeckState>({ index: 0, total: 0, label: "" });
+  const deckRef = useRef(deck);
+  deckRef.current = deck;
+  const targetRef = useRef(target);
+  targetRef.current = target;
+  const bootSyncedRef = useRef(false);
+
+  // Render mode. embedUrl wins (the trusted first-party workshop deck); an uploaded
+  // deck is previewable only when contentUrl is defined (i.e. DECK_ORIGIN is set);
+  // anything else (a Slide[]-only registry deck, or DECK_ORIGIN unset) has no frame.
+  const mode: PreviewMode = embedUrl ? "embed" : kind === "uploaded" && contentUrl ? "uploaded" : "none";
+
+  const [uploadedSrc, setUploadedSrc] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState(false);
+
+  // Uploaded decks: the deck HTML lives ONLY on the isolated DECK_ORIGIN and, when
+  // unpublished, is token-gated — so we mint a short-lived SIGNED preview URL server
+  // side (the exact endpoint the dashboard's Preview action uses) and frame THAT,
+  // never contentUrl directly. The fetch is aborted on unmount.
+  useEffect(() => {
+    if (mode !== "uploaded") return;
+    let alive = true;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(`/api/admin/decks/${slug}/preview`, { signal: ctrl.signal });
+        const data = (await res.json().catch(() => ({}))) as { url?: string };
+        if (!alive) return;
+        if (res.ok && data.url) setUploadedSrc(data.url);
+        else setLoadError(true);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (alive) setLoadError(true);
+      }
+    })();
+    return () => {
+      alive = false;
+      ctrl.abort();
+    };
+  }, [mode, slug]);
+
+  const src = mode === "embed" ? embedUrl ?? null : mode === "uploaded" ? uploadedSrc : null;
+
+  // SECURITY choke point — the ONLY posts to the (possibly untrusted) frame. The
+  // PreviewControlMessage union caps this to navigation-only shapes; targetOrigin is
+  // "*" because an uploaded deck runs on an opaque sandbox origin. We NEVER post
+  // notes, labels, tokens, or names. Mirrors UploadedDeckFrame §2.
+  const sendToDeck = useCallback((msg: PreviewControlMessage) => {
+    iframeRef.current?.contentWindow?.postMessage(msg, "*");
+  }, []);
+
+  // Sync the frame to `index`, guarded against a goto→slidechange loop (only send
+  // when it actually differs from the deck's reported slide).
+  const gotoIndex = useCallback(
+    (index: number) => {
+      if (index !== deckRef.current.index) sendToDeck({ type: "deck:goto", index });
+    },
+    [sendToDeck],
+  );
+
+  // Bridge receive. SECURITY: authenticate by OUR frame's window object-identity
+  // (event.origin is the string "null" for the opaque uploaded sandbox, so it can't
+  // be used) AND require the `source:"deck"` marker — copied verbatim from
+  // UploadedDeckFrame §1. This strict guard is also safe for the first-party embed.
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      const d = (e.data ?? {}) as { source?: string; type?: string } & Partial<PreviewDeckState>;
+      if (!(e.source === iframeRef.current?.contentWindow && d.source === "deck")) return;
+      if (d.type === "ready") {
+        gotoIndex(targetRef.current.index);
+      } else if (d.type === "slidechange") {
+        const next = { index: d.index ?? 0, total: d.total ?? 0, label: d.label ?? "" };
+        setDeck(next);
+        // One-shot boot sync: if the presenter focused a slide before the bridge was
+        // ready, snap to it once the deck first reports — then navigation stays free.
+        if (!bootSyncedRef.current) {
+          bootSyncedRef.current = true;
+          if (next.index !== targetRef.current.index) {
+            sendToDeck({ type: "deck:goto", index: targetRef.current.index });
+          }
+        }
+      }
+    }
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [gotoIndex, sendToDeck]);
+
+  // Follow the slide the presenter is editing. `seq` bumps on every Preview click so
+  // re-focusing the same slide (after paging inside the frame) still snaps it back.
+  useEffect(() => {
+    if (!src) return;
+    gotoIndex(target.index);
+  }, [target, src, gotoIndex]);
+
+  // Cover the boot race (like UploadedDeckFrame): the first slidechange may fire
+  // before this listener attached. Ping deck:report until we have a slide count;
+  // the interval is cleared on unmount / once the deck reports.
+  useEffect(() => {
+    if (!src || deck.total > 0) return;
+    sendToDeck({ type: "deck:report" });
+    const id = window.setInterval(() => sendToDeck({ type: "deck:report" }), 350);
+    return () => window.clearInterval(id);
+  }, [src, deck.total, sendToDeck]);
+
+  const fallbackCount = deck.total || slideCount || 0;
+  const caption =
+    mode === "none"
+      ? "No preview"
+      : deck.total > 0
+        ? `Slide ${deck.index + 1} of ${deck.total}${deck.label ? ` · ${deck.label}` : ""}`
+        : fallbackCount > 0
+          ? `Loading… · ${fallbackCount} slides`
+          : "Loading preview…";
+
+  return (
+    <div style={previewCardStyle}>
+      <div style={previewHeaderStyle}>
+        <span style={previewEyebrowStyle}>Live preview</span>
+        <span style={previewCaptionStyle} title={caption}>
+          {caption}
+        </span>
+      </div>
+      <div style={previewStageStyle}>
+        {mode === "none" ? (
+          <PreviewPlaceholder text="No preview available for this deck." />
+        ) : mode === "uploaded" && loadError ? (
+          <PreviewPlaceholder text="Preview unavailable right now — try reloading." />
+        ) : src ? (
+          <iframe
+            ref={iframeRef}
+            src={src}
+            title="Slide preview"
+            // SECURITY: uploaded content is untrusted → allow-scripts ONLY (no
+            // allow-same-origin, forcing an opaque origin). The embed is the trusted
+            // first-party deck (same sandbox LiveDeck uses).
+            sandbox={mode === "embed" ? "allow-scripts allow-same-origin" : "allow-scripts"}
+            onLoad={() => sendToDeck({ type: "deck:report" })}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: 0, display: "block" }}
+          />
+        ) : (
+          <PreviewPlaceholder text="Loading preview…" muted />
+        )}
+      </div>
+      {mode !== "none" && (
+        <p style={previewHintStyle}>
+          Hit <strong style={{ fontWeight: 600, color: "#5E5A52" }}>Preview</strong> on any slide to
+          jump this here — or click through the deck directly.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PreviewPlaceholder({ text, muted }: { text: string; muted?: boolean }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+        textAlign: "center",
+        color: muted ? "rgba(244,242,236,0.5)" : "rgba(244,242,236,0.68)",
+        fontSize: 13,
+        lineHeight: 1.5,
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+const previewCardStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 12,
+  padding: "16px 16px 14px",
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.55)",
+  border: "1px solid rgba(255,255,255,0.75)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 10px 28px -18px rgba(60,55,45,0.4)",
+};
+
+const previewHeaderStyle: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 4 };
+
+const previewEyebrowStyle: React.CSSProperties = {
+  fontSize: 11,
+  fontWeight: 600,
+  letterSpacing: "0.16em",
+  textTransform: "uppercase",
+  color: "#9A958A",
+};
+
+const previewCaptionStyle: React.CSSProperties = {
+  fontSize: 13.5,
+  fontWeight: 500,
+  color: "#3A372F",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const previewStageStyle: React.CSSProperties = {
+  position: "relative",
+  width: "100%",
+  aspectRatio: "16 / 9",
+  borderRadius: 12,
+  overflow: "hidden",
+  background: "#1B1A17",
+  border: "1px solid rgba(60,55,45,0.14)",
+};
+
+const previewHintStyle: React.CSSProperties = {
+  margin: 0,
+  fontSize: 11.5,
+  lineHeight: 1.5,
+  color: "#8A857C",
+};
+
+// A simple eye to mark the per-slide "Preview" affordance (matches the file's
+// minimal SVG-icon style). Purely decorative.
+function EyeIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke={color}
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M1.5 8S4 3 8 3s6.5 5 6.5 5-2.5 5-6.5 5-6.5-5-6.5-5z" />
+      <circle cx="8" cy="8" r="1.9" />
     </svg>
   );
 }
