@@ -8,9 +8,8 @@ import { validateDeckHtml } from "@/lib/deck-validator";
 import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { markdownToDeck, type DeckTheme } from "@/lib/markdown-deck";
 
-// Markdown → deck import (#21). Widens authoring to non-coders (and to presenters
-// without an OpenRouter key, which Studio requires): paste Markdown, get a themed,
-// contract-valid VibeDeck deck with auto AI grounding. Server-side transform (one
+// Markdown → deck import (#21). Widens authoring to non-coders: paste Markdown, get
+// a themed, contract-valid VibeDeck deck with auto AI grounding. Server-side transform (one
 // canonical renderer) → the SAME validate → insert → ground pipeline as upload, so
 // containment (isolated origin + CSP + sandbox) and grounding come for free. The
 // new deck is owned by the importer and lands unpublished.

@@ -1,10 +1,7 @@
 // Pure, dependency-free, client+server-safe: inline-inject a runtime <script> into
-// deck HTML. Extracted so there is ONE injection + escape used by both:
-//   • the server serve-transform (lib/deck-runtime.ts reads runtime/vibedeck-v1.js
-//     off disk and calls this) — the bytes real viewers get from /d-content
-//   • the Studio live preview (a client component fetches the runtime text via
-//     /api/studio/runtime and calls this to build a sandboxed <iframe srcdoc>)
-// so the preview renders EXACTLY as production and no one re-implements the escape.
+// deck HTML. The server serve-transform (lib/deck-runtime.ts reads
+// runtime/vibedeck-v1.js off disk and calls this) produces the exact bytes real
+// viewers get from /d-content — one injection + escape, no re-implementation.
 //
 // CRITICAL ESCAPE: the runtime source contains a literal `</script>` (deck-stage.js's
 // own header doc shows `<script src="deck-stage.js"></script>`). Inside an inline
