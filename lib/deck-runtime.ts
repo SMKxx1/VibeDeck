@@ -57,8 +57,7 @@ async function loadRuntime(): Promise<string | null> {
 }
 
 // The runtime injection (+ the critical </script> escape) lives in the pure,
-// client+server-safe lib/inject-runtime so the Studio preview reuses the EXACT
-// same logic. See that file for the escape rationale.
+// client+server-safe lib/inject-runtime. See that file for the escape rationale.
 
 /**
  * Transform an uploaded deck's stored html into the exact bytes served to the
@@ -72,14 +71,4 @@ export async function renderUploadedDeckHtml(storedHtml: string): Promise<string
   const runtime = await loadRuntime();
   if (!runtime) return storedHtml;
   return injectRuntime(storedHtml, runtime);
-}
-
-/**
- * The raw runtime JS body (cached), or null if unreadable. Exposed so the Studio
- * live preview can fetch it (via /api/studio/runtime) and inject it into a
- * sandboxed srcdoc iframe with the SAME lib/inject-runtime logic the server uses
- * — preview renders exactly like the real /d-content serve.
- */
-export function getRuntimeText(): Promise<string | null> {
-  return loadRuntime();
 }
