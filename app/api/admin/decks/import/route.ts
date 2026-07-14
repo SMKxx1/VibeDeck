@@ -122,7 +122,12 @@ export async function POST(req: Request) {
   }
   if (result === "conflict") return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
 
-  await replaceUploadedDeckSlides(slug, validation.slides);
+  // Attach the branch directives (branch points) to the validator's per-slide
+  // metadata — they live in deck_slides, not the HTML, so the merge happens here.
+  const slides = validation.slides.map((s) =>
+    rendered.branches[s.index] ? { ...s, branches: rendered.branches[s.index] } : s,
+  );
+  await replaceUploadedDeckSlides(slug, slides);
 
   return NextResponse.json(
     { slug, slideCount: validation.slideCount, warnings: validation.warnings },

@@ -58,6 +58,51 @@ export interface Slide {
   accent?: "amber" | "teal" | "violet" | "rose";
 }
 
+// ── Branch points (choose-your-own-path decks) ───────────────────────────────
+// A slide may be a BRANCH POINT: 2–4 labeled paths, each targeting a contiguous
+// slide range. The presenter opens an audience vote on the paths (reusing the
+// live-poll machinery — see lib/poll.ts `kind: "branch"`), reveals the tally, and
+// routes the room to the winning branch (a driver-gated session jump). Persisted
+// per slide in deck_slides.branches (JSONB, migration 005) alongside the other
+// editable slide metadata. All indices are 0-based and inclusive.
+export interface SlideBranch {
+  /** What the audience votes on, e.g. "Deep-dive the API". */
+  label: string;
+  /** First slide of the path (0-based). Routing jumps here. */
+  from: number;
+  /** Last slide of the path (0-based, inclusive) — authoring/breadcrumb info. */
+  to: number;
+}
+
+export const MAX_BRANCHES = 4;
+export const MIN_BRANCHES = 2;
+export const MAX_BRANCH_LABEL = 80;
+
+/**
+ * Validate/normalize an untrusted branch list (API body, DB JSONB, markdown
+ * directive). Returns a clean 2–4 entry list, or null when the input doesn't
+ * amount to a usable branch point (absent, malformed, or fewer than 2 valid
+ * paths) — null is the canonical "not a branch slide". Pure + dependency-free so
+ * both server stores and client editors share one rule. When `slideCount` is
+ * given, entries pointing outside the deck are dropped.
+ */
+export function sanitizeBranches(input: unknown, slideCount?: number): SlideBranch[] | null {
+  if (!Array.isArray(input)) return null;
+  const out: SlideBranch[] = [];
+  for (const raw of input) {
+    if (out.length >= MAX_BRANCHES) break;
+    if (!raw || typeof raw !== "object") continue;
+    const b = raw as Partial<SlideBranch>;
+    const label = typeof b.label === "string" ? b.label.trim().slice(0, MAX_BRANCH_LABEL) : "";
+    if (!label) continue;
+    if (typeof b.from !== "number" || !Number.isInteger(b.from) || b.from < 0) continue;
+    if (typeof b.to !== "number" || !Number.isInteger(b.to) || b.to < b.from) continue;
+    if (slideCount !== undefined && (b.from >= slideCount || b.to >= slideCount)) continue;
+    out.push({ label, from: b.from, to: b.to });
+  }
+  return out.length >= MIN_BRANCHES ? out : null;
+}
+
 export interface Deck {
   /** Permanent, URL-safe identifier. The deck lives forever at /d/<slug>. */
   slug: string;

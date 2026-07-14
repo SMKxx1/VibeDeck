@@ -13,6 +13,7 @@
 import { getPool, isDbReachable, query } from "./db";
 import { ensureSchema, SEEDS } from "./schema";
 import type { DeckSlideMeta } from "./deck-validator";
+import { sanitizeBranches, type SlideBranch } from "./types";
 
 // ensureSchema (the DB boot sequence) and SEEDS both moved to lib/schema.ts to
 // break an import cycle: uploaded-deck reads need ensureSchema, which used to live
@@ -24,6 +25,8 @@ export interface SlideMeta {
   label: string;
   speakerNotes: string;
   aiContext: string;
+  /** Branch point (2–4 audience-voted paths), or null — see lib/types.ts. */
+  branches: SlideBranch[] | null;
 }
 
 // SEEDS (the single source of seed truth) now lives in lib/schema.ts. We still
@@ -44,8 +47,9 @@ export async function getDeckSlides(slug: string): Promise<SlideMeta[]> {
       label: string | null;
       speaker_notes: string;
       ai_context: string;
+      branches: unknown;
     }>(
-      `SELECT slide_index, label, speaker_notes, ai_context
+      `SELECT slide_index, label, speaker_notes, ai_context, branches
          FROM deck_slides
         WHERE deck_slug = $1
         ORDER BY slide_index ASC`,
@@ -56,6 +60,9 @@ export async function getDeckSlides(slug: string): Promise<SlideMeta[]> {
       label: r.label ?? "",
       speakerNotes: r.speaker_notes ?? "",
       aiContext: r.ai_context ?? "",
+      // Re-sanitize on read: JSONB is schemaless, so a hand-edited row must
+      // degrade to "not a branch slide", never to a crashing shape.
+      branches: sanitizeBranches(r.branches),
     }));
   } catch {
     return []; // no DB / query error — caller falls back to static data
@@ -118,11 +125,48 @@ export async function getSlideNotes(slug: string): Promise<Record<number, string
   }
 }
 
+/** One slide's branch point, or null (not a branch slide / unavailable). */
+export async function getSlideBranches(slug: string, index: number): Promise<SlideBranch[] | null> {
+  await ensureSchema();
+  try {
+    const res = await query<{ branches: unknown }>(
+      `SELECT branches FROM deck_slides WHERE deck_slug = $1 AND slide_index = $2`,
+      [slug, index],
+    );
+    if (res.rows.length === 0) return null;
+    return sanitizeBranches(res.rows[0].branches);
+  } catch {
+    return null;
+  }
+}
+
+/** index → branches map for a deck's branch-point slides. `{}` when no DB. */
+export async function getDeckBranches(slug: string): Promise<Record<number, SlideBranch[]>> {
+  await ensureSchema();
+  try {
+    const res = await query<{ slide_index: number; branches: unknown }>(
+      `SELECT slide_index, branches FROM deck_slides
+        WHERE deck_slug = $1 AND branches IS NOT NULL`,
+      [slug],
+    );
+    const map: Record<number, SlideBranch[]> = {};
+    for (const r of res.rows) {
+      const b = sanitizeBranches(r.branches);
+      if (b) map[r.slide_index] = b;
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
 // ---- write ------------------------------------------------------------------
 
 export interface SlideMetaPatch {
   speakerNotes?: string;
   aiContext?: string;
+  /** null clears the branch point; a valid 2–4 list sets it. */
+  branches?: SlideBranch[] | null;
 }
 
 /**
@@ -149,6 +193,12 @@ export async function updateSlideMeta(
   if (patch.aiContext !== undefined) {
     sets.push(`ai_context = $${n++}`);
     values.push(patch.aiContext);
+  }
+  if (patch.branches !== undefined) {
+    sets.push(`branches = $${n++}`);
+    // Stringify rather than passing the array: node-postgres would serialize a
+    // JS array as a Postgres ARRAY literal, not JSONB. PG casts the text for us.
+    values.push(patch.branches === null ? null : JSON.stringify(patch.branches));
   }
   if (sets.length === 0) return { ok: true }; // nothing to change
 
@@ -179,13 +229,23 @@ export async function updateSlideMeta(
     if (patch.aiContext !== undefined) {
       conflictSets.push("ai_context = EXCLUDED.ai_context");
     }
+    if (patch.branches !== undefined) {
+      conflictSets.push("branches = EXCLUDED.branches");
+    }
     conflictSets.push("updated_at = now()");
     await query(
-      `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, updated_at)
-       VALUES ($1, $2, $3, $4, $5, now())
+      `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())
        ON CONFLICT (deck_slug, slide_index) DO UPDATE
          SET ${conflictSets.join(", ")}`,
-      [slug, index, label, patch.speakerNotes ?? "", patch.aiContext ?? ""],
+      [
+        slug,
+        index,
+        label,
+        patch.speakerNotes ?? "",
+        patch.aiContext ?? "",
+        patch.branches ? JSON.stringify(patch.branches) : null,
+      ],
     );
     return { ok: true };
   } catch (err) {
@@ -244,21 +304,25 @@ export async function replaceUploadedDeckSlides(
     ]);
     if (slides.length > 0) {
       // Build one multi-row INSERT ... ON CONFLICT DO UPDATE. Params per row:
-      // (deck_slug, slide_index, label, speaker_notes, ai_context).
+      // (deck_slug, slide_index, label, speaker_notes, ai_context, branches).
+      // branches overwrite too (the author is re-declaring the WHOLE deck; a
+      // replace that drops a branch directive must not leave a stale vote path).
       const rows: string[] = [];
       const values: unknown[] = [];
       let n = 1;
       for (const s of slides) {
-        rows.push(`($${n++}, $${n++}, $${n++}, $${n++}, $${n++})`);
-        values.push(slug, s.index, s.label, s.speakerNotes, s.aiContext);
+        rows.push(`($${n++}, $${n++}, $${n++}, $${n++}, $${n++}, $${n++})`);
+        const branches = sanitizeBranches(s.branches);
+        values.push(slug, s.index, s.label, s.speakerNotes, s.aiContext, branches ? JSON.stringify(branches) : null);
       }
       await client.query(
-        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
+        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches)
          VALUES ${rows.join(", ")}
          ON CONFLICT (deck_slug, slide_index) DO UPDATE
            SET label = EXCLUDED.label,
                speaker_notes = EXCLUDED.speaker_notes,
                ai_context = EXCLUDED.ai_context,
+               branches = EXCLUDED.branches,
                updated_at = now()`,
         values,
       );

@@ -18,6 +18,13 @@ export interface SessionState {
   updatedAt: number;
   /** Last time a presenter was seen (drove or heartbeat). Drives `live`. */
   seenAt: number;
+  /**
+   * Co-host mode: the userId currently holding "the clicker" (slide control).
+   * Unset until a presenter first drives — a legacy session simply has no driver,
+   * and the first writer claims it. Other presenters are moderators (roster,
+   * polls, recaps, Q&A) until they takeClicker().
+   */
+  driverId?: string;
 }
 
 // A session is "live" (presenter actively presenting → viewers locked/synced) if
@@ -49,6 +56,7 @@ function normalize(s: unknown): SessionState | null {
     max: Math.max(0, Math.floor(typeof o.max === "number" ? o.max : o.index)),
     updatedAt: typeof o.updatedAt === "number" ? o.updatedAt : 0,
     seenAt: typeof o.seenAt === "number" ? o.seenAt : 0,
+    ...(typeof o.driverId === "string" && o.driverId ? { driverId: o.driverId } : {}),
   };
 }
 
@@ -90,21 +98,59 @@ export async function getSession(slug: string): Promise<SessionState> {
   return state;
 }
 
-/** Presenter moved to `index`. Unlocks every slide up to there for viewers. */
-export async function setPresenterIndex(slug: string, index: number): Promise<SessionState> {
+/**
+ * Presenter moved to `index`. Unlocks every slide up to there for viewers.
+ *
+ * Co-host mode: when a driver is on record, ONLY that presenter moves the shared
+ * index — a different presenter's write is ignored (they're a moderator until they
+ * takeClicker(); the current state is returned so their console still reconciles).
+ * A session with no driver yet (fresh or legacy) is claimed by the first writer.
+ * Callers that pass no driverId (legacy behavior) drive unconditionally, as today.
+ */
+export async function setPresenterIndex(slug: string, index: number, driverId?: string): Promise<SessionState> {
   const prev = await readRaw(slug);
+  if (driverId && prev.driverId && prev.driverId !== driverId) return prev;
   const idx = Math.max(0, Math.floor(index));
   const now = Date.now();
-  const next: SessionState = { index: idx, max: Math.max(prev.max, idx), updatedAt: now, seenAt: now };
+  const next: SessionState = {
+    index: idx,
+    max: Math.max(prev.max, idx),
+    updatedAt: now,
+    seenAt: now,
+    ...(prev.driverId ?? driverId ? { driverId: prev.driverId ?? driverId } : {}),
+  };
   await persist(slug, next);
   return next;
+}
+
+/**
+ * Co-host handoff: the caller claims the clicker (slide control). Last claim wins
+ * — "pass the clicker" is simply the other presenter taking it. Position and lock
+ * are untouched; seenAt bumps so the claim also counts as presenter liveness.
+ */
+export async function takeClicker(slug: string, driverId: string): Promise<SessionState> {
+  const prev = await readRaw(slug);
+  const next: SessionState = { ...prev, driverId, seenAt: Date.now() };
+  await persist(slug, next);
+  return next;
+}
+
+/** Who holds the clicker (undefined = unclaimed — first presenter to drive wins). */
+export async function getDriverId(slug: string): Promise<string | undefined> {
+  return (await readRaw(slug)).driverId;
 }
 
 /** Presenter hit "reset lock": the current slide becomes the viewer ceiling. */
 export async function resetLock(slug: string): Promise<SessionState> {
   const prev = await readRaw(slug);
   const now = Date.now();
-  const next: SessionState = { index: prev.index, max: prev.index, updatedAt: now, seenAt: now };
+  const next: SessionState = {
+    index: prev.index,
+    max: prev.index,
+    updatedAt: now,
+    seenAt: now,
+    ...(prev.driverId ? { driverId: prev.driverId } : {}),
+  };
   await persist(slug, next);
   return next;
 }

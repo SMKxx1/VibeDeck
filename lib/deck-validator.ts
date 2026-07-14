@@ -26,6 +26,7 @@
 //     absent/empty → the deck simply has no authored AI grounding (generic answers).
 
 import { parse, type HTMLElement } from "node-html-parser";
+import type { SlideBranch } from "./types";
 
 // Bounds. MAX_SLIDES caps both the parse work and the number of deck_slides
 // upserts a single upload can trigger (a 2MB body of empty <section>s would
@@ -47,6 +48,12 @@ export interface DeckSlideMeta {
   label: string;
   aiContext: string;
   speakerNotes: string;
+  /**
+   * Optional branch point (2–4 audience-voted paths — lib/types.ts SlideBranch).
+   * Not derived from the HTML here; the markdown importer attaches it from its
+   * `branch` directive before the deck_slides upsert. The store re-sanitizes.
+   */
+  branches?: SlideBranch[] | null;
 }
 
 export interface DeckValidationResult {

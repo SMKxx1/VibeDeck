@@ -6,6 +6,7 @@ import { getDeckOwner } from "@/lib/uploaded-decks";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides, updateSlideMeta } from "@/lib/slides-store";
+import { sanitizeBranches, type SlideBranch } from "@/lib/types";
 
 // Ownership-gated editor API for per-slide speaker notes + AI grounding context.
 // GET reads a deck's slide metadata; PUT saves one slide's edits. READ is broader
@@ -61,6 +62,8 @@ interface PutBody {
   index?: number;
   speakerNotes?: string;
   aiContext?: string;
+  /** Branch point: null/[] clears it; otherwise 2–4 {label, from, to} paths. */
+  branches?: unknown;
 }
 
 export async function PUT(req: Request) {
@@ -95,7 +98,20 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: "bad_index" }, { status: 400 });
   }
 
-  const patch: { speakerNotes?: string; aiContext?: string } = {};
+  const patch: { speakerNotes?: string; aiContext?: string; branches?: SlideBranch[] | null } =
+    {};
+  if (body.branches !== undefined) {
+    // null or [] clears the branch point; anything else must sanitize to a valid
+    // 2–4 path list (lib/types.ts — the one shared rule) or the save is rejected,
+    // so a half-formed branch can never be persisted.
+    if (body.branches === null || (Array.isArray(body.branches) && body.branches.length === 0)) {
+      patch.branches = null;
+    } else {
+      const cleaned = sanitizeBranches(body.branches);
+      if (!cleaned) return NextResponse.json({ error: "bad_branches" }, { status: 400 });
+      patch.branches = cleaned;
+    }
+  }
   if (body.speakerNotes !== undefined) {
     const v = String(body.speakerNotes);
     if (v.length > MAX_FIELD) return NextResponse.json({ error: "too_long" }, { status: 400 });
