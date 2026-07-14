@@ -75,6 +75,11 @@ const QNA_HIDDEN_MS = 30_000;
 const PRESENCE_POLL_MS = 4_000;
 const PRESENCE_HIDDEN_MS = 30_000;
 
+// Comprehension checkpoint: when this many DISTINCT viewers hit "I'm lost" inside
+// the meter's 15s window (see /api/signal GET), surface the one-tap fixes. The
+// meter decays fast, so it inherently reflects the slide being shown right now.
+const LOST_THRESHOLD = 3;
+
 type Role = "presenter" | "viewer";
 
 // Viewer→presenter backchannel reaction kinds (#2). "lost" is its own button; the
@@ -116,6 +121,8 @@ interface SessionState {
 }
 
 // Viewer-safe poll projection, delivered on the SAME /api/session read (#3).
+// `explanation` is the room-shared AI "why that answer" note, attached shortly
+// AFTER reveal (it lands on a later session tick and the card re-renders).
 interface ViewerPoll {
   id: string;
   question: string;
@@ -124,7 +131,26 @@ interface ViewerPoll {
   correctIndex: number | null;
   tally: number[] | null;
   total: number | null;
+  explanation: string | null;
   at: number;
+}
+// A presenter-broadcast recap of a slide (comprehension checkpoint), delivered on
+// the same session read. Dismiss is local per viewer; a new id shows again.
+interface Recap {
+  id: string;
+  text: string;
+  slideIndex: number;
+  at: number;
+}
+// This viewer's personal "catch me up" recap: an on-demand AI summary of the
+// slides between THEIR slide and the live slide. Local to the tab — never
+// broadcast — so it lives here, not on the session poll.
+interface CatchUp {
+  from: number; // the viewer's slide (0-based) when they asked
+  to: number; // the live slide at that moment
+  text: string | null; // null until loaded
+  error: string | null;
+  loading: boolean;
 }
 // A question in the upvotable Q&A queue (#5).
 interface QnaQuestion {
@@ -145,6 +171,7 @@ interface Poll {
   revealed: boolean;
   tally: number[] | null;
   total: number | null;
+  explanation?: string; // "why that answer" — attached after reveal
   at: number;
 }
 interface Viewer {
@@ -183,6 +210,12 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const [qnaOpen, setQnaOpen] = useState(false);
   const [questions, setQuestions] = useState<QnaQuestion[]>([]);
   const [myVotes, setMyVotes] = useState<Record<string, boolean>>({});
+  // Room recap (comprehension checkpoint): shared across roles — viewers render the
+  // dismissible overlay; the presenter reads it for the "Clear recap" affordance.
+  const [recap, setRecap] = useState<Recap | null>(null);
+  const [dismissedRecapId, setDismissedRecapId] = useState<string | null>(null);
+  // Personal catch-up card (viewer): fetched on demand while behind; dismiss clears it.
+  const [catchUp, setCatchUp] = useState<CatchUp | null>(null);
 
   // Presenter live-room panels.
   const [roster, setRoster] = useState<{ count: number; viewers: Viewer[] }>({ count: 0, viewers: [] });
@@ -194,6 +227,11 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const [livePoll, setLivePoll] = useState<Poll | null>(null);
   const [liveTally, setLiveTally] = useState<number[]>([]);
   const [liveTotal, setLiveTotal] = useState(0);
+  // Comprehension checkpoint (presenter): recap send state + a pending "Launch
+  // check" auto-draft the poll panel consumes on open.
+  const [recapSending, setRecapSending] = useState(false);
+  const [recapError, setRecapError] = useState<string | null>(null);
+  const [pendingAutoDraft, setPendingAutoDraft] = useState(false);
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -205,11 +243,18 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const deckRef = useRef(deck);
   deckRef.current = deck;
   const voteCtrlRef = useRef<AbortController | null>(null);
+  // In-flight catch-up request — aborted when superseded, dismissed, or unmounted.
+  const catchUpCtrlRef = useRef<AbortController | null>(null);
   // Presenter tick guards (mirror PresenterConsole).
   const livePollRef = useRef(livePoll);
   livePollRef.current = livePoll;
   const closedPollIdRef = useRef<string | null>(null);
   const pollCtrlRef = useRef<AbortController | null>(null);
+  // Latest recap + the id the presenter just cleared, so an in-flight pre-clear
+  // session read can't resurrect it for one tick (same guard as closedPollIdRef).
+  const recapRef = useRef(recap);
+  recapRef.current = recap;
+  const clearedRecapIdRef = useRef<string | null>(null);
   const lastAtRef = useRef(0);
   const seededRef = useRef(false);
   const floatIdRef = useRef(0);
@@ -341,6 +386,40 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
     [slug],
   );
 
+  // "Catch me up": fetch an AI recap of the slides between THIS viewer's slide
+  // and the live slide. The server caches per (slug, from, liveTo), so a room of
+  // late joiners at the same slide shares one generation. Nameless viewers ask as
+  // "Viewer" — the same gate as the chat sidebar (the name only feeds the
+  // privacy-safe token accounting, never a broadcast). All in PARENT app-chrome —
+  // nothing is ever posted into the sandboxed deck frame.
+  const requestCatchUp = useCallback(async () => {
+    const from = deckRef.current.index;
+    const to = sessionRef.current.index;
+    if (to <= from) return; // caught up between render and tap
+    catchUpCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    catchUpCtrlRef.current = ctrl;
+    setCatchUp({ from, to, text: null, error: null, loading: true });
+    try {
+      const res = await fetch("/api/catchup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, name: nameRef.current || "Viewer", from, to }),
+        signal: ctrl.signal,
+      });
+      const data = (await res.json().catch(() => ({}))) as { recap?: string; error?: string };
+      if (!res.ok || !data.recap) {
+        setCatchUp({ from, to, text: null, error: mapCatchUpError(data.error), loading: false });
+        return;
+      }
+      setCatchUp({ from, to, text: data.recap, error: null, loading: false });
+    } catch (err) {
+      // Superseded by a newer tap or dismissed — that action owns the state now.
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setCatchUp({ from, to, text: null, error: "Couldn't catch you up — try again.", loading: false });
+    }
+  }, [slug]);
+
   const upvoteQuestion = useCallback(
     async (qid: string) => {
       const who = nameRef.current;
@@ -469,6 +548,45 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
     }
   }, [pollAction]);
 
+  // ── presenter comprehension checkpoint (ported from PresenterConsole) ──
+  // "Send recap" resolves + broadcasts an AI recap of the CURRENT slide (the server
+  // is cache-first, so a repeat is free); "Clear recap" removes the viewers' overlay.
+  const sendRecap = useCallback(async () => {
+    setRecapSending(true);
+    setRecapError(null);
+    try {
+      const res = await fetch("/api/recap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, slideIndex: deckRef.current.index }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { recap?: Recap; error?: string };
+      if (!res.ok || !data.recap) {
+        setRecapError(mapRecapError(data.error));
+        return;
+      }
+      clearedRecapIdRef.current = null;
+      setRecap(data.recap);
+    } catch {
+      setRecapError("Couldn't send — try again.");
+    } finally {
+      setRecapSending(false);
+    }
+  }, [slug]);
+
+  const clearRecapAction = useCallback(async () => {
+    // Remember the id so an in-flight pre-clear session read can't resurrect it,
+    // then optimistically drop it.
+    clearedRecapIdRef.current = recapRef.current?.id ?? null;
+    setRecap(null);
+    setRecapError(null);
+    try {
+      await fetch(`/api/recap?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
+    } catch {
+      /* transient — worst case the next session read restores it */
+    }
+  }, [slug]);
+
   // ── presenter Q&A control (ported from PresenterConsole) ──
   const qnaAction = useCallback(
     async (action: "answer" | "dismiss" | "undismiss", qid: string) => {
@@ -516,8 +634,9 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
     return () => mq.removeEventListener("change", apply);
   }, []);
 
-  // Abort any in-flight vote / poll-control request when the deck unmounts.
+  // Abort any in-flight vote / catch-up / poll-control request when the deck unmounts.
   useEffect(() => () => voteCtrlRef.current?.abort(), []);
+  useEffect(() => () => catchUpCtrlRef.current?.abort(), []);
   useEffect(() => () => pollCtrlRef.current?.abort(), []);
   useEffect(
     () => () => {
@@ -641,9 +760,17 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           signal: ctrl.signal,
         });
         if (!res.ok || !alive) return;
-        const s = (await res.json()) as SessionState & { poll?: ViewerPoll | null };
+        const s = (await res.json()) as SessionState & {
+          poll?: ViewerPoll | null;
+          recap?: Recap | null;
+        };
         lastLive = s.live;
         setSession(s);
+        // The room recap rides this same read for BOTH roles (viewers render the
+        // overlay; the presenter needs it for "Clear recap"). Skip the one the
+        // presenter just cleared — its id can linger for one in-flight tick.
+        const r = s.recap ?? null;
+        if (!r || r.id !== clearedRecapIdRef.current) setRecap(r);
         if (role === "presenter") return; // presenter drives locally, never from this poll
         setPoll(s.poll ?? null);
         void beat();
@@ -894,8 +1021,28 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           </div>
         )}
 
-        {/* Presenter help meter (#2) — top-left so it clears the right cluster. */}
-        {role === "presenter" && <HelpMeter lost={help.lost} slow={help.slow} />}
+        {/* Presenter help meter (#2) + comprehension-check fixes — top-left so
+            they clear the right cluster. */}
+        {role === "presenter" && (
+          <div style={{ position: "absolute", top: 14, left: 16, zIndex: 39, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", maxWidth: "min(640px, calc(100% - 32px))" }}>
+            <HelpMeter lost={help.lost} slow={help.slow} />
+            <ComprehensionCheck
+              show={help.lost >= LOST_THRESHOLD}
+              recapActive={!!recap}
+              sending={recapSending}
+              error={recapError}
+              pollLive={!!livePoll}
+              onSendRecap={() => void sendRecap()}
+              onClearRecap={() => void clearRecapAction()}
+              onLaunchCheck={() => {
+                // Reuse the reviewed ✨ draft flow: open the poll panel with a
+                // pending auto-draft (never auto-launches — the presenter reviews).
+                setPollPanelOpen(true);
+                setPendingAutoDraft(true);
+              }}
+            />
+          </div>
+        )}
 
         {/* top-right control cluster */}
         <div
@@ -918,9 +1065,19 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
               {session.live ? (
                 <>
                   {behind > 0 && (
-                    <button onClick={() => setAutoFollow(true)} style={pill("#2C2A31", "#F4F2EC")} title="Jump to the presenter">
-                      {behind} {behind === 1 ? "slide" : "slides"} behind · catch up
-                    </button>
+                    <>
+                      <button onClick={() => setAutoFollow(true)} style={pill("#2C2A31", "#F4F2EC")} title="Jump to the presenter">
+                        {behind} {behind === 1 ? "slide" : "slides"} behind · catch up
+                      </button>
+                      <button
+                        onClick={() => void requestCatchUp()}
+                        disabled={!!catchUp?.loading}
+                        style={{ ...pill("rgba(255,255,255,0.62)", "#2C2A31"), border: "1px solid rgba(255,255,255,0.85)", gap: 6 }}
+                        title="Get a quick AI recap of the slides you missed"
+                      >
+                        ✨ Catch me up
+                      </button>
+                    </>
                   )}
                   <FollowToggle on={autoFollow} onChange={setAutoFollow} />
                 </>
@@ -987,6 +1144,27 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           />
         )}
 
+        {/* Bottom-center card stack — the room recap (presenter-broadcast) and
+            this viewer's personal catch-up card share one column so they never
+            overlap. Both live in PARENT app-chrome (NEVER posted into the
+            sandboxed deck iframe) and clear the poll card and Q&A panel. */}
+        {role === "viewer" && ((recap && recap.id !== dismissedRecapId) || catchUp) && (
+          <div style={centerCardStack}>
+            {recap && recap.id !== dismissedRecapId && (
+              <RecapCard recap={recap} onDismiss={() => setDismissedRecapId(recap.id)} />
+            )}
+            {catchUp && (
+              <CatchUpCard
+                catchUp={catchUp}
+                onDismiss={() => {
+                  catchUpCtrlRef.current?.abort();
+                  setCatchUp(null);
+                }}
+              />
+            )}
+          </div>
+        )}
+
         {/* Viewer Q&A queue (#5) — right column below the top controls. */}
         {role === "viewer" && qnaOpen && (
           <QnaPanel
@@ -1009,6 +1187,8 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
             slug={slug}
             index={deck.index}
             reduceMotion={reduceMotion}
+            autoDraft={pendingAutoDraft}
+            onAutoDraftDone={() => setPendingAutoDraft(false)}
             onLaunch={openPollAction}
             onReveal={revealPollAction}
             onClose={closePollAction}
@@ -1353,6 +1533,15 @@ function PollCard({
           })}
         </div>
       )}
+
+      {/* "Why that answer" — the room-shared AI note attached after reveal. It
+          arrives a session tick or two behind the tally, so it simply pops in. */}
+      {revealed && poll.explanation && (
+        <div style={pollWhy}>
+          <span style={pollWhyLabel}>Why</span>
+          {poll.explanation}
+        </div>
+      )}
     </div>
   );
 }
@@ -1392,6 +1581,27 @@ const pollBadge: React.CSSProperties = {
 };
 
 const pollNote: React.CSSProperties = { fontSize: 11.5, fontWeight: 500, color: "#6E6A62", whiteSpace: "nowrap" };
+
+// The post-reveal "why that answer" note — green-tinted to pair with the ✓ tag.
+const pollWhy: React.CSSProperties = {
+  fontSize: 12.5,
+  color: "#4A463E",
+  lineHeight: 1.5,
+  padding: "9px 11px",
+  borderRadius: 11,
+  background: "rgba(191,224,72,0.16)",
+  border: "1px solid rgba(191,224,72,0.45)",
+};
+
+const pollWhyLabel: React.CSSProperties = {
+  display: "block",
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: "0.14em",
+  textTransform: "uppercase",
+  color: "#4B5A16",
+  marginBottom: 3,
+};
 
 const pollNameBtn: React.CSSProperties = {
   height: 40,
@@ -1762,10 +1972,12 @@ function PresenceChip({
 
 // Persistent "help" meter (#2): decaying counts of viewers who feel lost / want you
 // to slow down. Amber/red so it catches the eye; hidden when both are 0.
+// Renders inline chips — the caller owns positioning (the top-left presenter
+// cluster, shared with the comprehension-check buttons).
 function HelpMeter({ lost, slow }: { lost: number; slow: number }) {
   if (lost <= 0 && slow <= 0) return null;
   return (
-    <div style={{ position: "absolute", top: 14, left: 16, zIndex: 39, display: "flex", alignItems: "center", gap: 8 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
       {lost > 0 && (
         <span style={helpChip("#9A2A15", "rgba(181,51,31,0.16)", "rgba(181,51,31,0.45)")}>
           ❓ {lost} feel{lost === 1 ? "s" : ""} lost
@@ -1799,6 +2011,212 @@ function helpChip(fg: string, bg: string, border: string): React.CSSProperties {
     WebkitBackdropFilter: "blur(14px)",
     boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
   };
+}
+
+// Comprehension checkpoint: two one-tap fixes that appear next to the help meter
+// when the "I'm lost" count crosses LOST_THRESHOLD — broadcast an AI recap of the
+// current slide to every viewer, or draft an AI knowledge-check for review.
+// "Clear recap" stays visible while a recap is live, even after the meter decays.
+function ComprehensionCheck({
+  show,
+  recapActive,
+  sending,
+  error,
+  pollLive,
+  onSendRecap,
+  onClearRecap,
+  onLaunchCheck,
+}: {
+  show: boolean;
+  recapActive: boolean;
+  sending: boolean;
+  error: string | null;
+  pollLive: boolean;
+  onSendRecap: () => void;
+  onClearRecap: () => void;
+  onLaunchCheck: () => void;
+}) {
+  if (!show && !recapActive) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      {show && (
+        <button
+          onClick={onSendRecap}
+          disabled={sending || recapActive}
+          style={checkBtn(sending || recapActive)}
+          title={recapActive ? "A recap is already live" : "Broadcast an AI recap of this slide to every viewer"}
+        >
+          {sending ? "Sending…" : "📢 Send recap"}
+        </button>
+      )}
+      {show && (
+        <button
+          onClick={onLaunchCheck}
+          disabled={pollLive}
+          style={checkBtn(pollLive)}
+          title={pollLive ? "A poll is already live" : "Draft an AI knowledge-check on this slide for review"}
+        >
+          ✨ Launch check
+        </button>
+      )}
+      {recapActive && (
+        <button onClick={onClearRecap} style={checkBtn(false)} title="Remove the recap overlay from every viewer">
+          Clear recap
+        </button>
+      )}
+      {error && <span style={{ ...glassChip(), color: "#B5331F", fontSize: 11.5 }}>{error}</span>}
+    </div>
+  );
+}
+
+function checkBtn(muted: boolean): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    height: 30,
+    padding: "0 12px",
+    borderRadius: 999,
+    border: "1px solid rgba(154,42,21,0.35)",
+    background: "rgba(255,255,255,0.72)",
+    color: "#9A2A15",
+    cursor: muted ? "default" : "pointer",
+    fontFamily: '"Outfit", system-ui, sans-serif',
+    fontSize: 12.5,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+    backdropFilter: "blur(14px)",
+    WebkitBackdropFilter: "blur(14px)",
+    boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
+    opacity: muted ? 0.6 : 1,
+  };
+}
+
+function mapRecapError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "no_content":
+      return "This slide has no text to recap.";
+    case "ai_not_configured":
+      return "AI isn't configured.";
+    default:
+      return "Couldn't send — try again.";
+  }
+}
+
+// The viewer's recap card (comprehension checkpoint): the presenter pushed a short
+// AI recap of the slide because part of the room felt lost. Purely informational —
+// one dismiss button, no inputs. Dismissal is local to this viewer. Rendered in
+// PARENT app-chrome only; nothing is ever posted into the sandboxed deck frame.
+function RecapCard({ recap, onDismiss }: { recap: Recap; onDismiss: () => void }) {
+  return (
+    <div style={recapCardWrap} role="status" aria-label="Recap from the presenter">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>Recap · slide {recap.slideIndex + 1}</span>
+        <button onClick={onDismiss} title="Dismiss" aria-label="Dismiss recap" style={recapDismissBtn}>
+          ✕
+        </button>
+      </div>
+      <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "#262229", whiteSpace: "pre-wrap" }}>{recap.text}</div>
+    </div>
+  );
+}
+
+// Positioned by centerCardStack (shared with the catch-up card) — the card
+// itself only styles the glass panel.
+const recapCardWrap: React.CSSProperties = {
+  width: "100%",
+  maxHeight: "min(50vh, 380px)",
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  gap: 10,
+  padding: "14px 16px",
+  borderRadius: 18,
+  background: "rgba(255,255,255,0.82)",
+  border: "1px solid rgba(255,255,255,0.9)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+// The shared bottom-center column for the recap + catch-up cards: clears the
+// poll card (bottom-left) and the Q&A panel (right), and stacks the two cards
+// on the rare occasion both are open.
+const centerCardStack: React.CSSProperties = {
+  position: "absolute",
+  left: "50%",
+  bottom: 16,
+  transform: "translateX(-50%)",
+  zIndex: 39,
+  width: "min(460px, calc(100% - 32px))",
+  display: "flex",
+  flexDirection: "column",
+  gap: 10,
+};
+
+const recapDismissBtn: React.CSSProperties = {
+  width: 26,
+  height: 26,
+  flex: "0 0 auto",
+  borderRadius: 8,
+  border: "1px solid rgba(60,55,45,0.16)",
+  background: "rgba(255,255,255,0.62)",
+  color: "#2C2A31",
+  cursor: "pointer",
+  fontSize: 13,
+  lineHeight: 1,
+  padding: 0,
+};
+
+// Map an /api/catchup error code to a friendly line for the card body.
+function mapCatchUpError(code?: string): string {
+  switch (code) {
+    case "rate_limited":
+      return "You're doing that quickly — give it a few seconds.";
+    case "ai_budget_exceeded":
+      return "The AI is at today's usage limit — ask the presenter.";
+    case "no_content":
+      return "Those slides have no notes to recap yet.";
+    case "ai_not_configured":
+      return "AI isn't configured yet — ask the presenter.";
+    case "timeout":
+      return "That took too long — try again.";
+    default:
+      return "Couldn't catch you up — try again.";
+  }
+}
+
+// This viewer's personal catch-up card: an on-demand AI recap of the slides
+// between where they are and the live slide. Local to this tab (nothing is
+// broadcast); dismissing aborts any in-flight fetch and clears local state.
+// Rendered in PARENT app-chrome only — never posted into the sandboxed frame.
+function CatchUpCard({ catchUp, onDismiss }: { catchUp: CatchUp; onDismiss: () => void }) {
+  // The recap covers the slides AFTER the viewer's own (they can see theirs).
+  const lo = catchUp.from + 2; // first missed slide, 1-based
+  const hi = catchUp.to + 1; // the live slide, 1-based
+  const range = lo >= hi ? `slide ${hi}` : `slides ${lo}–${hi}`;
+  return (
+    <div style={recapCardWrap} role="status" aria-label="Catch-up recap">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>Catch-up · {range}</span>
+        <button onClick={onDismiss} title="Dismiss" aria-label="Dismiss catch-up" style={recapDismissBtn}>
+          ✕
+        </button>
+      </div>
+      {catchUp.loading ? (
+        <div style={{ fontSize: 13, color: "#8A857C", fontStyle: "italic" }}>Summarizing what you missed…</div>
+      ) : catchUp.error ? (
+        <div style={{ fontSize: 12.5, color: "#B5331F", fontWeight: 500 }}>{catchUp.error}</div>
+      ) : (
+        <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "#262229", whiteSpace: "pre-wrap" }}>{catchUp.text}</div>
+      )}
+    </div>
+  );
 }
 
 function floatStyle(left: number): React.CSSProperties {
@@ -1835,6 +2253,8 @@ function PresenterPollPanel({
   slug,
   index,
   reduceMotion,
+  autoDraft,
+  onAutoDraftDone,
   onLaunch,
   onReveal,
   onClose,
@@ -1846,6 +2266,8 @@ function PresenterPollPanel({
   slug: string;
   index: number;
   reduceMotion: boolean;
+  autoDraft: boolean;
+  onAutoDraftDone: () => void;
   onLaunch: (question: string, options: string[], correctIndex: number | null) => Promise<boolean>;
   onReveal: () => void;
   onClose: () => void;
@@ -1929,6 +2351,17 @@ function PresenterPollPanel({
     }
   }
 
+  // "Launch check" (comprehension checkpoint): the parent opened this panel with a
+  // pending auto-draft — run the SAME reviewed ✨ flow once, then consume the flag.
+  // Deliberately keyed on `autoDraft` alone: it must fire exactly once per request,
+  // not re-run as the draft's own state updates re-render the panel.
+  useEffect(() => {
+    if (!autoDraft) return;
+    onAutoDraftDone();
+    if (!poll) void draft();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoDraft]);
+
   // Drop empty options and remap the correct index to the kept list.
   const kept: string[] = [];
   let mappedCorrect: number | null = null;
@@ -1989,6 +2422,10 @@ function PresenterPollPanel({
               );
             })}
           </div>
+          {/* "Why that answer" — the room-shared note viewers see under the frozen
+              tally (arrives on the poll tick shortly after reveal). Same style as
+              the draft rationale above. */}
+          {poll.revealed && poll.explanation && <div style={pollExplain}>{poll.explanation}</div>}
           <div style={{ display: "flex", gap: 10, marginTop: 2 }}>
             {!poll.revealed && (
               <button onClick={onReveal} style={{ ...pill("#2C2A31", "#F4F2EC"), flex: 1, height: 40, justifyContent: "center" }}>

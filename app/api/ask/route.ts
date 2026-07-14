@@ -12,6 +12,7 @@ import {
 } from "@/lib/kv";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable } from "@/lib/publish-store";
+import { EXPLAIN_PROMPTS, type ExplainMode } from "@/lib/explain-prompts";
 import {
   buildHostWebsiteContext,
   contextForSlide,
@@ -31,14 +32,9 @@ const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 // "Explain differently" chips (#10): fixed reframe instructions. Each REPLACES the
 // viewer's free-text question and is grounded on the current slide like any other
-// question, then cached per (slug, slide, mode) so the whole room reuses it.
-const EXPLAIN_PROMPTS = {
-  eli5: "Explain what this slide is teaching as simply as you possibly can — as if to a curious beginner with no background. Use plain words and, if it helps, one everyday example.",
-  analogy: "Explain the core idea on this slide using a single concrete, everyday analogy that makes it click.",
-  example: "Walk through one short, concrete worked example that illustrates what this slide is teaching.",
-  deeper: "Go one level deeper on this slide — the reasoning behind it, an important nuance, or how it connects to the bigger picture — while staying accurate to the material shown.",
-} as const;
-type ExplainMode = keyof typeof EXPLAIN_PROMPTS;
+// question, then cached per (slug, slide, mode) so the whole room reuses it. The
+// prompts live in lib/explain-prompts.ts, shared with /api/recap so a presenter's
+// room recap and a viewer's reframe chip fill the SAME cache entry.
 
 interface AskBody {
   name?: string;

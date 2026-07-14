@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { openPoll, revealPoll, closePoll, getLiveTally } from "@/lib/poll";
+import { generatePollExplanation } from "@/lib/poll-explain";
 
 // Live poll control — PRESENTER ONLY.
 //   POST { action: "open" | "reveal" | "close", ... } drives the poll lifecycle.
@@ -63,6 +64,11 @@ export async function POST(req: Request) {
   if (action === "reveal") {
     const poll = await revealPoll(slug);
     if (!poll) return NextResponse.json({ error: "no_poll" }, { status: 404 });
+    // "Why that answer": kick off the ONE room-wide grounded explanation without
+    // awaiting it — a reveal must never wait on (or fail with) an AI call. It
+    // writes back onto the frozen poll and reaches everyone on a later session
+    // tick. No-ops internally for opinion polls and already-explained reveals.
+    void generatePollExplanation(slug, poll);
     return NextResponse.json({ poll, tally: poll.tally ?? [], total: poll.total ?? 0 }, { headers: NO_STORE });
   }
 

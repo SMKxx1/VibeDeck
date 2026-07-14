@@ -19,6 +19,7 @@ export interface Poll {
   revealed: boolean;
   tally: number[] | null; // frozen at reveal
   total: number | null; // frozen at reveal
+  explanation?: string; // "why that answer" — attached AFTER reveal (see lib/poll-explain.ts)
   at: number;
 }
 
@@ -31,12 +32,14 @@ export interface ViewerPoll {
   correctIndex: number | null;
   tally: number[] | null;
   total: number | null;
+  explanation: string | null;
   at: number;
 }
 
 export const MAX_OPTIONS = 8;
 export const MAX_QUESTION = 400;
 export const MAX_OPTION_LEN = 200;
+const MAX_EXPLANATION = 1200; // explanations are short model answers — a hard backstop
 
 const pollKey = (slug: string) => `live:poll:${slug}`;
 const votesKey = (slug: string, id: string) => `live:pollvotes:${slug}:${id}`;
@@ -191,6 +194,24 @@ export async function revealPoll(slug: string): Promise<Poll | null> {
   return revealed;
 }
 
+/**
+ * Attach the post-reveal "why that answer" note to the frozen poll so it rides
+ * the existing session-poll delivery. Re-reads before writing so a poll that was
+ * closed or replaced while the AI call ran is never resurrected — only the SAME
+ * poll, still revealed, is updated. First write wins; best-effort like the rest.
+ */
+export async function setPollExplanation(
+  slug: string,
+  pollId: string,
+  explanation: string,
+): Promise<void> {
+  const text = (explanation ?? "").toString().trim().slice(0, MAX_EXPLANATION);
+  if (!text) return;
+  const poll = await readPoll(slug);
+  if (!poll || poll.id !== pollId || !poll.revealed || poll.explanation) return;
+  await writePoll(slug, { ...poll, explanation: text });
+}
+
 /** Close/clear the current poll (removes the overlay for viewers). */
 export async function closePoll(slug: string): Promise<void> {
   pollMem.delete(slug);
@@ -215,6 +236,10 @@ export function pollForViewer(poll: Poll | null): ViewerPoll | null {
     correctIndex: poll.revealed ? poll.correctIndex : null,
     tally: poll.revealed ? poll.tally : null,
     total: poll.revealed ? poll.total : null,
+    // Redundant with the reveal gate (the note is only ever written to a revealed
+    // poll), but kept explicit: the explanation names the correct answer, so it
+    // must be impossible to surface pre-reveal.
+    explanation: poll.revealed ? (poll.explanation ?? null) : null,
     at: poll.at,
   };
 }

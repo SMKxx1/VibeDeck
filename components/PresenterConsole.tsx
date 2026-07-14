@@ -16,6 +16,11 @@ const POLL_MS = Number(process.env.NEXT_PUBLIC_SESSION_POLL_MS) || 2000;
 const PRESENCE_POLL_MS = 4_000;
 const PRESENCE_HIDDEN_MS = 30_000;
 
+// Comprehension checkpoint: when this many DISTINCT viewers hit "I'm lost" inside
+// the meter's 15s window (see /api/signal GET), surface the one-tap fixes. The
+// meter decays fast, so it inherently reflects the slide being shown right now.
+const LOST_THRESHOLD = 3;
+
 type SignalKind = "up" | "party" | "slow" | "hand" | "lost";
 // Only these float; slow/lost drive the persistent "help" meter instead.
 const ANIMATE_KINDS = new Set<SignalKind>(["up", "party", "hand"]);
@@ -57,6 +62,16 @@ interface Poll {
   revealed: boolean;
   tally: number[] | null;
   total: number | null;
+  explanation?: string; // "why that answer" — attached after reveal
+  at: number;
+}
+
+// The active room recap (comprehension checkpoint) — set via /api/recap and
+// delivered on the same /api/session poll viewers already run.
+interface Recap {
+  id: string;
+  text: string;
+  slideIndex: number;
   at: number;
 }
 
@@ -112,6 +127,13 @@ export function PresenterConsole({
   const [qnaPanelOpen, setQnaPanelOpen] = useState(false);
   const [questions, setQuestions] = useState<QnaQuestion[]>([]);
 
+  // Comprehension checkpoint: the active room recap (null = none) + send state,
+  // and a pending "Launch check" auto-draft the poll panel consumes on open.
+  const [recap, setRecap] = useState<Recap | null>(null);
+  const [recapSending, setRecapSending] = useState(false);
+  const [recapError, setRecapError] = useState<string | null>(null);
+  const [pendingAutoDraft, setPendingAutoDraft] = useState(false);
+
   const sessionRef = useRef(session);
   sessionRef.current = session;
   const deckRef = useRef(deck);
@@ -125,6 +147,12 @@ export function PresenterConsole({
   livePollRef.current = livePoll;
   const closedPollIdRef = useRef<string | null>(null);
   const pollCtrlRef = useRef<AbortController | null>(null);
+
+  // Latest recap + the id we just cleared, so an in-flight pre-clear session read
+  // can't resurrect it for one tick (same guard as closedPollIdRef above).
+  const recapRef = useRef(recap);
+  recapRef.current = recap;
+  const clearedRecapIdRef = useRef<string | null>(null);
 
   // "New reaction" detection: the max signal timestamp already handled, so a
   // signal seen on an earlier poll is never re-animated.
@@ -248,6 +276,45 @@ export function PresenterConsole({
     }
   }, [pollAction]);
 
+  // Comprehension checkpoint actions. "Send recap" resolves + broadcasts an AI
+  // recap of the CURRENT slide (the server is cache-first, so a repeat is free);
+  // "Clear recap" removes the overlay for every viewer.
+  const sendRecap = useCallback(async () => {
+    setRecapSending(true);
+    setRecapError(null);
+    try {
+      const res = await fetch("/api/recap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, slideIndex: deckRef.current.index }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { recap?: Recap; error?: string };
+      if (!res.ok || !data.recap) {
+        setRecapError(mapRecapError(data.error));
+        return;
+      }
+      clearedRecapIdRef.current = null;
+      setRecap(data.recap);
+    } catch {
+      setRecapError("Couldn't send — try again.");
+    } finally {
+      setRecapSending(false);
+    }
+  }, [slug]);
+
+  const clearRecapAction = useCallback(async () => {
+    // Remember the id so an in-flight pre-clear session read can't resurrect it,
+    // then optimistically drop it.
+    clearedRecapIdRef.current = recapRef.current?.id ?? null;
+    setRecap(null);
+    setRecapError(null);
+    try {
+      await fetch(`/api/recap?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
+    } catch {
+      /* transient — worst case the next session read restores it */
+    }
+  }, [slug]);
+
   // Q&A control (#5): answer / dismiss / undismiss. Each returns the fresh sorted
   // queue, which we adopt directly; the ~4s tick reconciles thereafter.
   const qnaAction = useCallback(
@@ -330,7 +397,12 @@ export function PresenterConsole({
       try {
         const res = await fetch(`/api/session?slug=${encodeURIComponent(slug)}`, { cache: "no-store" });
         if (!res.ok || !alive) return;
-        setSession((await res.json()) as SessionState);
+        const s = (await res.json()) as SessionState & { recap?: Recap | null };
+        setSession(s);
+        // The active room recap rides the same session read. Skip the one we just
+        // cleared — its id can linger for one in-flight tick.
+        const r = s.recap ?? null;
+        if (!r || r.id !== clearedRecapIdRef.current) setRecap(r);
       } catch {
         /* transient */
       }
@@ -564,7 +636,24 @@ export function PresenterConsole({
             onOpenChange={setRosterOpen}
           />
         </div>
-        <HelpMeter lost={help.lost} slow={help.slow} />
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <HelpMeter lost={help.lost} slow={help.slow} />
+          <ComprehensionCheck
+            show={help.lost >= LOST_THRESHOLD}
+            recapActive={!!recap}
+            sending={recapSending}
+            error={recapError}
+            pollLive={!!livePoll}
+            onSendRecap={() => void sendRecap()}
+            onClearRecap={() => void clearRecapAction()}
+            onLaunchCheck={() => {
+              // Reuse the reviewed ✨ draft flow: open the poll panel with a
+              // pending auto-draft (never auto-launches — the presenter reviews).
+              setPollPanelOpen(true);
+              setPendingAutoDraft(true);
+            }}
+          />
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <button
             onClick={() => setPollPanelOpen((o) => !o)}
@@ -671,6 +760,8 @@ export function PresenterConsole({
             slug={slug}
             index={deck.index}
             reduceMotion={reduceMotion}
+            autoDraft={pendingAutoDraft}
+            onAutoDraftDone={() => setPendingAutoDraft(false)}
             onLaunch={openPollAction}
             onReveal={revealPollAction}
             onClose={closePollAction}
@@ -830,6 +921,94 @@ function helpChip(fg: string, bg: string, border: string): React.CSSProperties {
   };
 }
 
+// Comprehension checkpoint: two one-tap fixes that appear next to the help meter
+// when the "I'm lost" count crosses LOST_THRESHOLD — broadcast an AI recap of the
+// current slide to every viewer, or draft an AI knowledge-check for review.
+// "Clear recap" stays visible while a recap is live, even after the meter decays.
+function ComprehensionCheck({
+  show,
+  recapActive,
+  sending,
+  error,
+  pollLive,
+  onSendRecap,
+  onClearRecap,
+  onLaunchCheck,
+}: {
+  show: boolean;
+  recapActive: boolean;
+  sending: boolean;
+  error: string | null;
+  pollLive: boolean;
+  onSendRecap: () => void;
+  onClearRecap: () => void;
+  onLaunchCheck: () => void;
+}) {
+  if (!show && !recapActive) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, whiteSpace: "nowrap" }}>
+      {show && (
+        <button
+          onClick={onSendRecap}
+          disabled={sending || recapActive}
+          style={checkBtn(sending || recapActive)}
+          title={recapActive ? "A recap is already live" : "Broadcast an AI recap of this slide to every viewer"}
+        >
+          {sending ? "Sending…" : "📢 Send recap"}
+        </button>
+      )}
+      {show && (
+        <button
+          onClick={onLaunchCheck}
+          disabled={pollLive}
+          style={checkBtn(pollLive)}
+          title={pollLive ? "A poll is already live" : "Draft an AI knowledge-check on this slide for review"}
+        >
+          ✨ Launch check
+        </button>
+      )}
+      {recapActive && (
+        <button onClick={onClearRecap} style={checkBtn(false)} title="Remove the recap overlay from every viewer">
+          Clear recap
+        </button>
+      )}
+      {error && <span style={{ fontSize: 11.5, color: "#FF8A6B", fontWeight: 500 }}>{error}</span>}
+    </div>
+  );
+}
+
+function checkBtn(muted: boolean): React.CSSProperties {
+  return {
+    height: 28,
+    padding: "0 11px",
+    borderRadius: 999,
+    border: "1px solid rgba(240,178,74,0.5)",
+    background: "rgba(240,178,74,0.14)",
+    color: "#F0C97E",
+    cursor: muted ? "default" : "pointer",
+    fontFamily: "inherit",
+    fontSize: 12,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+    opacity: muted ? 0.6 : 1,
+  };
+}
+
+function mapRecapError(code?: string): string {
+  switch (code) {
+    case "ai_budget_exceeded":
+      return "AI is at today's usage limit.";
+    case "rate_limited":
+      return "Slow down a moment.";
+    case "no_content":
+      return "This slide has no text to recap.";
+    case "ai_not_configured":
+      return "AI isn't configured.";
+    default:
+      return "Couldn't send — try again.";
+  }
+}
+
 function floatStyle(left: number): React.CSSProperties {
   return {
     position: "absolute",
@@ -930,6 +1109,8 @@ function PollPanel({
   slug,
   index,
   reduceMotion,
+  autoDraft,
+  onAutoDraftDone,
   onLaunch,
   onReveal,
   onClose,
@@ -941,6 +1122,8 @@ function PollPanel({
   slug: string;
   index: number;
   reduceMotion: boolean;
+  autoDraft: boolean;
+  onAutoDraftDone: () => void;
   onLaunch: (question: string, options: string[], correctIndex: number | null) => Promise<boolean>;
   onReveal: () => void;
   onClose: () => void;
@@ -1025,6 +1208,17 @@ function PollPanel({
       setDraftLoading(false);
     }
   }
+
+  // "Launch check" (comprehension checkpoint): the parent opened this panel with a
+  // pending auto-draft — run the SAME reviewed ✨ flow once, then consume the flag.
+  // Deliberately keyed on `autoDraft` alone: it must fire exactly once per request,
+  // not re-run as the draft's own state updates re-render the panel.
+  useEffect(() => {
+    if (!autoDraft) return;
+    onAutoDraftDone();
+    if (!poll) void draft();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoDraft]);
 
   // Drop empty options and remap the correct index to the kept list, so the
   // backend's own empty-filtering can't shift which option is "correct".
@@ -1183,6 +1377,10 @@ function PollResults({
           );
         })}
       </div>
+      {/* "Why that answer" — the room-shared note viewers see under the frozen
+          tally (arrives on the poll tick shortly after reveal). Same style as
+          the draft rationale in the compose form. */}
+      {poll.revealed && poll.explanation && <div style={pollExplain}>{poll.explanation}</div>}
       <div style={{ display: "flex", gap: 10, marginTop: 2 }}>
         {!poll.revealed && (
           <button onClick={onReveal} style={{ ...btn("#BFE048", "#1B1B20"), flex: 1, height: 40, fontWeight: 600 }}>
