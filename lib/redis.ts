@@ -23,6 +23,12 @@ export type RedisClient = {
   hset: (key: string, field: string, value: unknown) => Promise<number>;
   hgetall: <T = unknown>(key: string) => Promise<Record<string, T>>;
   hdel: (key: string, ...fields: string[]) => Promise<number>;
+  // Per-field atomic counter — used for the confusion pulse (one field per
+  // (slide,event), so concurrent viewer signals increment without a lost-update
+  // read-modify-write, same rationale as hset above).
+  hincrby: (key: string, field: string, increment: number) => Promise<number>;
+  // Set-if-absent — used to record a hash's first-write timestamp exactly once.
+  hsetnx: (key: string, field: string, value: unknown) => Promise<number>;
 };
 
 let redisPromise: Promise<RedisClient | null> | null = null;
@@ -84,6 +90,10 @@ export function getRedis(): Promise<RedisClient | null> {
             return out;
           },
           hdel: (key: string, ...fields: string[]) => client.hdel(key, ...fields),
+          hincrby: (key: string, field: string, increment: number) =>
+            client.hincrby(key, field, increment),
+          hsetnx: (key: string, field: string, value: unknown) =>
+            client.hsetnx(key, field, enc(value)),
         };
         return wrapped;
       } catch {

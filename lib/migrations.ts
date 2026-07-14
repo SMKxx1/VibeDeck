@@ -182,6 +182,87 @@ const migration005: Migration = {
   },
 };
 
+// 006_session_reports: end-of-session Insight Engine snapshots. When a presenter
+// asks for the AI teaching debrief, the live confusion-pulse aggregates (see
+// lib/pulse.ts — NUMERIC per-slide counts only, never any viewer text/name) are
+// frozen into a row here together with the generated debrief, so repeat runs of
+// the same deck are comparable.
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005): a brand-new table,
+// so every existing row backfills trivially with zero writes. `deck_slug` is
+// PLAIN TEXT — deliberately NOT a foreign key to decks(slug): a report is a
+// historical teaching artifact that should survive its deck being deleted or
+// replaced (and registry decks' slugs live in code, not necessarily in `decks`).
+// Every non-key column is nullable by design: `started_at` is best-effort (from
+// the pulse hash's first-bump timestamp), `aggregates` degrades to NULL if a
+// hand-edit wipes it (readers re-validate the JSONB on the way out, like
+// branches in 005), and `debrief` is NULL when generation failed but the
+// snapshot was still worth keeping. CREATE TABLE/INDEX IF NOT EXISTS for the
+// same reason as 004: the runner records a migration only AFTER up() succeeds
+// and doesn't wrap up() in a transaction, so a transient failure of the tracking
+// INSERT must not wedge the next boot on "already exists".
+const migration006: Migration = {
+  id: "006_session_reports",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS session_reports (
+        id          TEXT PRIMARY KEY,
+        deck_slug   TEXT NOT NULL,
+        started_at  TIMESTAMPTZ,
+        ended_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        aggregates  JSONB,
+        debrief     TEXT
+      )
+    `);
+    // The one read pattern is "this deck's reports, newest first" (comparing
+    // repeat runs), so index exactly that.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS session_reports_by_deck
+        ON session_reports (deck_slug, ended_at DESC)
+    `);
+  },
+};
+
+// 007_deck_recaps: published AI study-guide handouts. One presenter click drafts
+// a Markdown study guide from the deck; the presenter reviews/EDITS it; publishing
+// freezes the curated markdown into a row here, addressed by an unguessable token
+// that IS the sharing capability (the public /study/<token> page and its offline
+// .html download read this table).
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005/006): a brand-new
+// table, so every existing row backfills trivially with zero writes. `deck_slug`
+// is PLAIN TEXT — deliberately NOT a foreign key to decks(slug), same rationale
+// as session_reports: a published handout is a teaching artifact that must
+// survive its deck being deleted or replaced. `markdown` is NOT NULL — a guide
+// without content would render an empty page, so it can't exist (cf. the
+// uploaded_has_html CHECK in 003). `title` is nullable (readers degrade to a
+// generic heading). `created_by` is nullable with ON DELETE SET NULL so deleting
+// a user orphans — never deletes — their published guides. CREATE TABLE/INDEX
+// IF NOT EXISTS for the same reason as 004/006: the runner records a migration
+// only AFTER up() succeeds and doesn't wrap up() in a transaction, so a transient
+// failure of the tracking INSERT must not wedge the next boot on "already exists".
+const migration007: Migration = {
+  id: "007_deck_recaps",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS deck_recaps (
+        token       TEXT PRIMARY KEY,
+        deck_slug   TEXT NOT NULL,
+        title       TEXT,
+        markdown    TEXT NOT NULL,
+        created_by  TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    // The one non-PK read pattern is "this deck's published guides, newest
+    // first" (the edit-page panel), so index exactly that.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS deck_recaps_by_deck
+        ON deck_recaps (deck_slug, created_at DESC)
+    `);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
 export const MIGRATIONS: Migration[] = [
@@ -190,6 +271,8 @@ export const MIGRATIONS: Migration[] = [
   migration003,
   migration004,
   migration005,
+  migration006,
+  migration007,
 ];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we

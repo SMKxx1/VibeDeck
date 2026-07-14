@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { MAX_BRANCHES, MIN_BRANCHES, MAX_BRANCH_LABEL, type SlideBranch } from "@/lib/types";
+import { StudyGuidePanel, type PublishedGuide } from "@/components/StudyGuidePanel";
 
 export interface EditorSlide {
   index: number;
@@ -128,6 +129,7 @@ export function SlideMetaEditor({
   contentUrl,
   embedUrl,
   slideCount,
+  studyGuides = [],
 }: {
   slug: string;
   deckTitle: string;
@@ -137,6 +139,8 @@ export function SlideMetaEditor({
   contentUrl?: string;
   embedUrl?: string;
   slideCount?: number;
+  /** Previously published study-guide handouts (edit page passes these). */
+  studyGuides?: PublishedGuide[];
 }) {
   // Registry of live per-card handles, keyed by slide index. A card registers a
   // STABLE handle on mount whose methods read the latest values via refs, so the
@@ -364,6 +368,15 @@ export function SlideMetaEditor({
             </p>
           </div>
         )}
+
+        {/* AI Study-Guide Handout: deck-level, so it sits with the other deck-
+            level tools above the per-slide cards. Draft → edit → publish. */}
+        <StudyGuidePanel
+          slug={slug}
+          deckTitle={deckTitle}
+          dbAvailable={dbAvailable}
+          guides={studyGuides}
+        />
 
         {slides.length === 0 ? (
           <div style={{ color: "#6E6A62", fontSize: 15 }}>

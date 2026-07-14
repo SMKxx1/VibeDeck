@@ -6,6 +6,7 @@ import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides } from "@/lib/slides-store";
+import { listRecapsForDeck } from "@/lib/study-guide-store";
 import { SlideMetaEditor } from "@/components/SlideMetaEditor";
 
 // Presenter-only editor for a deck's per-slide speaker notes + AI grounding.
@@ -53,6 +54,9 @@ export default async function EditDeckPage({
     if (!perm.ok) notFound();
   }
   const slides = dbAvailable ? await getDeckSlides(slug) : [];
+  // Previously published study-guide handouts for this deck's panel. A read that
+  // fails open to [] — with no DB the panel just shows none (and disables Publish).
+  const studyGuides = dbAvailable ? await listRecapsForDeck(slug) : [];
 
   return (
     <SlideMetaEditor
@@ -60,6 +64,7 @@ export default async function EditDeckPage({
       deckTitle={deck.title}
       slides={slides}
       dbAvailable={dbAvailable}
+      studyGuides={studyGuides}
       // Preview needs the deck's render info: an embed deck frames embedUrl
       // (first-party), an uploaded deck mints a signed preview URL (contentUrl is
       // defined only when DECK_ORIGIN is set), and a Slide[]-only registry deck has

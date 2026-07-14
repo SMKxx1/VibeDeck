@@ -20,6 +20,7 @@ import {
 } from "@/lib/decks/build-host-website-context";
 import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
 import { setRecap, clearRecap } from "@/lib/recap";
+import { bumpPulse } from "@/lib/pulse";
 
 // Room recap broadcast (comprehension checkpoint). When the "I'm lost" meter
 // spikes, ONE presenter tap pushes a short recap of the current slide to every
@@ -75,6 +76,12 @@ export async function POST(req: Request) {
 
   const deck = await getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
+
+  // Insight Engine: a broadcast recap means the room needed this slide REFRAMED —
+  // count it as an 'explain' struggle signal on the heat strip. Content-free,
+  // fire-and-forget (never affects the response), and before the cache check so
+  // a cache-hit recap counts the same as a fresh one.
+  void bumpPulse(slug, slideIndex, "explain").catch(() => {});
 
   // Cache-first (#10): a reframe already generated for this (slug, slide, mode) —
   // by a viewer's chip or a prior recap — is reused verbatim: instant and free.

@@ -19,6 +19,7 @@ import {
   fullContextText,
 } from "@/lib/decks/build-host-website-context";
 import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
+import { bumpPulse } from "@/lib/pulse";
 
 // The chat's serverless function (slide-system-rules.md §9). The browser never
 // sees the OpenRouter key. We ground the model in the CURRENT slide + the whole
@@ -133,6 +134,14 @@ export async function POST(req: Request) {
   if (!rl.allowed) {
     return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
   }
+  // Insight Engine: count this as a per-slide struggle signal for the presenter's
+  // heat strip — a real tutor question is 'ask', a reframe chip is 'explain'.
+  // CONTENT-FREE (a count against (slug, slide) only — never the question) and
+  // fire-and-forget: it must never affect this response. Placed after the publish
+  // + rate-limit gates (garbage doesn't count) but BEFORE the explain cache — a
+  // cached reframe still evidences a struggling viewer. Covers the stream and
+  // non-stream paths alike (one bump per accepted request).
+  void bumpPulse(slug, slideIndex, explainMode ? "explain" : "ask").catch(() => {});
   // Explain-mode fast path (#10): a room-shared cached reframe returns instantly
   // and spends no tokens/budget. Checked AFTER the publish gate + rate limit (so a
   // hidden deck can't be probed via cache) but BEFORE the budget gate (a cached
