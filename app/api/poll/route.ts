@@ -5,7 +5,8 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { openPoll, revealPoll, closePoll, getLiveTally, getActivePoll, setBranchTaken } from "@/lib/poll";
 import { generatePollExplanation } from "@/lib/poll-explain";
 import { getSlideBranches } from "@/lib/slides-store";
-import { setPresenterIndex } from "@/lib/session";
+import { setPresenterIndex, getSession } from "@/lib/session";
+import { bumpPulse } from "@/lib/pulse";
 
 // Live poll control — PRESENTER ONLY.
 //   POST { action: "open" | "reveal" | "close" | "route", ... } drives the poll
@@ -112,8 +113,24 @@ export async function POST(req: Request) {
   }
 
   if (action === "reveal") {
+    // Read the pre-reveal state first so a repeated "reveal" (idempotent for the
+    // poll itself) can't double-count the wrong votes below.
+    const prior = await getActivePoll(slug);
     const poll = await revealPoll(slug);
     if (!poll) return NextResponse.json({ error: "no_poll" }, { status: 404 });
+    // Insight Engine: a knowledge-check with a correct answer just froze its
+    // tally — count the WRONG votes as struggle signals on the heat strip.
+    // Polls aren't per-slide, so attribute them to the room's CURRENT live slide
+    // (same convention as an "I'm lost" signal). Content-free (a count only —
+    // never who voted) and fire-and-forget: it must never affect the reveal.
+    if (prior && !prior.revealed && poll.correctIndex !== null && poll.tally) {
+      const wrong = Math.max(0, (poll.total ?? 0) - (poll.tally[poll.correctIndex] ?? 0));
+      if (wrong > 0) {
+        void getSession(slug)
+          .then((s) => bumpPulse(slug, s.index, "poll_wrong", wrong))
+          .catch(() => {});
+      }
+    }
     // "Why that answer": kick off the ONE room-wide grounded explanation without
     // awaiting it — a reveal must never wait on (or fail with) an AI call. It
     // writes back onto the frozen poll and reaches everyone on a later session

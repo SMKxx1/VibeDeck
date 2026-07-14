@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { addSignal, getSignals, isSignalKind } from "@/lib/signals";
+import { getSession } from "@/lib/session";
+import { bumpPulse } from "@/lib/pulse";
 import { checkRateLimit } from "@/lib/kv";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
@@ -71,6 +73,16 @@ export async function POST(req: Request) {
   }
 
   await addSignal(slug, name, kind);
+  // Insight Engine: an "I'm lost" tap is a struggle signal for the heat strip.
+  // Signals aren't per-slide, so attribute it to the room's CURRENT live slide
+  // (getSession — the slide being presented when the viewer got lost). Content-
+  // free (a count only — never the name) and fire-and-forget: it must never
+  // affect this response.
+  if (kind === "lost") {
+    void getSession(slug)
+      .then((s) => bumpPulse(slug, s.index, "lost"))
+      .catch(() => {});
+  }
   return NextResponse.json({ ok: true }, { headers: NO_STORE });
 }
 

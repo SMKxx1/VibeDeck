@@ -9,6 +9,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createSyncChannel, type SyncChannel } from "@/lib/sync";
+import { PulseHeatStrip, InsightPanel, type PulseSlideDto } from "@/components/InsightPulse";
 
 const POLL_MS = Number(process.env.NEXT_PUBLIC_SESSION_POLL_MS) || 2000;
 // Roster + backchannel polling for the live-room panels (#1/#2). Every ~4s, and
@@ -167,6 +168,11 @@ export function PresenterConsole({
   // compose form). Delivered on the same session tick as the recap.
   const [activityPanelOpen, setActivityPanelOpen] = useState(false);
   const [activity, setActivity] = useState<Activity | null>(null);
+
+  // Insight Engine: the live confusion-pulse aggregates (heat strip) — refreshed
+  // on the same ~4s console tick as presence/signals — and the debrief panel.
+  const [pulseSlides, setPulseSlides] = useState<PulseSlideDto[]>([]);
+  const [insightPanelOpen, setInsightPanelOpen] = useState(false);
 
   const sessionRef = useRef(session);
   sessionRef.current = session;
@@ -671,13 +677,15 @@ export function PresenterConsole({
 
     async function tick() {
       try {
-        // Fold the live-poll tally (#3) and Q&A queue (#5) into the same tick as
-        // presence + reactions — one round-trip, one abort signal.
-        const [pRes, sRes, qRes, qaRes] = await Promise.all([
+        // Fold the live-poll tally (#3), Q&A queue (#5) and the confusion pulse
+        // (Insight Engine heat strip) into the same tick as presence + reactions
+        // — one round-trip, one abort signal.
+        const [pRes, sRes, qRes, qaRes, plRes] = await Promise.all([
           fetch(`/api/presence?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/signal?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/poll?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/qna?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/pulse?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
         ]);
         if (alive && pRes.ok) {
           const data = (await pRes.json()) as { count?: number; viewers?: Viewer[] };
@@ -709,6 +717,10 @@ export function PresenterConsole({
         if (alive && qaRes.ok) {
           const data = (await qaRes.json()) as { questions?: QnaQuestion[] };
           setQuestions(data.questions ?? []);
+        }
+        if (alive && plRes.ok) {
+          const data = (await plRes.json()) as { slides?: PulseSlideDto[] };
+          setPulseSlides(data.slides ?? []);
         }
       } catch {
         /* transient / aborted — try again next tick */
@@ -855,6 +867,19 @@ export function PresenterConsole({
           >
             ⏱ Turn &amp; Talk{activity ? " · live" : ""}
           </button>
+          <button
+            onClick={() => setInsightPanelOpen((o) => !o)}
+            title="Room insights — where viewers are struggling + the AI session debrief"
+            aria-pressed={insightPanelOpen}
+            style={{
+              ...btn(insightPanelOpen ? "#BFE048" : "rgba(255,255,255,0.1)", insightPanelOpen ? "#1B1B20" : "#F4F2EC"),
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 7,
+            }}
+          >
+            🔥 Insights
+          </button>
           <ConsoleTimer />
           {isDriver ? (
             <span
@@ -907,6 +932,12 @@ export function PresenterConsole({
               )}
             </div>
           </div>
+          {/* Insight Engine heat strip — one cell per slide, intensity = struggle
+              signals (tooltip has the breakdown). Only rendered once there's a
+              slide count AND at least one signal, so it never adds dead chrome. */}
+          {deck.total > 0 && pulseSlides.length > 0 && (
+            <PulseHeatStrip slides={pulseSlides} total={deck.total} currentIndex={deck.index} variant="dark" />
+          )}
           <div style={{ display: "flex", gap: 12 }}>
             <button
               onClick={() => sendMain({ type: "deck:advance", dir: -1 })}
@@ -992,6 +1023,18 @@ export function PresenterConsole({
             onRegroup={() => void regroupActivity()}
             onDismiss={() => setActivityPanelOpen(false)}
           />
+        )}
+
+        {/* Insight panel — live struggle breakdown + the AI session debrief. */}
+        {insightPanelOpen && (
+          <div style={pollPanelWrap}>
+            <InsightPanel
+              slug={slug}
+              slides={pulseSlides}
+              variant="dark"
+              onDismiss={() => setInsightPanelOpen(false)}
+            />
+          </div>
         )}
       </div>
     </div>

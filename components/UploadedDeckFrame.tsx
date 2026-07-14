@@ -53,6 +53,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Deck } from "@/lib/types";
 import { LiveChat } from "./LiveChat";
 import { useFullscreen } from "@/lib/useFullscreen";
+import { PulseHeatStrip, InsightPanel, type PulseSlideDto } from "@/components/InsightPulse";
 
 // Reuse the workshop's stored viewer name so a returning visitor keeps their name
 // across decks. Where a name is REQUIRED (vote / ask / presence heartbeat) we gate
@@ -273,6 +274,11 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   // Turn & Talk (presenter): the compose/countdown panel toggle. Shares the LEFT
   // column with the poll panel, so opening one closes the other.
   const [activityPanelOpen, setActivityPanelOpen] = useState(false);
+  // Insight Engine (presenter): the live confusion-pulse aggregates (heat strip,
+  // refreshed on the same ~4s presenter tick) + the debrief panel toggle. The
+  // panel shares the LEFT column with the poll / Turn & Talk panels.
+  const [pulseSlides, setPulseSlides] = useState<PulseSlideDto[]>([]);
+  const [insightPanelOpen, setInsightPanelOpen] = useState(false);
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -1045,11 +1051,12 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
 
     async function tick() {
       try {
-        const [pRes, sRes, qRes, qaRes] = await Promise.all([
+        const [pRes, sRes, qRes, qaRes, plRes] = await Promise.all([
           fetch(`/api/presence?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/signal?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/poll?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
           fetch(`/api/qna?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
+          fetch(`/api/pulse?slug=${enc}`, { cache: "no-store", signal: ctrl.signal }),
         ]);
         if (alive && pRes.ok) {
           const data = (await pRes.json()) as { count?: number; viewers?: Viewer[] };
@@ -1079,6 +1086,10 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         if (alive && qaRes.ok) {
           const data = (await qaRes.json()) as { questions?: QnaQuestion[] };
           setQuestions(data.questions ?? []);
+        }
+        if (alive && plRes.ok) {
+          const data = (await plRes.json()) as { slides?: PulseSlideDto[] };
+          setPulseSlides(data.slides ?? []);
         }
       } catch {
         /* transient / aborted */
@@ -1294,9 +1305,12 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
               <button
                 onClick={() =>
                   setPollPanelOpen((o) => {
-                    // The poll + Turn & Talk panels share the LEFT column — only
-                    // one may be open at a time.
-                    if (!o) setActivityPanelOpen(false);
+                    // The poll + Turn & Talk + Insights panels share the LEFT
+                    // column — only one may be open at a time.
+                    if (!o) {
+                      setActivityPanelOpen(false);
+                      setInsightPanelOpen(false);
+                    }
                     return !o;
                   })
                 }
@@ -1309,7 +1323,10 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
               <button
                 onClick={() =>
                   setActivityPanelOpen((o) => {
-                    if (!o) setPollPanelOpen(false);
+                    if (!o) {
+                      setPollPanelOpen(false);
+                      setInsightPanelOpen(false);
+                    }
                     return !o;
                   })
                 }
@@ -1318,6 +1335,22 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
                 style={pill(activityPanelOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", activityPanelOpen ? "#F4F2EC" : "#2C2A31")}
               >
                 ⏱ Turn &amp; Talk{activity ? " · live" : ""}
+              </button>
+              <button
+                onClick={() =>
+                  setInsightPanelOpen((o) => {
+                    if (!o) {
+                      setPollPanelOpen(false);
+                      setActivityPanelOpen(false);
+                    }
+                    return !o;
+                  })
+                }
+                aria-pressed={insightPanelOpen}
+                title="Room insights — where viewers are struggling + the AI session debrief"
+                style={pill(insightPanelOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", insightPanelOpen ? "#F4F2EC" : "#2C2A31")}
+              >
+                🔥 Insights
               </button>
               <button
                 onClick={() => setQnaOpen((o) => !o)}
@@ -1429,6 +1462,29 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
             onRegroup={() => void regroupActivity()}
             onDismiss={() => setActivityPanelOpen(false)}
           />
+        )}
+
+        {/* Presenter Insight panel — live struggle breakdown + the AI session
+            debrief (left, exclusive with the poll / Turn & Talk panels). */}
+        {role === "presenter" && insightPanelOpen && (
+          <div style={presenterPollWrap}>
+            <InsightPanel
+              slug={slug}
+              slides={pulseSlides}
+              variant="light"
+              onDismiss={() => setInsightPanelOpen(false)}
+            />
+          </div>
+        )}
+
+        {/* Presenter confusion heat strip (Insight Engine) — one cell per slide,
+            bottom of the stage so it never collides with the top control
+            clusters. Only rendered once the deck reported its slide count AND
+            at least one struggle signal exists, so it adds no dead chrome. */}
+        {role === "presenter" && deck.total > 0 && pulseSlides.length > 0 && (
+          <div style={heatStripWrap}>
+            <PulseHeatStrip slides={pulseSlides} total={deck.total} currentIndex={deck.index} variant="light" />
+          </div>
         )}
       </div>
 
@@ -3311,6 +3367,26 @@ const presenterPollWrap: React.CSSProperties = {
   WebkitBackdropFilter: "blur(16px)",
   boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
   fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+// The presenter heat strip's floating dock (Insight Engine): a slim glass bar
+// across the bottom of the stage — clears the poll card (bottom-left card is
+// viewer-only) and the top control clusters. Tooltips need hover, so pointer
+// events stay ON (it's a 20px-tall bar; the deck below keeps its full surface).
+const heatStripWrap: React.CSSProperties = {
+  position: "absolute",
+  left: 16,
+  right: 16,
+  bottom: 10,
+  zIndex: 37,
+  display: "flex",
+  alignItems: "center",
+  padding: "5px 8px",
+  borderRadius: 10,
+  background: "rgba(255,255,255,0.72)",
+  border: "1px solid rgba(255,255,255,0.85)",
+  backdropFilter: "blur(12px)",
+  WebkitBackdropFilter: "blur(12px)",
 };
 
 const presenterQnaWrap: React.CSSProperties = {

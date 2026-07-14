@@ -14,6 +14,7 @@ import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable } from "@/lib/publish-store";
 import { buildHostWebsiteContext, contextForSlide } from "@/lib/decks/build-host-website-context";
 import { getSlideContextText } from "@/lib/slides-store";
+import { bumpPulse } from "@/lib/pulse";
 
 // Catch-up card: a late joiner (or a viewer who paused) taps "Catch me up" and
 // gets a short, warm AI recap of the slides BETWEEN their position and the live
@@ -111,6 +112,13 @@ export async function POST(req: Request) {
   // canonical pair for both the cache key and the grounding.
   const from = Math.max(clamp(fromRaw, 0, to), to - MAX_RANGE);
   if (from >= to) return NextResponse.json({ error: "bad_range" }, { status: 400 });
+
+  // Insight Engine: a catch-up request is a struggle signal, attributed to the
+  // viewer's OWN slide (`from` — where they stopped following the room; the
+  // missed slides themselves aren't evidence of confusion). Content-free,
+  // fire-and-forget (never affects the response), and before the cache check so
+  // a cached recap counts a struggling viewer the same as a fresh one.
+  void bumpPulse(slug, from, "catchup").catch(() => {});
 
   // Cache-first: a recap already generated for this (slug, from, to) — by ANY
   // viewer stuck at the same slide — is reused verbatim. Checked AFTER the
