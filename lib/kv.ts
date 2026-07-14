@@ -99,6 +99,67 @@ export async function setExplainCache(key: string, answer: string): Promise<void
   }
 }
 
+// ---- Catch-up recap cache -----------------------------------------------------
+// The "catch me up" card asks a FIXED question about a specific slide RANGE —
+// (viewer's slide, live slide] — so the answer is reusable by every viewer stuck
+// at the same slide. Keyed by (slug, from, to) where `to` is always the LIVE
+// slide, which keeps the key space bounded: one entry per (lagging slide, live
+// slide) pair, not per viewer. Same wrapped-string storage rationale as the
+// explain cache above.
+const CATCHUP_TTL = 60 * 60; // 1h — a session artifact, like the explain cache
+
+export async function getCatchupCache(key: string): Promise<string | null> {
+  const redis = await getRedis();
+  if (!redis) return null;
+  try {
+    const v = await redis.get<{ a?: string }>(`catchup:${key}`);
+    return v && typeof v.a === "string" ? v.a : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setCatchupCache(key: string, answer: string): Promise<void> {
+  if (!answer) return;
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    await redis.set(`catchup:${key}`, { a: answer }, { ex: CATCHUP_TTL });
+  } catch {
+    /* best-effort cache */
+  }
+}
+
+// ---- "Why that answer" poll-explanation cache (#3 reveal explainer) ----------
+// The post-reveal explanation of a poll's correct answer is generated ONCE per
+// poll and shared by the whole room (it rides the frozen poll record on the
+// session poll). This cache is the cross-instance dedupe: keyed by (slug,
+// pollId), so a double-reveal race or a second server instance never pays for a
+// second generation. Same wrapped-string storage rationale as the explain cache.
+const POLL_EXPLAIN_TTL = 60 * 60; // 1h — a session artifact, like the explain cache
+
+export async function getPollExplainCache(key: string): Promise<string | null> {
+  const redis = await getRedis();
+  if (!redis) return null;
+  try {
+    const v = await redis.get<{ a?: string }>(`poll-explain:${key}`);
+    return v && typeof v.a === "string" ? v.a : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setPollExplainCache(key: string, answer: string): Promise<void> {
+  if (!answer) return;
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    await redis.set(`poll-explain:${key}`, { a: answer }, { ex: POLL_EXPLAIN_TTL });
+  } catch {
+    /* best-effort cache */
+  }
+}
+
 // ---- Suggested-questions cache (#9) -----------------------------------------
 // The 2-3 grounded follow-up questions shown under a slide are the same for every
 // viewer on that (deck, slide), so cache them per (slug, slideIndex).

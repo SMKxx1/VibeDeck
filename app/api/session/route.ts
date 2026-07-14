@@ -5,6 +5,7 @@ import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { getActivePoll, pollForViewer } from "@/lib/poll";
+import { getRecap } from "@/lib/recap";
 
 // The live-session channel. Viewers GET the presenter's position (polled);
 // the presenter POSTs its position (and can "reset the lock"). Only a valid
@@ -33,7 +34,10 @@ export async function GET(req: Request) {
   // Deliver the current live poll on the SAME poll viewers already run (#3) — no
   // new viewer request. Viewer-safe projection: no correct answer/tally pre-reveal.
   const poll = pollForViewer(await getActivePoll(slug));
-  return NextResponse.json({ ...state, live: isLive(state), poll }, { headers: NO_STORE });
+  // The active room recap rides here too (comprehension checkpoint). Viewer-safe
+  // as-is: it's presenter-authored/approved text about a slide they can already see.
+  const recap = await getRecap(slug);
+  return NextResponse.json({ ...state, live: isLive(state), poll, recap }, { headers: NO_STORE });
 }
 
 interface PostBody {
