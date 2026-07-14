@@ -10,9 +10,19 @@
 
 import { randomBytes } from "crypto";
 import { getRedis } from "./redis";
+import type { SlideBranch } from "./types";
+
+// A poll is either a regular question ("poll") or a BRANCH VOTE ("branch") — the
+// audience choosing which path a branch-point slide takes (lib/types.ts
+// SlideBranch). Branch votes reuse ALL of the vote/tally/reveal machinery below;
+// the discriminator only tells clients to render them distinctly and carries the
+// option→slide-range mapping needed to route the room afterwards.
+export type PollKind = "poll" | "branch";
 
 export interface Poll {
   id: string;
+  /** Absent (pre-feature Redis records) = "poll". */
+  kind?: PollKind;
   question: string;
   options: string[];
   correctIndex: number | null; // null = opinion poll (no right answer)
@@ -20,12 +30,17 @@ export interface Poll {
   tally: number[] | null; // frozen at reveal
   total: number | null; // frozen at reveal
   explanation?: string; // "why that answer" — attached AFTER reveal (see lib/poll-explain.ts)
+  /** kind "branch" only: option i routes to branches[i] (parallel to options). */
+  branches?: SlideBranch[];
+  /** kind "branch" only: the option the room was routed to (set AFTER reveal). */
+  takenIndex?: number;
   at: number;
 }
 
 // What a VIEWER is allowed to see: never the correct answer or tally until reveal.
 export interface ViewerPoll {
   id: string;
+  kind: PollKind;
   question: string;
   options: string[];
   revealed: boolean;
@@ -33,6 +48,8 @@ export interface ViewerPoll {
   tally: number[] | null;
   total: number | null;
   explanation: string | null;
+  /** Branch vote breadcrumb: the routed option (post-reveal), else null. */
+  takenIndex: number | null;
   at: number;
 }
 
@@ -86,10 +103,21 @@ export async function getActivePoll(slug: string): Promise<Poll | null> {
   return readPoll(slug);
 }
 
-/** Open a NEW poll (replaces any current one and starts fresh votes). */
+/**
+ * Open a NEW poll (replaces any current one and starts fresh votes). For a
+ * branch vote pass kind:"branch" + branches parallel to options (the caller —
+ * app/api/poll — derives options FROM the branch labels, so they stay 1:1; we
+ * defensively trim to options.length after the empty-filter anyway).
+ */
 export async function openPoll(
   slug: string,
-  input: { question: string; options: string[]; correctIndex: number | null },
+  input: {
+    question: string;
+    options: string[];
+    correctIndex: number | null;
+    kind?: PollKind;
+    branches?: SlideBranch[];
+  },
 ): Promise<Poll> {
   const options = input.options
     .map((o) => (o ?? "").toString().trim().slice(0, MAX_OPTION_LEN))
@@ -102,14 +130,19 @@ export async function openPoll(
     input.correctIndex < options.length
       ? input.correctIndex
       : null;
+  const kind: PollKind = input.kind === "branch" ? "branch" : "poll";
   const poll: Poll = {
     id: newId(),
+    kind,
     question: (input.question ?? "").toString().trim().slice(0, MAX_QUESTION),
     options,
     correctIndex,
     revealed: false,
     tally: null,
     total: null,
+    ...(kind === "branch" && input.branches
+      ? { branches: input.branches.slice(0, options.length) }
+      : {}),
     at: Date.now(),
   };
   await writePoll(slug, poll);
@@ -212,6 +245,30 @@ export async function setPollExplanation(
   await writePoll(slug, { ...poll, explanation: text });
 }
 
+/**
+ * Record which branch the room was routed to (branch votes only). Mirrors
+ * setPollExplanation's discipline: re-reads before writing so only the SAME,
+ * still-revealed branch poll is updated — a vote replaced or closed while the
+ * route ran is never resurrected. Unlike the explanation, a re-route OVERWRITES
+ * (last route wins): untaken branches stay reachable and the presenter may
+ * legitimately change course. Returns the updated poll, or null when no
+ * matching branch poll was live.
+ */
+export async function setBranchTaken(
+  slug: string,
+  pollId: string,
+  optionIndex: number,
+): Promise<Poll | null> {
+  const poll = await readPoll(slug);
+  if (!poll || poll.id !== pollId || poll.kind !== "branch" || !poll.revealed) return null;
+  if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= poll.options.length) {
+    return null;
+  }
+  const next: Poll = { ...poll, takenIndex: optionIndex };
+  await writePoll(slug, next);
+  return next;
+}
+
 /** Close/clear the current poll (removes the overlay for viewers). */
 export async function closePoll(slug: string): Promise<void> {
   pollMem.delete(slug);
@@ -230,6 +287,7 @@ export function pollForViewer(poll: Poll | null): ViewerPoll | null {
   if (!poll) return null;
   return {
     id: poll.id,
+    kind: poll.kind ?? "poll",
     question: poll.question,
     options: poll.options,
     revealed: poll.revealed,
@@ -240,6 +298,8 @@ export function pollForViewer(poll: Poll | null): ViewerPoll | null {
     // poll), but kept explicit: the explanation names the correct answer, so it
     // must be impossible to surface pre-reveal.
     explanation: poll.revealed ? (poll.explanation ?? null) : null,
+    // The branch-route breadcrumb (only ever written post-reveal; gate anyway).
+    takenIndex: poll.revealed && typeof poll.takenIndex === "number" ? poll.takenIndex : null,
     at: poll.at,
   };
 }

@@ -118,6 +118,9 @@ interface SessionState {
   max: number;
   // A presenter is actively presenting. When false, viewers browse freely.
   live: boolean;
+  // Co-host mode (presenter only): false when ANOTHER presenter holds the clicker
+  // (slide control). Absent/true — including an unclaimed session — means drive.
+  isDriver?: boolean;
 }
 
 // Viewer-safe poll projection, delivered on the SAME /api/session read (#3).
@@ -125,6 +128,9 @@ interface SessionState {
 // AFTER reveal (it lands on a later session tick and the card re-renders).
 interface ViewerPoll {
   id: string;
+  // "branch" = a branch-point vote (choose-your-own-path): options are paths and
+  // takenIndex is the routed-path breadcrumb once the presenter routes the room.
+  kind?: "poll" | "branch";
   question: string;
   options: string[];
   revealed: boolean;
@@ -132,6 +138,7 @@ interface ViewerPoll {
   tally: number[] | null;
   total: number | null;
   explanation: string | null;
+  takenIndex?: number | null;
   at: number;
 }
 // A presenter-broadcast recap of a slide (comprehension checkpoint), delivered on
@@ -140,6 +147,19 @@ interface Recap {
   id: string;
   text: string;
   slideIndex: number;
+  at: number;
+}
+// A presenter-broadcast Turn & Talk activity: a discussion/exercise prompt + a
+// synchronized countdown, delivered on the same session read. Everyone counts
+// down CLIENT-SIDE from `endsAt` (no per-second server traffic); "Regroup"
+// clears it everywhere at once. Rendered ONLY in parent app-chrome — never
+// posted into the sandboxed deck frame.
+type ActivityFollowUp = "poll" | "pinboard";
+interface Activity {
+  id: string;
+  prompt: string;
+  endsAt: number; // epoch ms
+  followUp: ActivityFollowUp | null;
   at: number;
 }
 // This viewer's personal "catch me up" recap: an on-demand AI summary of the
@@ -162,9 +182,17 @@ interface QnaQuestion {
   dismissed: boolean;
   at: number;
 }
+// A branch-point path (lib/types.ts SlideBranch) — 0-based inclusive range.
+interface SlideBranch {
+  label: string;
+  from: number;
+  to: number;
+}
+
 // Presenter-side records (full poll incl. correct answer/tally; roster; signals).
 interface Poll {
   id: string;
+  kind?: "poll" | "branch"; // absent = regular poll
   question: string;
   options: string[];
   correctIndex: number | null;
@@ -172,6 +200,8 @@ interface Poll {
   tally: number[] | null;
   total: number | null;
   explanation?: string; // "why that answer" — attached after reveal
+  branches?: SlideBranch[]; // kind "branch": option i routes to branches[i]
+  takenIndex?: number; // kind "branch": the routed option (post-reveal)
   at: number;
 }
 interface Viewer {
@@ -214,6 +244,11 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   // dismissible overlay; the presenter reads it for the "Clear recap" affordance.
   const [recap, setRecap] = useState<Recap | null>(null);
   const [dismissedRecapId, setDismissedRecapId] = useState<string | null>(null);
+  // Turn & Talk activity: shared across roles — viewers render the countdown
+  // card; the presenter reads it for the countdown + Regroup panel. Hide is
+  // local per activity id (viewer only).
+  const [activity, setActivity] = useState<Activity | null>(null);
+  const [hiddenActivityId, setHiddenActivityId] = useState<string | null>(null);
   // Personal catch-up card (viewer): fetched on demand while behind; dismiss clears it.
   const [catchUp, setCatchUp] = useState<CatchUp | null>(null);
 
@@ -227,11 +262,17 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const [livePoll, setLivePoll] = useState<Poll | null>(null);
   const [liveTally, setLiveTally] = useState<number[]>([]);
   const [liveTotal, setLiveTotal] = useState(0);
+  // Branch points: index → authored paths (presenter only; fetched once, {} when
+  // the DB is unavailable or the deck has none). Drives "Open branch vote".
+  const [deckBranches, setDeckBranches] = useState<Record<number, SlideBranch[]>>({});
   // Comprehension checkpoint (presenter): recap send state + a pending "Launch
   // check" auto-draft the poll panel consumes on open.
   const [recapSending, setRecapSending] = useState(false);
   const [recapError, setRecapError] = useState<string | null>(null);
   const [pendingAutoDraft, setPendingAutoDraft] = useState(false);
+  // Turn & Talk (presenter): the compose/countdown panel toggle. Shares the LEFT
+  // column with the poll panel, so opening one closes the other.
+  const [activityPanelOpen, setActivityPanelOpen] = useState(false);
 
   // Refs so the (stable) message/poll handlers always read live values.
   const sessionRef = useRef(session);
@@ -255,6 +296,10 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const recapRef = useRef(recap);
   recapRef.current = recap;
   const clearedRecapIdRef = useRef<string | null>(null);
+  // Latest activity + the id the presenter just regrouped (same one-tick guard).
+  const activityRef = useRef(activity);
+  activityRef.current = activity;
+  const clearedActivityIdRef = useRef<string | null>(null);
   const lastAtRef = useRef(0);
   const seededRef = useRef(false);
   const floatIdRef = useRef(0);
@@ -293,9 +338,9 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
     [sendToDeck],
   );
 
-  // Presenter → broadcast a position, reset the lock, or just heartbeat.
+  // Presenter → broadcast a position, reset the lock, heartbeat, or take the clicker.
   const postPresenter = useCallback(
-    async (opts: { index?: number; reset?: boolean; heartbeat?: boolean }) => {
+    async (opts: { index?: number; reset?: boolean; heartbeat?: boolean; takeClicker?: boolean }) => {
       try {
         const res = await fetch("/api/session", {
           method: "POST",
@@ -548,6 +593,69 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
     }
   }, [pollAction]);
 
+  // Branch points: open the audience vote on the CURRENT slide's authored paths.
+  // The server reads the paths from deck_slides — the body only names the slide.
+  const openBranchAction = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await pollAction({ action: "open", kind: "branch", index: deckRef.current.index });
+      if (!res.ok) return false;
+      const data = (await res.json()) as { poll: Poll; tally?: number[]; total?: number };
+      closedPollIdRef.current = null;
+      setLivePoll(data.poll);
+      setLiveTally(data.tally ?? new Array(data.poll.options.length).fill(0));
+      setLiveTotal(data.total ?? 0);
+      return true;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return false;
+      return false;
+    }
+  }, [pollAction]);
+
+  // Route the room to a branch (post-reveal). The server does the driver-gated
+  // session jump; on success we sync THIS frame too — the goto reports back with
+  // reason 'api', so it never re-drives the session (see followTo).
+  const routeBranchAction = useCallback(
+    async (optionIndex: number): Promise<boolean> => {
+      try {
+        const res = await pollAction({ action: "route", optionIndex });
+        if (!res.ok) return false;
+        const data = (await res.json()) as { poll?: Poll; index?: number; routed?: boolean };
+        if (data.poll) setLivePoll(data.poll);
+        if (data.routed && typeof data.index === "number") {
+          lastPostedIdxRef.current = data.index; // the server already holds it
+          followTo(data.index);
+        }
+        return data.routed === true;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return false;
+        return false;
+      }
+    },
+    [pollAction, followTo],
+  );
+
+  // Load this deck's branch points once (presenter only; silently {} when there
+  // are none or the DB is down — the affordance simply doesn't appear).
+  useEffect(() => {
+    if (role !== "presenter") return;
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch(`/api/branches?slug=${encodeURIComponent(slug)}`, {
+          cache: "no-store",
+        });
+        if (!res.ok || !alive) return;
+        const data = (await res.json()) as { branches?: Record<number, SlideBranch[]> };
+        if (alive && data.branches) setDeckBranches(data.branches);
+      } catch {
+        /* no branch affordance */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [role, slug]);
+
   // ── presenter comprehension checkpoint (ported from PresenterConsole) ──
   // "Send recap" resolves + broadcasts an AI recap of the CURRENT slide (the server
   // is cache-first, so a repeat is free); "Clear recap" removes the viewers' overlay.
@@ -584,6 +692,50 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
       await fetch(`/api/recap?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
     } catch {
       /* transient — worst case the next session read restores it */
+    }
+  }, [slug]);
+
+  // ── presenter Turn & Talk (ported from PresenterConsole) ──
+  // "Start" broadcasts the prompt + a synchronized countdown (the server computes
+  // endsAt at write time, so the whole room counts down to the same instant);
+  // "Regroup" ends it everywhere at once and, for a "poll" follow-up, chains into
+  // the SAME reviewed ✨ draft flow as "Launch check" (never auto-launches).
+  const startActivity = useCallback(
+    async (prompt: string, durationSec: number, followUp: ActivityFollowUp | null): Promise<boolean> => {
+      try {
+        const res = await fetch("/api/activity", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug, prompt, durationSec, followUp }),
+        });
+        if (!res.ok) return false;
+        const data = (await res.json()) as { activity?: Activity };
+        if (!data.activity) return false;
+        clearedActivityIdRef.current = null;
+        setActivity(data.activity);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [slug],
+  );
+
+  const regroupActivity = useCallback(async () => {
+    // Remember the id so an in-flight pre-clear session read can't resurrect it,
+    // then optimistically drop it (same guard as clearRecapAction).
+    const followUp = activityRef.current?.followUp ?? null;
+    clearedActivityIdRef.current = activityRef.current?.id ?? null;
+    setActivity(null);
+    try {
+      await fetch(`/api/activity?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
+    } catch {
+      /* transient — worst case the next session read restores it */
+    }
+    if (followUp === "poll") {
+      setActivityPanelOpen(false);
+      setPollPanelOpen(true);
+      setPendingAutoDraft(true);
     }
   }, [slug]);
 
@@ -712,7 +864,11 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         const userNav = d.reason !== "api" && d.reason !== "init" && d.reason !== "sync";
         // Debounced + clamped: a forged slidechange flood can't amplify into
         // unbounded authenticated session writes. See schedulePresenterPost.
-        if (role === "presenter" && userNav) schedulePresenterPost(idx);
+        // Co-host mode: a moderator (clicker held by the co-host) never writes the
+        // shared index — the server would ignore it anyway.
+        if (role === "presenter" && userNav && sessionRef.current.isDriver !== false) {
+          schedulePresenterPost(idx);
+        }
       }
       // `activity` is ignored — no auto-hiding presenter overlay here.
     }
@@ -763,6 +919,7 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         const s = (await res.json()) as SessionState & {
           poll?: ViewerPoll | null;
           recap?: Recap | null;
+          activity?: Activity | null;
         };
         lastLive = s.live;
         setSession(s);
@@ -771,7 +928,17 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         // presenter just cleared — its id can linger for one in-flight tick.
         const r = s.recap ?? null;
         if (!r || r.id !== clearedRecapIdRef.current) setRecap(r);
-        if (role === "presenter") return; // presenter drives locally, never from this poll
+        // The Turn & Talk activity rides here too, for BOTH roles (viewers render
+        // the countdown card; the presenter needs it for the Regroup panel).
+        const a = s.activity ?? null;
+        if (!a || a.id !== clearedActivityIdRef.current) setActivity(a);
+        if (role === "presenter") {
+          // Co-host mode: a moderator follows the driver (the goto reports back as
+          // reason 'api', so it never re-drives). The driver drives locally, never
+          // from this poll.
+          if (s.isDriver === false) followTo(s.index);
+          return;
+        }
         setPoll(s.poll ?? null);
         void beat();
         if (!s.live) {
@@ -978,6 +1145,9 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   const behind = role === "viewer" && session.live && !autoFollow ? session.index - deck.index : 0;
   const unlockedTo = session.max; // 0-based
   const chatName = role === "presenter" ? "Presenter" : name ?? "Viewer";
+  // Co-host mode: does THIS presenter hold the clicker? Absent (solo/legacy or an
+  // unclaimed session) counts as yes, so a lone presenter is never gated.
+  const isDriver = session.isDriver !== false;
 
   // Presenter roster breakdown against the presenter's CURRENT slide (#1).
   const presenterIdx = deck.index;
@@ -1108,13 +1278,46 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
                 onOpenChange={setRosterOpen}
               />
               <span style={glassChip()}>Unlocked → slide {unlockedTo + 1}</span>
+              {isDriver ? (
+                <span style={glassChip()} title="You control the room's slide position">
+                  🖱 You have the clicker
+                </span>
+              ) : (
+                <button
+                  onClick={() => void postPresenter({ takeClicker: true })}
+                  style={pill("#BFE048", "#1B1B20")}
+                  title="Take slide control from your co-host"
+                >
+                  🖱 Take the clicker
+                </button>
+              )}
               <button
-                onClick={() => setPollPanelOpen((o) => !o)}
+                onClick={() =>
+                  setPollPanelOpen((o) => {
+                    // The poll + Turn & Talk panels share the LEFT column — only
+                    // one may be open at a time.
+                    if (!o) setActivityPanelOpen(false);
+                    return !o;
+                  })
+                }
                 aria-pressed={pollPanelOpen}
                 title="Live poll & AI knowledge-check"
                 style={pill(pollPanelOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", pollPanelOpen ? "#F4F2EC" : "#2C2A31")}
               >
                 📊 Poll{livePoll ? (livePoll.revealed ? " · revealed" : " · live") : ""}
+              </button>
+              <button
+                onClick={() =>
+                  setActivityPanelOpen((o) => {
+                    if (!o) setPollPanelOpen(false);
+                    return !o;
+                  })
+                }
+                aria-pressed={activityPanelOpen}
+                title="Turn & Talk — broadcast a discussion prompt + countdown to every viewer"
+                style={pill(activityPanelOpen ? "#2C2A31" : "rgba(255,255,255,0.62)", activityPanelOpen ? "#F4F2EC" : "#2C2A31")}
+              >
+                ⏱ Turn &amp; Talk{activity ? " · live" : ""}
               </button>
               <button
                 onClick={() => setQnaOpen((o) => !o)}
@@ -1144,12 +1347,19 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           />
         )}
 
-        {/* Bottom-center card stack — the room recap (presenter-broadcast) and
-            this viewer's personal catch-up card share one column so they never
-            overlap. Both live in PARENT app-chrome (NEVER posted into the
-            sandboxed deck iframe) and clear the poll card and Q&A panel. */}
-        {role === "viewer" && ((recap && recap.id !== dismissedRecapId) || catchUp) && (
+        {/* Bottom-center card stack — the Turn & Talk activity card, the room
+            recap (presenter-broadcast) and this viewer's personal catch-up card
+            share one column so they never overlap. All live in PARENT app-chrome
+            (NEVER posted into the sandboxed deck iframe) and clear the poll card
+            and Q&A panel. */}
+        {role === "viewer" &&
+          ((activity && activity.id !== hiddenActivityId) ||
+            (recap && recap.id !== dismissedRecapId) ||
+            catchUp) && (
           <div style={centerCardStack}>
+            {activity && activity.id !== hiddenActivityId && (
+              <ActivityCard activity={activity} onHide={() => setHiddenActivityId(activity.id)} />
+            )}
             {recap && recap.id !== dismissedRecapId && (
               <RecapCard recap={recap} onDismiss={() => setDismissedRecapId(recap.id)} />
             )}
@@ -1186,10 +1396,13 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
             total={liveTotal}
             slug={slug}
             index={deck.index}
+            branches={deckBranches[deck.index] ?? null}
             reduceMotion={reduceMotion}
             autoDraft={pendingAutoDraft}
             onAutoDraftDone={() => setPendingAutoDraft(false)}
             onLaunch={openPollAction}
+            onOpenBranch={openBranchAction}
+            onRoute={routeBranchAction}
             onReveal={revealPollAction}
             onClose={closePollAction}
             onDismiss={() => setPollPanelOpen(false)}
@@ -1204,6 +1417,17 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
             index={deck.index}
             onAction={qnaAction}
             onDismiss={() => setQnaOpen(false)}
+          />
+        )}
+
+        {/* Presenter Turn & Talk panel — compose (prompt · duration · follow-up)
+            or the running countdown + Regroup (left, exclusive with the poll panel). */}
+        {role === "presenter" && activityPanelOpen && (
+          <PresenterActivityPanel
+            activity={activity}
+            onStart={startActivity}
+            onRegroup={() => void regroupActivity()}
+            onDismiss={() => setActivityPanelOpen(false)}
           />
         )}
       </div>
@@ -1476,11 +1700,18 @@ function PollCard({
   const tally = poll.tally ?? [];
   const total = poll.total ?? 0;
   const max = Math.max(1, ...(tally.length ? tally : [0]));
+  // Branch vote (branch points): distinct badge/copy, the routed path is
+  // highlighted instead of a "correct" answer, and a breadcrumb shows once the
+  // presenter routes the room.
+  const isBranch = poll.kind === "branch";
+  const taken = isBranch && typeof poll.takenIndex === "number" ? poll.takenIndex : null;
 
   return (
-    <div style={pollCardWrap} role="group" aria-label="Live poll">
+    <div style={pollCardWrap} role="group" aria-label={isBranch ? "Branch vote" : "Live poll"}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>{revealed ? "Results" : "Live poll"}</span>
+        <span style={pollBadge}>
+          {isBranch ? (revealed ? "⑂ Path chosen" : "⑂ Choose our path") : revealed ? "Results" : "Live poll"}
+        </span>
         {revealed ? (
           <span style={pollNote}>
             {total} vote{total === 1 ? "" : "s"}
@@ -1514,7 +1745,7 @@ function PollCard({
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {poll.options.map((opt, i) => {
             const count = tally[i] ?? 0;
-            const correct = poll.correctIndex === i;
+            const correct = isBranch ? taken === i : poll.correctIndex === i;
             const mine = myOptionIndex === i;
             const pct = Math.round((count / max) * 100);
             return (
@@ -1523,7 +1754,7 @@ function PollCard({
                 <div style={pollResultText}>
                   <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
-                    {correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                    {correct && <span style={pollTag("#3F7A12")}>{isBranch ? "⑂ taking this path" : "✓ correct"}</span>}
                     {mine && <span style={pollTag("#6E6A62")}>your pick</span>}
                   </span>
                   <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>{count}</span>
@@ -1531,6 +1762,13 @@ function PollCard({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Branch breadcrumb — shows once the presenter routes the room. */}
+      {isBranch && revealed && taken !== null && (
+        <div style={pollWhy}>
+          <span style={pollWhyLabel}>Path</span>⑂ {poll.options[taken]}
         </div>
       )}
 
@@ -2219,6 +2457,97 @@ function CatchUpCard({ catchUp, onDismiss }: { catchUp: CatchUp; onDismiss: () =
   );
 }
 
+// Re-render every `stepMs` so a client-side countdown ticks. Returns "now".
+function useNow(stepMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), stepMs);
+    return () => window.clearInterval(id);
+  }, [stepMs]);
+  return now;
+}
+
+// The viewer's Turn & Talk card: the presenter broadcast a discussion/exercise
+// prompt with a synchronized countdown. The MM:SS timer renders client-side from
+// `endsAt` (everyone counts down to the same wall-clock instant); when it hits 0
+// it lingers briefly as "time's up", and the presenter's Regroup clears it
+// everywhere via the session poll. Hiding is local; a new activity id re-shows.
+// Rendered in PARENT app-chrome only — never posted into the sandboxed frame.
+function ActivityCard({ activity, onHide }: { activity: Activity; onHide: () => void }) {
+  const now = useNow(500);
+  const remaining = activity.endsAt - now;
+  // Past the brief "time's up" linger the card is over — the next session tick
+  // stops delivering the activity anyway (the server filters ended ones).
+  if (remaining <= -10_000) return null;
+  const done = remaining <= 0;
+  const secs = Math.max(0, Math.ceil(remaining / 1000));
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+  return (
+    <div style={activityCardWrap} role="status" aria-label="Group activity">
+      <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>⏱ Turn &amp; talk</span>
+        <button onClick={onHide} title="Hide" aria-label="Hide activity" style={recapDismissBtn}>
+          ✕
+        </button>
+      </div>
+      <div style={{ fontSize: 17, fontWeight: 500, color: "#262229", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
+        {activity.prompt}
+      </div>
+      <div style={activityTimer(done)} aria-live={done ? "assertive" : "off"}>
+        {done ? "Time's up — regroup!" : `${mm}:${ss}`}
+      </div>
+      {!done && activity.followUp === "poll" && (
+        <div style={activityNote}>Up next: a quick poll on this.</div>
+      )}
+      {!done && activity.followUp === "pinboard" && (
+        <div style={activityNote}>Up next: share your link on the pinboard.</div>
+      )}
+    </div>
+  );
+}
+
+// Larger than the recap card — during a turn-and-talk the activity IS the focus.
+const activityCardWrap: React.CSSProperties = {
+  width: "100%",
+  maxHeight: "min(60vh, 440px)",
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  textAlign: "center",
+  gap: 12,
+  padding: "18px 20px 22px",
+  borderRadius: 20,
+  background: "rgba(255,255,255,0.88)",
+  border: "1px solid rgba(255,255,255,0.9)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 26px 65px -30px rgba(60,55,45,0.65)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+function activityTimer(done: boolean): React.CSSProperties {
+  return {
+    fontVariantNumeric: "tabular-nums",
+    fontSize: done ? 21 : 44,
+    fontWeight: 600,
+    letterSpacing: done ? "0" : "0.03em",
+    lineHeight: 1.1,
+    color: done ? "#B5331F" : "#2C2A31",
+  };
+}
+
+const activityNote: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: "#4B5A16",
+  background: "rgba(191,224,72,0.2)",
+  border: "1px solid rgba(191,224,72,0.45)",
+  borderRadius: 9,
+  padding: "6px 10px",
+};
+
 function floatStyle(left: number): React.CSSProperties {
   return {
     position: "absolute",
@@ -2246,16 +2575,28 @@ const reactionBadge: React.CSSProperties = {
 
 // ---- presenter poll panel (#3/#4) — light adaptation of PresenterConsole ------
 
+// The tally's winning option (first wins a tie) — the branch the room chose.
+function winningIndex(tally: number[], optionCount: number): number {
+  let win = 0;
+  for (let i = 1; i < optionCount; i++) {
+    if ((tally[i] ?? 0) > (tally[win] ?? 0)) win = i;
+  }
+  return win;
+}
+
 function PresenterPollPanel({
   poll,
   tally,
   total,
   slug,
   index,
+  branches,
   reduceMotion,
   autoDraft,
   onAutoDraftDone,
   onLaunch,
+  onOpenBranch,
+  onRoute,
   onReveal,
   onClose,
   onDismiss,
@@ -2265,10 +2606,13 @@ function PresenterPollPanel({
   total: number;
   slug: string;
   index: number;
+  branches: SlideBranch[] | null; // the CURRENT slide's branch point, if any
   reduceMotion: boolean;
   autoDraft: boolean;
   onAutoDraftDone: () => void;
   onLaunch: (question: string, options: string[], correctIndex: number | null) => Promise<boolean>;
+  onOpenBranch: () => Promise<boolean>;
+  onRoute: (optionIndex: number) => Promise<boolean>;
   onReveal: () => void;
   onClose: () => void;
   onDismiss: () => void;
@@ -2281,9 +2625,31 @@ function PresenterPollPanel({
   const [draftError, setDraftError] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [branchBusy, setBranchBusy] = useState(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
+  const [routeBusy, setRouteBusy] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const draftCtrlRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => draftCtrlRef.current?.abort(), []);
+
+  async function openBranch() {
+    if (branchBusy) return;
+    setBranchBusy(true);
+    setBranchError(null);
+    const ok = await onOpenBranch();
+    setBranchBusy(false);
+    if (!ok) setBranchError("Couldn't open the branch vote — try again.");
+  }
+
+  async function route(i: number) {
+    if (routeBusy) return;
+    setRouteBusy(true);
+    setRouteError(null);
+    const ok = await onRoute(i);
+    setRouteBusy(false);
+    if (!ok) setRouteError("Couldn't route — only the presenter with the clicker can move the room.");
+  }
 
   // When a live poll closes, reset the compose form to a blank slate.
   const hadPollRef = useRef(false);
@@ -2383,11 +2749,14 @@ function PresenterPollPanel({
   }
 
   const max = Math.max(1, ...(tally.length ? tally : [0]));
+  const isBranch = poll?.kind === "branch";
+  const taken = poll && isBranch && typeof poll.takenIndex === "number" ? poll.takenIndex : null;
+  const win = poll ? winningIndex(tally, poll.options.length) : 0;
 
   return (
     <div style={presenterPollWrap}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>{poll ? "Live poll" : "New poll"}</span>
+        <span style={pollBadge}>{poll ? (isBranch ? "⑂ Branch vote" : "Live poll") : "New poll"}</span>
         <button onClick={onDismiss} title="Hide panel" aria-label="Hide poll panel" style={qnaCloseBtn}>
           ✕
         </button>
@@ -2397,26 +2766,43 @@ function PresenterPollPanel({
         <div style={presenterPanelScroll}>
           <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.4 }}>{poll.question}</div>
           <div style={{ fontSize: 12, fontWeight: 500, color: poll.revealed ? "#4B5A16" : "#6E6A62" }}>
-            {poll.revealed ? "Revealed to the room" : "Live — collecting votes"} · {total} vote{total === 1 ? "" : "s"}
+            {poll.revealed ? "Revealed to the room" : isBranch ? "Live — the room is choosing a path" : "Live — collecting votes"} · {total} vote{total === 1 ? "" : "s"}
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {poll.options.map((opt, i) => {
               const count = tally[i] ?? 0;
-              const correct = poll.correctIndex === i;
+              const correct = isBranch ? taken === i : poll.correctIndex === i;
               const pct = Math.round((count / max) * 100);
               const share = total > 0 ? Math.round((count / total) * 100) : 0;
+              const range = isBranch ? poll.branches?.[i] : undefined;
               return (
                 <div key={i} style={pollResultRow}>
                   <div style={{ ...pollResultBar(poll.revealed && correct, false), width: `${pct}%`, transition: reduceMotion ? "none" : "width .45s ease" }} aria-hidden />
                   <div style={pollResultText}>
                     <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
-                      {poll.revealed && correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                      {range && (
+                        <span style={{ fontSize: 10.5, color: "#8A867E", whiteSpace: "nowrap", flex: "0 0 auto" }}>
+                          slides {range.from + 1}–{range.to + 1}
+                        </span>
+                      )}
+                      {poll.revealed && correct && <span style={pollTag("#3F7A12")}>{isBranch ? "⑂ taken" : "✓ correct"}</span>}
                     </span>
                     <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>
                       {count}
                       {total > 0 ? ` · ${share}%` : ""}
                     </span>
+                    {/* Untaken branches remain reachable — route to ANY path. */}
+                    {isBranch && poll.revealed && taken !== i && (
+                      <button
+                        onClick={() => void route(i)}
+                        disabled={routeBusy}
+                        title={`Take the room to slides ${(poll.branches?.[i]?.from ?? 0) + 1}–${(poll.branches?.[i]?.to ?? 0) + 1}`}
+                        style={{ ...qnaActionBtn, height: 26, fontSize: 11.5, flex: "0 0 auto", opacity: routeBusy ? 0.6 : 1 }}
+                      >
+                        Go →
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -2426,19 +2812,56 @@ function PresenterPollPanel({
               tally (arrives on the poll tick shortly after reveal). Same style as
               the draft rationale above. */}
           {poll.revealed && poll.explanation && <div style={pollExplain}>{poll.explanation}</div>}
+          {isBranch && poll.revealed && taken !== null && (
+            <div style={pollExplain}>
+              ⑂ Routed the room to <strong style={{ fontWeight: 600 }}>{poll.options[taken]}</strong>
+              {poll.branches?.[taken] ? ` (slides ${poll.branches[taken].from + 1}–${poll.branches[taken].to + 1})` : ""}.
+              Untaken paths stay reachable — Go → any of them, or navigate freely.
+            </div>
+          )}
+          {routeError && <div style={qnaErrorText}>{routeError}</div>}
           <div style={{ display: "flex", gap: 10, marginTop: 2 }}>
             {!poll.revealed && (
               <button onClick={onReveal} style={{ ...pill("#2C2A31", "#F4F2EC"), flex: 1, height: 40, justifyContent: "center" }}>
-                Reveal to room
+                {isBranch ? "Reveal the room's choice" : "Reveal to room"}
               </button>
             )}
-            <button onClick={onClose} style={{ ...pill("rgba(255,255,255,0.62)", "#2C2A31"), border: "1px solid rgba(255,255,255,0.85)", flex: poll.revealed ? 1 : "0 0 auto", height: 40, justifyContent: "center" }}>
+            {isBranch && poll.revealed && taken === null && (
+              <button
+                onClick={() => void route(win)}
+                disabled={routeBusy}
+                style={{ ...pill("#2C2A31", "#F4F2EC"), flex: 1, height: 40, justifyContent: "center", opacity: routeBusy ? 0.7 : 1 }}
+              >
+                {routeBusy ? "Routing…" : `⑂ Go to winning branch — ${poll.options[win] ?? ""}`}
+              </button>
+            )}
+            <button onClick={onClose} style={{ ...pill("rgba(255,255,255,0.62)", "#2C2A31"), border: "1px solid rgba(255,255,255,0.85)", flex: poll.revealed && !(isBranch && taken === null) ? 1 : "0 0 auto", height: 40, justifyContent: "center" }}>
               Close
             </button>
           </div>
         </div>
       ) : (
         <div style={presenterPanelScroll}>
+          {/* Branch point: this slide's authored paths — one tap opens the vote. */}
+          {branches && (
+            <div style={branchOffer}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: "#4B5A16" }}>
+                ⑂ This slide is a branch point
+              </div>
+              {branches.map((b, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, color: "#4A463E" }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.label}</span>
+                  <span style={{ color: "#8A867E", whiteSpace: "nowrap" }}>
+                    slides {b.from + 1}–{b.to + 1}
+                  </span>
+                </div>
+              ))}
+              <button onClick={() => void openBranch()} disabled={branchBusy} style={draftBtn(branchBusy)}>
+                {branchBusy ? "Opening…" : "⑂ Open branch vote"}
+              </button>
+              {branchError && <div style={qnaErrorText}>{branchError}</div>}
+            </div>
+          )}
           <button onClick={() => void draft()} disabled={draftLoading} style={draftBtn(draftLoading)}>
             {draftLoading ? "Drafting…" : "✨ Draft with AI"}
           </button>
@@ -2479,6 +2902,192 @@ function PresenterPollPanel({
       )}
     </div>
   );
+}
+
+// ---- presenter Turn & Talk panel — light adaptation of PresenterConsole -------
+
+// Turn & Talk duration presets — synchronized countdowns, so no free-form input.
+const ACTIVITY_PRESETS: { label: string; sec: number }[] = [
+  { label: "2 min", sec: 120 },
+  { label: "5 min", sec: 300 },
+  { label: "10 min", sec: 600 },
+];
+
+// No active activity → the compose form (prompt + duration presets + optional
+// follow-up). Active → the prompt, a live MM:SS countdown (client-side from
+// endsAt) and the Regroup button, which ends the activity on every screen at
+// once (and, for a "poll" follow-up, opens the reviewed ✨ poll-draft flow —
+// handled by the parent). Compose state is local; the parent owns the live
+// activity (it rides the session poll).
+function PresenterActivityPanel({
+  activity,
+  onStart,
+  onRegroup,
+  onDismiss,
+}: {
+  activity: Activity | null;
+  onStart: (prompt: string, durationSec: number, followUp: ActivityFollowUp | null) => Promise<boolean>;
+  onRegroup: () => void;
+  onDismiss: () => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [durationSec, setDurationSec] = useState(300);
+  const [followUp, setFollowUp] = useState<ActivityFollowUp | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const now = useNow(500);
+
+  // When an activity ends/clears, reset the compose form for the next one
+  // (mirrors the poll panel's blank-slate reset).
+  const hadActivityRef = useRef(false);
+  useEffect(() => {
+    if (activity) {
+      hadActivityRef.current = true;
+      return;
+    }
+    if (hadActivityRef.current) {
+      hadActivityRef.current = false;
+      setPrompt("");
+      setFollowUp(null);
+      setError(null);
+    }
+  }, [activity]);
+
+  const canStart = prompt.trim().length > 0 && !starting;
+  async function start() {
+    if (!canStart) return;
+    setStarting(true);
+    setError(null);
+    const ok = await onStart(prompt.trim(), durationSec, followUp);
+    setStarting(false);
+    if (!ok) setError("Couldn't start — try again.");
+  }
+
+  const remaining = activity ? activity.endsAt - now : 0;
+  const done = remaining <= 0;
+  const secs = Math.max(0, Math.ceil(remaining / 1000));
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+
+  return (
+    <div style={presenterPollWrap}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>⏱ Turn &amp; talk</span>
+        <button onClick={onDismiss} title="Hide panel" aria-label="Hide Turn & Talk panel" style={qnaCloseBtn}>
+          ✕
+        </button>
+      </div>
+
+      {activity ? (
+        <div style={presenterPanelScroll}>
+          <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
+            {activity.prompt}
+          </div>
+          <div style={presenterCountdown(done)}>{done ? "Time's up" : `${mm}:${ss}`}</div>
+          <div style={{ fontSize: 12, fontWeight: 500, color: done ? "#9A4B12" : "#6E6A62" }}>
+            {done
+              ? "The room sees “time's up” — regroup to clear it."
+              : "Live on every viewer's screen — everyone counts down together."}
+          </div>
+          {activity.followUp === "poll" && (
+            <div style={pollExplain}>Regrouping opens an AI poll draft on this slide for your review.</div>
+          )}
+          {activity.followUp === "pinboard" && (
+            <div style={pollExplain}>Viewers see a nudge to share their link on the pinboard afterwards.</div>
+          )}
+          <button
+            onClick={onRegroup}
+            style={{ ...pill("#2C2A31", "#F4F2EC"), height: 42, justifyContent: "center" }}
+            title="End the activity on every screen at once"
+          >
+            {activity.followUp === "poll" ? "⏹ Regroup & draft poll" : "⏹ Regroup"}
+          </button>
+        </div>
+      ) : (
+        <div style={presenterPanelScroll}>
+          <div>
+            <FieldLabel>Prompt</FieldLabel>
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Discuss with your neighbor…"
+              maxLength={500}
+              rows={3}
+              style={lightTextarea}
+            />
+          </div>
+
+          <div>
+            <FieldLabel>Duration</FieldLabel>
+            <div style={{ display: "flex", gap: 8 }}>
+              {ACTIVITY_PRESETS.map((p) => (
+                <button
+                  key={p.sec}
+                  type="button"
+                  onClick={() => setDurationSec(p.sec)}
+                  aria-pressed={durationSec === p.sec}
+                  style={activityChoice(durationSec === p.sec)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <FieldLabel>Afterwards (optional)</FieldLabel>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" onClick={() => setFollowUp(null)} aria-pressed={followUp === null} style={activityChoice(followUp === null)}>
+                Nothing
+              </button>
+              <button type="button" onClick={() => setFollowUp("poll")} aria-pressed={followUp === "poll"} style={activityChoice(followUp === "poll")}>
+                📊 Poll
+              </button>
+              <button type="button" onClick={() => setFollowUp("pinboard")} aria-pressed={followUp === "pinboard"} style={activityChoice(followUp === "pinboard")}>
+                📌 Pinboard
+              </button>
+            </div>
+          </div>
+
+          {error && <div style={qnaErrorText}>{error}</div>}
+          <button
+            onClick={() => void start()}
+            disabled={!canStart}
+            style={{ ...pill(canStart ? "#2C2A31" : "#B7B2A8", "#F4F2EC"), height: 42, justifyContent: "center", cursor: canStart ? "pointer" : "default" }}
+          >
+            {starting ? "Starting…" : "⏱ Start Turn & Talk"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function presenterCountdown(done: boolean): React.CSSProperties {
+  return {
+    fontVariantNumeric: "tabular-nums",
+    fontSize: done ? 22 : 42,
+    fontWeight: 600,
+    letterSpacing: done ? "0" : "0.03em",
+    lineHeight: 1.1,
+    color: done ? "#9A4B12" : "#2C2A31",
+  };
+}
+
+function activityChoice(on: boolean): React.CSSProperties {
+  return {
+    flex: 1,
+    height: 34,
+    borderRadius: 9,
+    border: on ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.18)",
+    background: on ? "#2C2A31" : "rgba(255,255,255,0.7)",
+    color: on ? "#F4F2EC" : "#2C2A31",
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: 12.5,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+  };
 }
 
 // ---- presenter Q&A panel (#5) — light adaptation of PresenterConsole ----------
@@ -2803,6 +3412,17 @@ const pollExplain: React.CSSProperties = {
   borderRadius: 9,
   background: "rgba(60,55,45,0.05)",
   border: "1px solid rgba(60,55,45,0.1)",
+};
+
+// The branch-point offer in the compose panel (this slide's authored paths).
+const branchOffer: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 8,
+  padding: "10px 12px",
+  borderRadius: 11,
+  background: "rgba(191,224,72,0.14)",
+  border: "1px solid rgba(120,150,30,0.35)",
 };
 
 const digestChip: React.CSSProperties = {

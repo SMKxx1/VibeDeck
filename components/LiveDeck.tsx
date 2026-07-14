@@ -62,6 +62,9 @@ interface SessionState {
   // A presenter is actively presenting. When false, viewers browse freely
   // (no lock, no auto-follow); the sync only kicks in while someone's live.
   live: boolean;
+  // Co-host mode (presenter only): false when ANOTHER presenter holds the clicker
+  // (slide control). Absent/true — including an unclaimed session — means drive.
+  isDriver?: boolean;
 }
 
 // The viewer-safe projection of a live poll (#3), delivered on the SAME session
@@ -71,6 +74,9 @@ interface SessionState {
 // arrives on a later session tick — the card just re-renders when it lands).
 interface ViewerPoll {
   id: string;
+  // "branch" = a branch-point vote: the options are paths through the deck and
+  // the presenter routes the room to the winner (takenIndex = the breadcrumb).
+  kind?: "poll" | "branch";
   question: string;
   options: string[];
   revealed: boolean;
@@ -78,6 +84,7 @@ interface ViewerPoll {
   tally: number[] | null;
   total: number | null;
   explanation: string | null;
+  takenIndex?: number | null;
   at: number;
 }
 
@@ -87,6 +94,18 @@ interface Recap {
   id: string;
   text: string;
   slideIndex: number;
+  at: number;
+}
+
+// A presenter-broadcast Turn & Talk activity: a discussion/exercise prompt + a
+// synchronized countdown, delivered on the same session poll. Viewers count down
+// CLIENT-SIDE from `endsAt` (no per-second server traffic); "Regroup" clears it
+// everywhere at once. Hide is local per viewer; a new id shows the card again.
+interface Activity {
+  id: string;
+  prompt: string;
+  endsAt: number; // epoch ms
+  followUp: "poll" | "pinboard" | null;
   at: number;
 }
 
@@ -146,6 +165,10 @@ export function LiveDeck({
   // the same session poll. Dismiss is local; a NEW recap id shows the card again.
   const [recap, setRecap] = useState<Recap | null>(null);
   const [dismissedRecapId, setDismissedRecapId] = useState<string | null>(null);
+  // Turn & Talk activity card: presenter-broadcast, riding the same session poll.
+  // Hide is local (per activity id); the countdown runs client-side from endsAt.
+  const [activity, setActivity] = useState<Activity | null>(null);
+  const [hiddenActivityId, setHiddenActivityId] = useState<string | null>(null);
   // Personal catch-up card: fetched on demand while behind; dismiss clears it.
   const [catchUp, setCatchUp] = useState<CatchUp | null>(null);
   const [reduceMotion, setReduceMotion] = useState(false);
@@ -191,9 +214,9 @@ export function LiveDeck({
     else send({ type: "deck:role", role: "viewer", max: s.max, locked: autoFollowRef.current });
   }, [role, send, sendFree]);
 
-  // Presenter → broadcast a position, reset the lock, or just heartbeat.
+  // Presenter → broadcast a position, reset the lock, heartbeat, or take the clicker.
   const postPresenter = useCallback(
-    async (opts: { index?: number; reset?: boolean; heartbeat?: boolean }) => {
+    async (opts: { index?: number; reset?: boolean; heartbeat?: boolean; takeClicker?: boolean }) => {
       try {
         const res = await fetch("/api/session", {
           method: "POST",
@@ -217,11 +240,13 @@ export function LiveDeck({
   );
 
   // Presenter's own navigation → tell peer presenter windows instantly
-  // (BroadcastChannel) and the server (for viewers).
+  // (BroadcastChannel) and the server (for viewers). Co-host mode: a moderator
+  // (clicker held by the co-host) never writes the shared index — the server
+  // would ignore it anyway; skipping spares the round-trip.
   const drive = useCallback(
     (index: number) => {
       channelRef.current?.post({ type: "state", index });
-      void postPresenter({ index });
+      if (sessionRef.current.isDriver !== false) void postPresenter({ index });
     },
     [postPresenter],
   );
@@ -571,16 +596,23 @@ export function LiveDeck({
         const s = (await res.json()) as SessionState & {
           poll?: ViewerPoll | null;
           recap?: Recap | null;
+          activity?: Activity | null;
         };
         lastLive = s.live;
         setSession(s);
         // Presenter windows sync with each other instantly via BroadcastChannel,
         // never via this poll — polling here would fight local navigation.
-        if (role === "presenter") return;
-        // The live poll (#3) + room recap ride on this same session read — no
-        // extra request.
+        // Co-host mode is the exception: a moderator follows the driver (the goto
+        // reports back as reason 'api', so it never re-drives).
+        if (role === "presenter") {
+          if (s.isDriver === false) followTo(s.index);
+          return;
+        }
+        // The live poll (#3) + room recap + Turn & Talk activity ride on this
+        // same session read — no extra request.
         setPoll(s.poll ?? null);
         setRecap(s.recap ?? null);
+        setActivity(s.activity ?? null);
         // Heartbeat presence on every viewer tick (live or free-roam browsing).
         void beat();
         if (!s.live) {
@@ -838,6 +870,19 @@ export function LiveDeck({
           ) : (
             <>
               <span style={glassChip()}>Viewers unlocked → slide {unlockedTo + 1}</span>
+              {session.isDriver !== false ? (
+                <span style={glassChip()} title="You control the room's slide position">
+                  🖱 You have the clicker
+                </span>
+              ) : (
+                <button
+                  onClick={() => void postPresenter({ takeClicker: true })}
+                  style={pill("#BFE048", "#1B1B20")}
+                  title="Take slide control from your co-host"
+                >
+                  🖱 Take the clicker
+                </button>
+              )}
               <button onClick={() => void postPresenter({ reset: true })} style={pill("#B5331F", "#FFF")} title="Set the current slide as the viewers' ceiling">
                 Reset lock
               </button>
@@ -866,11 +911,18 @@ export function LiveDeck({
           />
         )}
 
-        {/* Bottom-center card stack — the room recap (presenter-broadcast) and
-            this viewer's personal catch-up card share one column so they never
-            overlap; both clear the poll card (bottom-left) and Q&A panel (right). */}
-        {role === "viewer" && ((recap && recap.id !== dismissedRecapId) || catchUp) && (
+        {/* Bottom-center card stack — the Turn & Talk activity card, the room
+            recap (presenter-broadcast) and this viewer's personal catch-up card
+            share one column so they never overlap; all clear the poll card
+            (bottom-left) and Q&A panel (right). */}
+        {role === "viewer" &&
+          ((activity && activity.id !== hiddenActivityId) ||
+            (recap && recap.id !== dismissedRecapId) ||
+            catchUp) && (
           <div style={centerCardStack}>
+            {activity && activity.id !== hiddenActivityId && (
+              <ActivityCard activity={activity} onHide={() => setHiddenActivityId(activity.id)} />
+            )}
             {recap && recap.id !== dismissedRecapId && (
               <RecapCard recap={recap} onDismiss={() => setDismissedRecapId(recap.id)} />
             )}
@@ -1254,11 +1306,18 @@ function PollCard({
   const tally = poll.tally ?? [];
   const total = poll.total ?? 0;
   const max = Math.max(1, ...(tally.length ? tally : [0]));
+  // Branch vote (branch points): distinct badge/copy, the routed path is
+  // highlighted instead of a "correct" answer, and a breadcrumb shows once the
+  // presenter routes the room.
+  const isBranch = poll.kind === "branch";
+  const taken = isBranch && typeof poll.takenIndex === "number" ? poll.takenIndex : null;
 
   return (
-    <div style={pollCardWrap} role="group" aria-label="Live poll">
+    <div style={pollCardWrap} role="group" aria-label={isBranch ? "Branch vote" : "Live poll"}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>{revealed ? "Results" : "Live poll"}</span>
+        <span style={pollBadge}>
+          {isBranch ? (revealed ? "⑂ Path chosen" : "⑂ Choose our path") : revealed ? "Results" : "Live poll"}
+        </span>
         {revealed ? (
           <span style={pollNote}>
             {total} vote{total === 1 ? "" : "s"}
@@ -1292,7 +1351,7 @@ function PollCard({
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {poll.options.map((opt, i) => {
             const count = tally[i] ?? 0;
-            const correct = poll.correctIndex === i;
+            const correct = isBranch ? taken === i : poll.correctIndex === i;
             const mine = myOptionIndex === i;
             const pct = Math.round((count / max) * 100);
             return (
@@ -1308,7 +1367,7 @@ function PollCard({
                 <div style={pollResultText}>
                   <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
-                    {correct && <span style={pollTag("#3F7A12")}>✓ correct</span>}
+                    {correct && <span style={pollTag("#3F7A12")}>{isBranch ? "⑂ taking this path" : "✓ correct"}</span>}
                     {mine && <span style={pollTag("#6E6A62")}>your pick</span>}
                   </span>
                   <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>{count}</span>
@@ -1316,6 +1375,13 @@ function PollCard({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Branch breadcrumb — shows once the presenter routes the room. */}
+      {isBranch && revealed && taken !== null && (
+        <div style={pollWhy}>
+          <span style={pollWhyLabel}>Path</span>⑂ {poll.options[taken]}
         </div>
       )}
 
@@ -1481,6 +1547,96 @@ function pollTag(color: string): React.CSSProperties {
     flex: "0 0 auto",
   };
 }
+
+// Re-render every `stepMs` so a client-side countdown ticks. Returns "now".
+function useNow(stepMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), stepMs);
+    return () => window.clearInterval(id);
+  }, [stepMs]);
+  return now;
+}
+
+// The viewer's Turn & Talk card: the presenter broadcast a discussion/exercise
+// prompt with a synchronized countdown. The MM:SS timer renders client-side from
+// `endsAt` (everyone counts down to the same wall-clock instant); when it hits 0
+// it lingers briefly as "time's up", and the presenter's Regroup clears it
+// everywhere via the session poll. Hiding is local; a new activity id re-shows.
+function ActivityCard({ activity, onHide }: { activity: Activity; onHide: () => void }) {
+  const now = useNow(500);
+  const remaining = activity.endsAt - now;
+  // Past the brief "time's up" linger the card is over — the next session tick
+  // stops delivering the activity anyway (the server filters ended ones).
+  if (remaining <= -10_000) return null;
+  const done = remaining <= 0;
+  const secs = Math.max(0, Math.ceil(remaining / 1000));
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+  return (
+    <div style={activityCardWrap} role="status" aria-label="Group activity">
+      <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={pollBadge}>⏱ Turn &amp; talk</span>
+        <button onClick={onHide} title="Hide" aria-label="Hide activity" style={recapDismissBtn}>
+          ✕
+        </button>
+      </div>
+      <div style={{ fontSize: 17, fontWeight: 500, color: "#262229", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
+        {activity.prompt}
+      </div>
+      <div style={activityTimer(done)} aria-live={done ? "assertive" : "off"}>
+        {done ? "Time's up — regroup!" : `${mm}:${ss}`}
+      </div>
+      {!done && activity.followUp === "poll" && (
+        <div style={activityNote}>Up next: a quick poll on this.</div>
+      )}
+      {!done && activity.followUp === "pinboard" && (
+        <div style={activityNote}>Up next: share your link on the pinboard.</div>
+      )}
+    </div>
+  );
+}
+
+// Larger than the recap card — during a turn-and-talk the activity IS the focus.
+const activityCardWrap: React.CSSProperties = {
+  width: "100%",
+  maxHeight: "min(60vh, 440px)",
+  overflowY: "auto",
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  textAlign: "center",
+  gap: 12,
+  padding: "18px 20px 22px",
+  borderRadius: 20,
+  background: "rgba(255,255,255,0.88)",
+  border: "1px solid rgba(255,255,255,0.9)",
+  backdropFilter: "blur(16px)",
+  WebkitBackdropFilter: "blur(16px)",
+  boxShadow: "0 26px 65px -30px rgba(60,55,45,0.65)",
+  fontFamily: '"Outfit", system-ui, sans-serif',
+};
+
+function activityTimer(done: boolean): React.CSSProperties {
+  return {
+    fontVariantNumeric: "tabular-nums",
+    fontSize: done ? 21 : 44,
+    fontWeight: 600,
+    letterSpacing: done ? "0" : "0.03em",
+    lineHeight: 1.1,
+    color: done ? "#B5331F" : "#2C2A31",
+  };
+}
+
+const activityNote: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: "#4B5A16",
+  background: "rgba(191,224,72,0.2)",
+  border: "1px solid rgba(191,224,72,0.45)",
+  borderRadius: 9,
+  padding: "6px 10px",
+};
 
 // The viewer's recap card (comprehension checkpoint): the presenter pushed a short
 // AI recap of the slide because part of the room felt lost. Purely informational —

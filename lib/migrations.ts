@@ -163,9 +163,34 @@ const migration004: Migration = {
   },
 };
 
+// 005_slide_branches: branch points (audience-voted choose-your-own-path decks).
+// A deck_slides row may declare 2–4 labeled paths, each targeting a slide range
+// — stored as a JSONB array of { label, from, to } (see lib/types.ts
+// SlideBranch / sanitizeBranches, the single shape+validation rule; readers
+// re-sanitize on the way out so a hand-edited row can never crash a render).
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003): the column is NULLABLE
+// with no default, so every existing row backfills to NULL — "not a branch
+// slide" — with zero writes. IF NOT EXISTS for the same reason as 004: the
+// runner records a migration only AFTER up() succeeds and doesn't wrap up() in a
+// transaction, so a transient failure of the tracking INSERT must not wedge the
+// next boot on "column already exists".
+const migration005: Migration = {
+  id: "005_slide_branches",
+  async up(client) {
+    await client.query(`ALTER TABLE deck_slides ADD COLUMN IF NOT EXISTS branches JSONB`);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
-export const MIGRATIONS: Migration[] = [migration001, migration002, migration003, migration004];
+export const MIGRATIONS: Migration[] = [
+  migration001,
+  migration002,
+  migration003,
+  migration004,
+  migration005,
+];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
 // must run every boot before we can consult it. Safe to re-run. `checksum` is

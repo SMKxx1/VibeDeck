@@ -1,20 +1,34 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { getSession, setPresenterIndex, resetLock, heartbeat, isLive } from "@/lib/session";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { getSession, setPresenterIndex, resetLock, heartbeat, takeClicker, isLive } from "@/lib/session";
+import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession, type Session } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { getActivePoll, pollForViewer } from "@/lib/poll";
 import { getRecap } from "@/lib/recap";
+import { getActivity } from "@/lib/activity";
 
 // The live-session channel. Viewers GET the presenter's position (polled);
 // the presenter POSTs its position (and can "reset the lock"). Only a valid
 // presenter cookie may write.
+//
+// Co-host mode: any valid presenter may run the live room (polls, recaps, Q&A,
+// reset lock, heartbeat), but only the presenter holding "the clicker" moves the
+// shared slide index. `{takeClicker:true}` claims it; a non-driver's position
+// POST is a no-op for the shared index (they still get state back). Both verbs
+// return `isDriver` for the CALLER so the console knows whether it drives.
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+
+// Co-host mode: the clicker is held per presenter IDENTITY. A legacy (v<2) cookie
+// has no user row (userId null) but is one stable identity — the pre-accounts
+// admin — so map it to a sentinel that can hold/contest the clicker like anyone.
+function driverIdFor(session: Session): string {
+  return session.userId ?? "legacy-admin";
+}
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
@@ -37,7 +51,20 @@ export async function GET(req: Request) {
   // The active room recap rides here too (comprehension checkpoint). Viewer-safe
   // as-is: it's presenter-authored/approved text about a slide they can already see.
   const recap = await getRecap(slug);
-  return NextResponse.json({ ...state, live: isLive(state), poll, recap }, { headers: NO_STORE });
+  // The Turn & Talk activity rides here too. Viewer-safe as-is: it's a
+  // presenter-authored prompt + a wall-clock deadline; viewers count down
+  // client-side from `endsAt`, so this poll's cadence never changes.
+  const activity = await getActivity(slug);
+  // Co-host mode: driverId is a userId — never leak it to the room. A presenter
+  // caller instead gets `isDriver` for THEIR identity (an unclaimed session counts
+  // as driving, so a solo console never shows a handoff button).
+  const { driverId, ...pub } = state;
+  const auth = isPresenter ? getAuthSession(token) : null;
+  const extra = auth ? { isDriver: !driverId || driverId === driverIdFor(auth) } : {};
+  return NextResponse.json(
+    { ...pub, live: isLive(state), poll, recap, activity, ...extra },
+    { headers: NO_STORE },
+  );
 }
 
 interface PostBody {
@@ -45,6 +72,7 @@ interface PostBody {
   index?: number;
   reset?: boolean;
   heartbeat?: boolean;
+  takeClicker?: boolean;
 }
 
 export async function POST(req: Request) {
@@ -55,7 +83,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  if (!verifySessionToken(token)) {
+  // Identity, not just validity: the clicker is held per presenter userId.
+  // getAuthSession runs the IDENTICAL signature/expiry/role checks as
+  // verifySessionToken, so this is the same gate — plus who is asking.
+  const auth = getAuthSession(token);
+  if (!auth) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   let body: PostBody;
@@ -67,10 +99,18 @@ export async function POST(req: Request) {
   const slug = (body.slug ?? "").toString();
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
 
-  const state = body.reset
-    ? await resetLock(slug)
-    : body.heartbeat
-      ? await heartbeat(slug)
-      : await setPresenterIndex(slug, Number.isFinite(body.index) ? Number(body.index) : 0);
-  return NextResponse.json({ ...state, live: isLive(state) }, { headers: NO_STORE });
+  const me = driverIdFor(auth);
+  const state = body.takeClicker
+    ? await takeClicker(slug, me)
+    : body.reset
+      ? await resetLock(slug)
+      : body.heartbeat
+        ? await heartbeat(slug)
+        : await setPresenterIndex(slug, Number.isFinite(body.index) ? Number(body.index) : 0, me);
+  // Same shape discipline as GET: no raw driverId out, `isDriver` for the caller.
+  const { driverId, ...pub } = state;
+  return NextResponse.json(
+    { ...pub, live: isLive(state), isDriver: !driverId || driverId === me },
+    { headers: NO_STORE },
+  );
 }

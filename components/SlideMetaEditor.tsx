@@ -16,15 +16,63 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { MAX_BRANCHES, MIN_BRANCHES, MAX_BRANCH_LABEL, type SlideBranch } from "@/lib/types";
 
 export interface EditorSlide {
   index: number;
   label: string;
   speakerNotes: string;
   aiContext: string;
+  /** Branch point (2–4 audience-voted paths), or null/absent. */
+  branches?: SlideBranch[] | null;
 }
 
 const MAX_FIELD = 8000;
+
+// ── Branch-point authoring ──────────────────────────────────────────────────
+// Raw per-row inputs (slide numbers are 1-BASED strings while editing — what an
+// author counts — and converted to the canonical 0-based SlideBranch on save).
+interface BranchDraft {
+  label: string;
+  from: string;
+  to: string;
+}
+
+function toBranchDrafts(branches?: SlideBranch[] | null): BranchDraft[] {
+  return (branches ?? []).map((b) => ({
+    label: b.label,
+    from: String(b.from + 1),
+    to: String(b.to + 1),
+  }));
+}
+
+// Canonical comparison key so "dirty" survives re-renders without deep equality.
+function branchKey(drafts: BranchDraft[]): string {
+  return JSON.stringify(drafts.map((d) => [d.label.trim(), d.from.trim(), d.to.trim()]));
+}
+
+function parseSlideNo(s: string): number | null {
+  const n = Number(s.trim());
+  return Number.isInteger(n) && n >= 1 ? n : null;
+}
+
+// null = the drafts don't form a valid branch point (and aren't empty).
+// [] is impossible by construction: empty drafts → { clear: true }.
+function cleanBranches(drafts: BranchDraft[]): { value: SlideBranch[] | null; valid: boolean } {
+  if (drafts.length === 0) return { value: null, valid: true }; // not a branch slide
+  if (drafts.length < MIN_BRANCHES || drafts.length > MAX_BRANCHES) {
+    return { value: null, valid: false };
+  }
+  const out: SlideBranch[] = [];
+  for (const d of drafts) {
+    const label = d.label.trim().slice(0, MAX_BRANCH_LABEL);
+    const from = parseSlideNo(d.from);
+    const to = parseSlideNo(d.to);
+    if (!label || from === null || to === null || to < from) return { value: null, valid: false };
+    out.push({ label, from: from - 1, to: to - 1 });
+  }
+  return { value: out, valid: true };
+}
 
 // ── Live slide preview ──────────────────────────────────────────────────────
 // The editor renders the ACTUAL slide next to its notes so the presenter no longer
@@ -398,6 +446,11 @@ function SlideCard({
   const [ctx, setCtx] = useState(slide.aiContext);
   const [savedNotes, setSavedNotes] = useState(slide.speakerNotes);
   const [savedCtx, setSavedCtx] = useState(slide.aiContext);
+  // Branch point (audience-voted paths): raw 1-based drafts while editing.
+  const [branches, setBranches] = useState<BranchDraft[]>(() => toBranchDrafts(slide.branches));
+  const [savedBranchKey, setSavedBranchKey] = useState<string>(() =>
+    branchKey(toBranchDrafts(slide.branches)),
+  );
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [genStatus, setGenStatus] = useState<GenStatus>("idle");
@@ -408,9 +461,11 @@ function SlideCard({
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
 
-  const dirty = notes !== savedNotes || ctx !== savedCtx;
+  const cleaned = cleanBranches(branches);
+  const dirty =
+    notes !== savedNotes || ctx !== savedCtx || branchKey(branches) !== savedBranchKey;
   const tooLong = notes.length > MAX_FIELD || ctx.length > MAX_FIELD;
-  const canSave = dbAvailable && dirty && !tooLong && status !== "saving";
+  const canSave = dbAvailable && dirty && !tooLong && cleaned.valid && status !== "saving";
 
   // Generate a suggestion and FILL the editable fields. Review-before-save: the
   // server returns a draft and never persists — the existing Save button does.
@@ -463,11 +518,20 @@ function SlideCard({
       const res = await fetch("/api/admin/slides", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, index: slide.index, speakerNotes: notes, aiContext: ctx }),
+        body: JSON.stringify({
+          slug,
+          index: slide.index,
+          speakerNotes: notes,
+          aiContext: ctx,
+          // null clears the branch point; a valid list sets it (canSave already
+          // guarantees cleaned.valid, so a half-formed draft can't reach here).
+          branches: cleaned.value,
+        }),
       });
       if (res.ok) {
         setSavedNotes(notes);
         setSavedCtx(ctx);
+        setSavedBranchKey(branchKey(branches));
         setStatus("saved");
       } else {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -607,6 +671,8 @@ function SlideCard({
         disabled={!dbAvailable}
         rows={6}
       />
+      <div style={{ height: 14 }} />
+      <BranchEditor branches={branches} onChange={setBranches} disabled={!dbAvailable} />
 
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
         <button
@@ -629,7 +695,13 @@ function SlideCard({
           {status === "saving" ? "Saving…" : "Save"}
         </button>
 
-        <StatusPill dirty={dirty} status={status} errorMsg={errorMsg} tooLong={tooLong} />
+        <StatusPill
+          dirty={dirty}
+          status={status}
+          errorMsg={errorMsg}
+          tooLong={tooLong}
+          branchesInvalid={!cleaned.valid}
+        />
       </div>
     </section>
   );
@@ -640,14 +712,24 @@ function StatusPill({
   status,
   errorMsg,
   tooLong,
+  branchesInvalid,
 }: {
   dirty: boolean;
   status: Status;
   errorMsg: string | null;
   tooLong: boolean;
+  branchesInvalid: boolean;
 }) {
   if (tooLong) {
     return <span style={{ fontSize: 13, color: "#C23B27" }}>Too long — keep each field under {MAX_FIELD.toLocaleString()} characters.</span>;
+  }
+  if (branchesInvalid) {
+    return (
+      <span style={{ fontSize: 13, color: "#C23B27" }}>
+        A branch point needs {MIN_BRANCHES}–{MAX_BRANCHES} paths, each with a label and a valid
+        slide range.
+      </span>
+    );
   }
   if (status === "saving") {
     return <span style={{ fontSize: 13, color: "#8A857C" }}>Saving…</span>;
@@ -722,6 +804,149 @@ function Field({
     </label>
   );
 }
+
+// ── Branch-point editor ─────────────────────────────────────────────────────
+// Author 2–4 audience-voted paths for this slide (label + a 1-based slide range
+// each). Empty = not a branch point. Validation (and the canonical 0-based
+// conversion) happens in cleanBranches; this component only edits raw drafts.
+function BranchEditor({
+  branches,
+  onChange,
+  disabled,
+}: {
+  branches: BranchDraft[];
+  onChange: (next: BranchDraft[]) => void;
+  disabled: boolean;
+}) {
+  const setAt = (i: number, patch: Partial<BranchDraft>) =>
+    onChange(branches.map((b, idx) => (idx === i ? { ...b, ...patch } : b)));
+  const remove = (i: number) => onChange(branches.filter((_, idx) => idx !== i));
+  const add = () => {
+    if (branches.length >= MAX_BRANCHES) return;
+    // Seeding a second row when the first is added keeps the draft out of the
+    // invalid 1-path state by default.
+    const seed: BranchDraft = { label: "", from: "", to: "" };
+    onChange(branches.length === 0 ? [seed, { ...seed }] : [...branches, seed]);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <span
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "baseline",
+          fontSize: 12,
+          fontWeight: 500,
+          letterSpacing: "0.02em",
+          color: "#6E6A62",
+        }}
+      >
+        Branch point (audience-voted paths)
+        <span style={{ fontSize: 11, color: "#A29D92" }}>
+          {branches.length === 0 ? "off" : `${branches.length} / ${MAX_BRANCHES} paths`}
+        </span>
+      </span>
+
+      {branches.map((b, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            value={b.label}
+            onChange={(e) => setAt(i, { label: e.target.value })}
+            disabled={disabled}
+            placeholder={`Path ${i + 1} label — what the room votes on`}
+            maxLength={MAX_BRANCH_LABEL}
+            style={{ ...branchInput, flex: 1, minWidth: 0 }}
+          />
+          <span style={{ fontSize: 12, color: "#8A857C", whiteSpace: "nowrap" }}>slides</span>
+          <input
+            value={b.from}
+            onChange={(e) => setAt(i, { from: e.target.value })}
+            disabled={disabled}
+            placeholder="from"
+            inputMode="numeric"
+            aria-label={`Path ${i + 1} first slide`}
+            style={{ ...branchInput, width: 58, textAlign: "center" }}
+          />
+          <span style={{ color: "#8A857C" }}>–</span>
+          <input
+            value={b.to}
+            onChange={(e) => setAt(i, { to: e.target.value })}
+            disabled={disabled}
+            placeholder="to"
+            inputMode="numeric"
+            aria-label={`Path ${i + 1} last slide`}
+            style={{ ...branchInput, width: 58, textAlign: "center" }}
+          />
+          <button
+            type="button"
+            onClick={() => remove(i)}
+            disabled={disabled}
+            title="Remove this path"
+            aria-label={`Remove path ${i + 1}`}
+            style={branchRemoveBtn}
+          >
+            –
+          </button>
+        </div>
+      ))}
+
+      {branches.length < MAX_BRANCHES && (
+        <button type="button" onClick={add} disabled={disabled} style={branchAddBtn}>
+          {branches.length === 0 ? "⑂ Make this a branch point" : "+ Add path"}
+        </button>
+      )}
+      {branches.length > 0 && (
+        <p style={{ margin: 0, fontSize: 11.5, color: "#8A857C", lineHeight: 1.5 }}>
+          When you reach this slide live, open a branch vote from the presenter controls — the
+          room votes on the labels, and one click routes everyone to the winning path&rsquo;s
+          first slide. Slide numbers are 1-based.
+        </p>
+      )}
+    </div>
+  );
+}
+
+const branchInput: React.CSSProperties = {
+  height: 36,
+  padding: "0 11px",
+  borderRadius: 10,
+  border: "1px solid rgba(60,55,45,0.18)",
+  background: "rgba(255,255,255,0.72)",
+  fontFamily: "inherit",
+  fontSize: 13.5,
+  color: "#2C2A31",
+  outline: "none",
+  boxSizing: "border-box",
+};
+
+const branchRemoveBtn: React.CSSProperties = {
+  width: 30,
+  height: 30,
+  flex: "0 0 auto",
+  borderRadius: 9,
+  border: "1px solid rgba(60,55,45,0.16)",
+  background: "transparent",
+  color: "#6E6A62",
+  cursor: "pointer",
+  fontSize: 15,
+  lineHeight: 1,
+  padding: 0,
+};
+
+const branchAddBtn: React.CSSProperties = {
+  height: 34,
+  borderRadius: 10,
+  border: "1px dashed rgba(60,55,45,0.28)",
+  background: "transparent",
+  color: "#5E5A52",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  fontSize: 12.5,
+  fontWeight: 500,
+  width: "fit-content",
+  padding: "0 14px",
+};
 
 // A tasteful two-point sparkle to mark the AI-generate affordances, matching the
 // file's minimal SVG-icon style. Purely decorative.
