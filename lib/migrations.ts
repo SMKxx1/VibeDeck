@@ -263,6 +263,27 @@ const migration007: Migration = {
   },
 };
 
+// 008_deck_drafts: the VDML Workbench's in-progress working copy. An owner edits
+// an uploaded deck's HTML in-app; saves land in `draft_html` while `html` (003)
+// keeps serving the LIVE bytes untouched, and Publish validates + atomically
+// swaps draft→html and clears the draft. NULL = no draft in progress.
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005): nullable with no
+// default, so every existing row backfills to NULL — "no draft" — with zero
+// writes. Deliberately NO size/kind CHECK: the ~2MB cap is a route concern (same
+// placement as 003's html cap), and a draft is allowed to be mid-edit/broken —
+// the ONLY gate that matters is validateDeckHtml at publish time, before the
+// bytes ever reach `html`. IF NOT EXISTS for the same reason as 004/005: the
+// runner records a migration only AFTER up() succeeds and doesn't wrap up() in a
+// transaction, so a transient failure of the tracking INSERT must not wedge the
+// next boot on "column already exists".
+const migration008: Migration = {
+  id: "008_deck_drafts",
+  async up(client) {
+    await client.query(`ALTER TABLE decks ADD COLUMN IF NOT EXISTS draft_html TEXT`);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
 export const MIGRATIONS: Migration[] = [
@@ -273,6 +294,7 @@ export const MIGRATIONS: Migration[] = [
   migration005,
   migration006,
   migration007,
+  migration008,
 ];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we

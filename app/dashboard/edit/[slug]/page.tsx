@@ -8,6 +8,7 @@ import { isDbReachable } from "@/lib/db";
 import { getDeckSlides } from "@/lib/slides-store";
 import { listRecapsForDeck } from "@/lib/study-guide-store";
 import { SlideMetaEditor } from "@/components/SlideMetaEditor";
+import { DeckWorkbench } from "@/components/DeckWorkbench";
 
 // Presenter-only editor for a deck's per-slide speaker notes + AI grounding.
 // Reads the session cookie (per-request), so it must be dynamic.
@@ -74,6 +75,14 @@ export default async function EditDeckPage({
       contentUrl={deck.contentUrl}
       embedUrl={deck.embedUrl}
       slideCount={deck.slideCount}
+      // VDML Workbench: in-app HTML editor + draft preview, ONLY for uploaded
+      // decks (registry decks' HTML lives in code) and only when the DB is up
+      // (drafts live in decks.draft_html — with no DB there is nothing to edit).
+      // The Workbench's owner-only draft API re-enforces authorization on every
+      // call; this render gate is UX, the ownership gate above is the security.
+      workbench={
+        deck.kind === "uploaded" && dbAvailable ? <DeckWorkbench slug={slug} /> : undefined
+      }
     />
   );
 }
