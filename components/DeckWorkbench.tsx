@@ -194,11 +194,12 @@ export function DeckWorkbench({ slug }: { slug: string }) {
       setBusy("uploading");
       setNote(null);
       try {
-        const form = new FormData();
-        form.append("file", file);
+        // Raw bytes as the body — NOT multipart (the server's formData parser
+        // chokes on multi-MB bodies; it sniffs the real type from the bytes).
         const res = await fetch(`/api/admin/decks/${slug}/assets`, {
           method: "POST",
-          body: form,
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
         });
         const data = (await res.json().catch(() => ({}))) as { hash?: string; byteSize?: number };
         if (!res.ok || typeof data.hash !== "string") {
