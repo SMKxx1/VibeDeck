@@ -33,7 +33,7 @@ import { html as htmlLang } from "@codemirror/lang-html";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 type Phase = "loading" | "ready" | "load_error";
-type Busy = "idle" | "saving" | "publishing" | "discarding" | "refreshing";
+type Busy = "idle" | "saving" | "publishing" | "discarding" | "refreshing" | "uploading";
 
 interface DraftGetResponse {
   html?: string;
@@ -42,12 +42,25 @@ interface DraftGetResponse {
   previewUrl?: string | null;
 }
 
+// One Deck Asset Vault entry (metadata only — bytes stay server-side).
+interface DeckAsset {
+  hash: string;
+  url: string;
+  contentType: string;
+  byteSize: number;
+  width: number | null;
+  height: number | null;
+}
+
 interface StatusNote {
   kind: "ok" | "warn" | "error";
   text: string;
 }
 
 const MAX_BYTES = 2_000_000; // mirror the route's cap for a friendly pre-flight message
+// Mirror the asset route's RAW ceiling (lib/deck-assets MAX_RAW_BYTES) for a
+// friendly pre-flight message; the server compresses to ≤10MB stored.
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 
 export function DeckWorkbench({ slug }: { slug: string }) {
   const [phase, setPhase] = useState<Phase>("loading");
@@ -58,9 +71,12 @@ export function DeckWorkbench({ slug }: { slug: string }) {
   const [note, setNote] = useState<StatusNote | null>(null);
   // Publish-validation failures, rendered inline under the buttons.
   const [issues, setIssues] = useState<string[]>([]);
+  // Images already in this deck's Asset Vault (metadata only) — for re-insert.
+  const [assets, setAssets] = useState<DeckAsset[]>([]);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // The initial document, held until the editor mounts (fetch completes first).
   const initialDocRef = useRef<string>("");
 
@@ -127,6 +143,89 @@ export function DeckWorkbench({ slug }: { slug: string }) {
     if (!view) return;
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next } });
   }, []);
+
+  // Insert text at (replacing) the current selection, leaving the caret after it.
+  const insertAtCursor = useCallback((text: string) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const { from, to } = view.state.selection.main;
+    view.dispatch({
+      changes: { from, to, insert: text },
+      selection: { anchor: from + text.length },
+    });
+    view.focus();
+  }, []);
+
+  // ── Deck Asset Vault (images) ─────────────────────────────────────────────
+  // Root-relative src: inside the sandboxed frame it resolves against the deck
+  // origin, which is 'self' under the deck CSP — and the same html keeps
+  // working across environments because no origin is baked in.
+  const imgTagFor = useCallback(
+    (hash: string) => `<img src="/d-assets/${slug}/${hash}" alt="">`,
+    [slug],
+  );
+
+  const refreshAssets = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/admin/decks/${slug}/assets`);
+      const data = (await res.json().catch(() => ({}))) as { assets?: DeckAsset[] };
+      if (res.ok && Array.isArray(data.assets)) setAssets(data.assets);
+    } catch {
+      // non-fatal — the list just stays as it was
+    }
+  }, [slug]);
+
+  // Load the existing-images list once the editor is up (informational only).
+  useEffect(() => {
+    if (phase === "ready") void refreshAssets();
+  }, [phase, refreshAssets]);
+
+  // Pick a file → POST to the vault (the server strips EXIF, re-encodes, and
+  // compresses to ≤10MB stored) → insert the <img> tag at the cursor.
+  const onFileChosen = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = ""; // allow re-choosing the same file later
+      if (!file || busy !== "idle") return;
+      if (file.size > MAX_IMAGE_BYTES) {
+        setNote({ kind: "error", text: "Too large — an image upload must stay under 50 MB." });
+        return;
+      }
+      setBusy("uploading");
+      setNote(null);
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const res = await fetch(`/api/admin/decks/${slug}/assets`, {
+          method: "POST",
+          body: form,
+        });
+        const data = (await res.json().catch(() => ({}))) as { hash?: string; byteSize?: number };
+        if (!res.ok || typeof data.hash !== "string") {
+          setNote({
+            kind: "error",
+            text:
+              res.status === 415
+                ? "That file doesn't look like an image."
+                : res.status === 413
+                  ? "Too large — an image upload must stay under 50 MB."
+                  : errorMessageFor(res.status),
+          });
+        } else {
+          insertAtCursor(imgTagFor(data.hash));
+          setNote({
+            kind: "ok",
+            text: `Image added (${fmtBytes(data.byteSize ?? 0)} stored) — tag inserted at the cursor. Save to see it in the preview.`,
+          });
+          void refreshAssets();
+        }
+      } catch {
+        setNote({ kind: "error", text: "Network error — try again." });
+      }
+      setBusy("idle");
+    },
+    [busy, slug, insertAtCursor, imgTagFor, refreshAssets],
+  );
 
   // ── actions ───────────────────────────────────────────────────────────────
 
@@ -339,6 +438,22 @@ export function DeckWorkbench({ slug }: { slug: string }) {
         >
           {busy === "refreshing" ? "Refreshing…" : "Refresh preview"}
         </button>
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={busy !== "idle" || phase !== "ready"}
+          style={ghostBtnStyle(busy !== "idle" || phase !== "ready")}
+          title="Upload an image to this deck and insert its <img> tag at the cursor. Stored compressed (≤10 MB) and served from the deck origin."
+        >
+          {busy === "uploading" ? "Uploading…" : "Insert image…"}
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          onChange={onFileChosen}
+          style={{ display: "none" }}
+        />
 
         {note && (
           <span
@@ -363,6 +478,30 @@ export function DeckWorkbench({ slug }: { slug: string }) {
             ))}
           </ul>
         </div>
+      )}
+
+      {/* images already in this deck's vault — click to re-insert the tag */}
+      {assets.length > 0 && (
+        <details style={{ fontSize: 12.5, color: "#5E5A52" }}>
+          <summary style={{ cursor: "pointer", fontWeight: 500 }}>
+            Images in this deck ({assets.length})
+          </summary>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+            {assets.map((a) => (
+              <button
+                key={a.hash}
+                type="button"
+                onClick={() => insertAtCursor(imgTagFor(a.hash))}
+                disabled={phase !== "ready"}
+                style={assetChipStyle}
+                title="Insert this image's tag at the cursor"
+              >
+                {a.width && a.height ? `${a.width}×${a.height}` : "image"} · {fmtBytes(a.byteSize)} ·{" "}
+                {a.hash.slice(0, 8)}…
+              </button>
+            ))}
+          </div>
+        </details>
       )}
 
       <p style={{ margin: 0, fontSize: 12, color: "#8A857C", lineHeight: 1.55 }}>
@@ -420,6 +559,12 @@ function WorkbenchHeader({ hasDraft, dirty }: { hasDraft: boolean; dirty: boolea
   );
 }
 
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
 function errorMessageFor(status: number): string {
   if (status === 401) return "Session expired — sign in again.";
   if (status === 403) return "Blocked for security — reload the page.";
@@ -473,6 +618,19 @@ const paneNoteStyle: React.CSSProperties = {
   color: "rgba(244,242,236,0.6)",
   fontSize: 13,
   lineHeight: 1.5,
+};
+
+const assetChipStyle: React.CSSProperties = {
+  height: 28,
+  padding: "0 12px",
+  borderRadius: 9,
+  border: "1px solid rgba(60,55,45,0.18)",
+  cursor: "pointer",
+  background: "rgba(255,255,255,0.6)",
+  color: "#5E5A52",
+  fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace",
+  fontSize: 11.5,
+  whiteSpace: "nowrap",
 };
 
 const errorBoxStyle: React.CSSProperties = {

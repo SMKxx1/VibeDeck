@@ -8,8 +8,16 @@
 //
 // Deliberately a SUBSET of Markdown (the part that makes sense on a slide):
 // headings, paragraphs, unordered/ordered lists, bold/italic/inline-code, fenced
-// code blocks, blockquotes, and links. No tables/images (remote images are
-// CSP-blocked anyway) — that's the documented fidelity boundary.
+// code blocks, blockquotes, links, and images. No tables — that's the documented
+// fidelity boundary.
+//
+// IMAGES: `![alt](url)` emits a plain <img> with the src/alt escaped. NOTE that
+// under the deck CSP ("img-src 'self' data:") only SAME-ORIGIN URLs — i.e. the
+// Deck Asset Vault's /d-assets/<slug>/<hash> paths (or anything else on the deck
+// origin) — and data: URIs will actually render; a remote http(s) image is
+// CSP-blocked BY DESIGN (the sandboxed deck must not phone home). We emit the
+// tag regardless and let the CSP enforce that; we deliberately do NOT fetch or
+// inline remote images at import time.
 
 import { sanitizeBranches, type SlideBranch } from "./types";
 
@@ -57,6 +65,8 @@ function themeCss(theme: DeckTheme): string {
     pre code { background:none; padding:0; }
     blockquote { margin:.4em 0 .7em; padding-left:18px; border-left:4px solid var(--accent);
                  color:var(--muted); font-style:italic; }
+    img { max-width:100%; max-height:420px; object-fit:contain; border-radius:10px;
+          display:block; margin:.3em 0 .7em; }
   `.trim();
 }
 
@@ -68,13 +78,21 @@ function escAttr(s: string): string {
 }
 
 // Inline formatting on ALREADY-ESCAPED text: code spans first (so their contents
-// aren't re-formatted), then links, bold, italic. Only http(s) links are emitted.
+// aren't re-formatted), then images (before links — `![x](y)` must not be eaten
+// by the link rule), links, bold, italic. Only http(s) links are emitted; image
+// srcs may also be relative (/d-assets/…) or data: — see the file header for
+// which of those the deck CSP will actually render.
 function inline(escaped: string): string {
   let t = escaped;
   const codes: string[] = [];
   t = t.replace(/`([^`]+)`/g, (_m, c: string) => {
     codes.push(`<code>${c}</code>`);
     return `\u0000${codes.length - 1}\u0000`; // placeholder so bold/italic skip code
+  });
+  t = t.replace(/!\[([^\]]*)\]\(([^\s)]+)\)/g, (_m, alt: string, url: string) => {
+    // Text is already HTML-escaped; only quotes still need escaping inside the
+    // attribute values (escAttr on `url` would double-escape its `&`s).
+    return `<img src="${url.replace(/"/g, "&quot;")}" alt="${alt.replace(/"/g, "&quot;")}">`;
   });
   t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m, txt: string, url: string) => {
     return `<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
