@@ -1,4 +1,4 @@
-import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
+import { getUploadedDeckHtml, getDraftServeHtml } from "@/lib/uploaded-decks";
 import { verifyPreviewToken } from "@/lib/auth";
 import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
 
@@ -61,11 +61,51 @@ function notFound(): Response {
   return new Response(null, { status: 404 });
 }
 
+// The ONE response shape for served deck bytes — the draft path and the live
+// path must be byte-for-byte identical in headers (same strict CSP, same forced
+// sandbox, same no-store), so it lives in one place and can't drift.
+async function serveDeckHtml(storedHtml: string): Promise<Response> {
+  // Inline-inject the shared platform runtime (lib/deck-runtime) so the deck
+  // renders and reports slide changes without shipping its own engine.
+  const body = await renderUploadedDeckHtml(storedHtml);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy": CSP,
+      "X-Content-Type-Options": "nosniff",
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id: slug } = await params;
+  const url = new URL(req.url);
+
+  // DRAFT PREVIEW (?draft=1) — the Workbench's live preview of the in-progress
+  // working copy. UNCONDITIONALLY token-gated: a valid preview token (?t=) for
+  // THIS slug is required regardless of publish_status, because a draft is
+  // presenter-private WIP even on a published deck. The token is minted only by
+  // the owner-gated /api/admin/decks/[slug]/draft route (session + CSRF +
+  // checkDeckManage), and it is the ONLY authority that reaches this far — the
+  // DECK_ORIGIN has no session cookie. Served with the IDENTICAL strict CSP +
+  // forced sandbox + no-store as the live path (serveDeckHtml — no relaxation),
+  // and a missing/invalid token, missing slug, registry slug, or DB error are
+  // all the same bare 404.
+  if (url.searchParams.get("draft") === "1") {
+    if (!verifyPreviewToken(url.searchParams.get("t"), slug)) return notFound();
+    // draft_html when a draft exists, else the published html (previewing with
+    // no draft shows the live deck). Fail CLOSED, same as below.
+    const draft = await getDraftServeHtml(slug);
+    if (!draft) return notFound();
+    return serveDeckHtml(draft.html);
+  }
 
   // Fail CLOSED: null means missing, a registry slug, OR the DB is unreachable.
   // Unlike the fail-OPEN isDeckViewable() path for registry decks (whose whole
@@ -80,24 +120,11 @@ export async function GET(
   // so the signed token is the only authority that reaches this far. Any other
   // status value (should be impossible given the CHECK constraint) also 404s.
   if (row.publishStatus === "unpublished") {
-    const token = new URL(req.url).searchParams.get("t");
+    const token = url.searchParams.get("t");
     if (!verifyPreviewToken(token, slug)) return notFound();
   } else if (row.publishStatus !== "main" && row.publishStatus !== "normal") {
     return notFound();
   }
 
-  // Inline-inject the shared platform runtime (lib/deck-runtime) so the deck
-  // renders and reports slide changes without shipping its own engine.
-  const body = await renderUploadedDeckHtml(row.html);
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": CSP,
-      "X-Content-Type-Options": "nosniff",
-      "Cross-Origin-Resource-Policy": "same-origin",
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cache-Control": "no-store",
-    },
-  });
+  return serveDeckHtml(row.html);
 }

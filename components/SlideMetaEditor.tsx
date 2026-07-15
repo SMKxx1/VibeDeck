@@ -130,6 +130,7 @@ export function SlideMetaEditor({
   embedUrl,
   slideCount,
   studyGuides = [],
+  workbench,
 }: {
   slug: string;
   deckTitle: string;
@@ -141,6 +142,13 @@ export function SlideMetaEditor({
   slideCount?: number;
   /** Previously published study-guide handouts (edit page passes these). */
   studyGuides?: PublishedGuide[];
+  /**
+   * Deck-level tool slot rendered full-width above the notes editor — the edit
+   * page passes the VDML Workbench (in-app HTML editor + draft preview) here for
+   * uploaded decks. A slot, not an import, so this component stays deck-kind
+   * agnostic and the Workbench bundle is only pulled in when actually rendered.
+   */
+  workbench?: React.ReactNode;
 }) {
   // Registry of live per-card handles, keyed by slide index. A card registers a
   // STABLE handle on mount whose methods read the latest values via refs, so the
@@ -223,12 +231,16 @@ export function SlideMetaEditor({
         minHeight: "100vh",
         padding: "34px 24px 60px",
         display: "flex",
-        justifyContent: "center",
+        flexDirection: "column",
+        alignItems: "center",
         background: "#ECEAE3",
         backgroundImage: "radial-gradient(rgba(40,38,32,0.045) 1px, transparent 1.4px)",
         backgroundSize: "22px 22px",
       }}
     >
+      {workbench && (
+        <div style={{ width: "100%", maxWidth: 1188, marginBottom: 26 }}>{workbench}</div>
+      )}
       <div className="sme-shell">
         <div className="sme-main">
         {/* header */}
