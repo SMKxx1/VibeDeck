@@ -11,9 +11,12 @@ import {
 } from "@/lib/deck-assets";
 
 // Deck Asset Vault — the owner-gated write/list surface for a deck's images.
-//   POST → multipart/form-data with a `file` field: normalize/compress the
-//          image (lib/deck-assets putAsset — EXIF stripped, re-encoded WebP,
-//          ≤10MB stored, dedupe by content hash) and return its vault address.
+//   POST → raw image bytes as the request body (NOT multipart — undici's
+//          formData parser throws on multi-MB bodies; the Content-Type header
+//          is advisory only, sharp sniffs the real bytes): normalize/compress
+//          the image (lib/deck-assets putAsset — EXIF stripped, re-encoded
+//          WebP, ≤10MB stored, dedupe by content hash) and return its vault
+//          address.
 //   GET  → asset metadata for the Workbench picker (never bytes).
 //
 // Gate order on BOTH methods (same idiom as ../draft/route.ts): authenticated
@@ -76,33 +79,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
   // Content-Length ceiling BEFORE buffering the body — same reasoning as the
   // upload/replace/draft routes (App Router handlers have no built-in body
   // limit; reject an oversized or header-less request from the raw header).
-  // The multipart envelope adds a little overhead over the file itself, but
-  // the ceiling is generous and putAsset re-checks the actual file bytes.
+  // The ceiling has a little headroom over the raw cap, and the actual bytes
+  // are re-checked below after buffering.
   const lenHeader = req.headers.get("content-length");
   const len = lenHeader === null ? NaN : Number(lenHeader);
   if (!Number.isFinite(len) || len <= 0 || len > MAX_RAW_BYTES + 64 * 1024) {
     return NextResponse.json({ error: "payload_too_large" }, { status: 413 });
   }
 
-  let file: File;
-  try {
-    const form = await req.formData();
-    const f = form.get("file");
-    if (!(f instanceof File)) {
-      return NextResponse.json({ error: "missing_file" }, { status: 400 });
-    }
-    file = f;
-  } catch {
-    return NextResponse.json({ error: "bad_request" }, { status: 400 });
-  }
-  if (file.size === 0) {
+  // The body IS the image — no multipart envelope (undici's formData parser
+  // throws on multi-MB uploads, which broke the whole feature). Buffer it and
+  // enforce the raw cap on the bytes we actually received.
+  const input = Buffer.from(await req.arrayBuffer());
+  if (input.length === 0) {
     return NextResponse.json({ error: "missing_file" }, { status: 400 });
   }
-  if (file.size > MAX_RAW_BYTES) {
+  if (input.length > MAX_RAW_BYTES) {
     return NextResponse.json({ error: "payload_too_large" }, { status: 413 });
   }
-
-  const input = Buffer.from(await file.arrayBuffer());
 
   // putAsset: decode → strip metadata → compress to ≤10MB → content-address →
   // dedupe. The declared MIME type is deliberately ignored — sharp sniffs the
