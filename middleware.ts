@@ -11,10 +11,12 @@ import type { NextRequest } from "next/server";
 // host, expose NOTHING except the deck-content route. Everything else 404s.
 //
 // This is enforced as a DEFAULT-DENY ALLOWLIST, not a blocklist of "sensitive"
-// routes: on the deck host, the ONLY thing that survives is /d-content/*. A new
-// API route added next year is unreachable here by construction — no one has to
-// remember to add it to a list. That property is the whole point; do not turn
-// this into "if path is /api or /login, 404".
+// routes: on the deck host, the ONLY things that survive are /d-content/* (the
+// deck HTML) and /d-assets/* (the Deck Asset Vault's image bytes, which the
+// deck's strict CSP loads as same-origin 'self'). A new API route added next
+// year is unreachable here by construction — no one has to remember to add it
+// to a list. That property is the whole point; do not turn this into "if path
+// is /api or /login, 404".
 //
 // Kept deliberately minimal and free of Node-only APIs so it runs on the Edge
 // runtime with no surprises. The actual file read lives in the route handler,
@@ -45,20 +47,23 @@ function normalizeHost(host: string | null): string {
 
 export function middleware(req: NextRequest) {
   const host = normalizeHost(req.headers.get("host"));
-  const isDeckContent = req.nextUrl.pathname.startsWith("/d-content/");
+  const pathname = req.nextUrl.pathname;
+  // The deck-host allowlist: untrusted deck HTML and its vault-served images.
+  const isDeckServing =
+    pathname.startsWith("/d-content/") || pathname.startsWith("/d-assets/");
 
-  // Deck host: allowlist. ONLY /d-content/* survives; everything else — every
-  // /api/*, /login, /dashboard, /d/* — is a bare 404 by construction.
+  // Deck host: allowlist. ONLY /d-content/* and /d-assets/* survive; everything
+  // else — every /api/*, /login, /dashboard, /d/* — is a bare 404 by construction.
   if (DECK_HOST && host === DECK_HOST) {
-    if (isDeckContent) return NextResponse.next();
+    if (isDeckServing) return NextResponse.next();
     return new NextResponse(null, { status: 404 });
   }
 
   // Any other host (including the real app host, and including the no-DECK_HOST
-  // fail-closed case): deck content must NEVER be reachable on the app's origin,
-  // or we'd have re-created the very same-origin exposure F1 is about. 404 it.
-  // Everything else on the app host passes through untouched.
-  if (isDeckContent) return new NextResponse(null, { status: 404 });
+  // fail-closed case): deck content (and deck assets) must NEVER be reachable on
+  // the app's origin, or we'd have re-created the very same-origin exposure F1
+  // is about. 404 it. Everything else on the app host passes through untouched.
+  if (isDeckServing) return new NextResponse(null, { status: 404 });
   return NextResponse.next();
 }
 

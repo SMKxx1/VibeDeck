@@ -284,6 +284,44 @@ const migration008: Migration = {
   },
 };
 
+// 009_deck_assets: the Deck Asset Vault — per-deck images stored as BYTEA and
+// served from the isolated DECK_ORIGIN (/d-assets/<slug>/<hash>), so an uploaded
+// deck can reference real <img> tags instead of inlining data: URIs into its
+// ~2MB html. `hash` is the sha256 of the FINAL stored bytes (content-addressed:
+// re-uploading the same image dedupes onto the same row), and the composite
+// PRIMARY KEY (deck_slug, hash) scopes every asset to exactly one deck. The FK
+// is ON DELETE CASCADE — unlike session_reports/deck_recaps (historical
+// artifacts that outlive their deck), an asset exists ONLY to be referenced by
+// its deck's html, so deleting the deck reclaims its images.
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005/006/007): a
+// brand-new table, so every existing row backfills trivially with zero writes.
+// The ONLY size rule (per image ≤ 10MB after compression) lives in
+// lib/deck-assets.ts putAsset — a route/store concern, same placement as 003's
+// html cap; there is intentionally NO total-storage or per-deck count cap
+// (owner's decision: small trusted user base). CREATE TABLE IF NOT EXISTS for
+// the same reason as 004/006/007: the runner records a migration only AFTER
+// up() succeeds and doesn't wrap up() in a transaction, so a transient failure
+// of the tracking INSERT must not wedge the next boot on "already exists".
+const migration009: Migration = {
+  id: "009_deck_assets",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS deck_assets (
+        hash          TEXT NOT NULL,
+        deck_slug     TEXT NOT NULL REFERENCES decks(slug) ON DELETE CASCADE,
+        bytes         BYTEA NOT NULL,
+        content_type  TEXT NOT NULL,
+        byte_size     INTEGER NOT NULL,
+        width         INTEGER,
+        height        INTEGER,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (deck_slug, hash)
+      )
+    `);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
 export const MIGRATIONS: Migration[] = [
@@ -295,6 +333,7 @@ export const MIGRATIONS: Migration[] = [
   migration006,
   migration007,
   migration008,
+  migration009,
 ];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we

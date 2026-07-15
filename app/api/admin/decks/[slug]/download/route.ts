@@ -4,6 +4,7 @@ import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
+import { getAsset } from "@/lib/deck-assets";
 
 // Owner-gated DOWNLOAD (GET) — hand back a fully self-contained, offline-capable
 // copy of an uploaded deck for low-bandwidth / offline use. This DELIBERATELY
@@ -20,6 +21,40 @@ export const dynamic = "force-dynamic";
 async function currentSession() {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
   return getSession(token);
+}
+
+// Matches a src attribute pointing at THIS deck's vault: root-relative or
+// absolute (any origin prefix) /d-assets/<slug>/<64-hex-hash>. The slug is
+// interpolated but its charset is [a-z0-9-] (SLUG_RE at upload time), so it is
+// regex-inert. Captures: quote, hash, closing quote.
+function assetRefRe(slug: string): RegExp {
+  return new RegExp(
+    `(src=["'])(?:https?://[^"']*)?/d-assets/${slug}/([a-f0-9]{64})(["'])`,
+    "g",
+  );
+}
+
+// Replace every vault reference with a data: URI of the stored bytes. Two
+// passes: collect the unique hashes and read each ONCE (an image reused across
+// slides costs one query), then a synchronous replace from the map.
+async function inlineDeckAssets(html: string, slug: string): Promise<string> {
+  const re = assetRefRe(slug);
+  const hashes = new Set<string>();
+  for (const m of html.matchAll(re)) hashes.add(m[2]);
+  if (hashes.size === 0) return html;
+
+  const dataUris = new Map<string, string>();
+  for (const hash of hashes) {
+    const asset = await getAsset(slug, hash); // fail-closed null → keep the URL
+    if (asset) {
+      dataUris.set(hash, `data:${asset.contentType};base64,${asset.bytes.toString("base64")}`);
+    }
+  }
+
+  return html.replace(re, (whole, open: string, hash: string, close: string) => {
+    const uri = dataUris.get(hash);
+    return uri ? `${open}${uri}${close}` : whole;
+  });
 }
 
 export async function GET(_req: Request, { params }: { params: Promise<{ slug: string }> }) {
@@ -47,7 +82,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ slug: s
   // Serve the SAME serve-time transform /d-content uses (lib/deck-runtime), so the
   // downloaded file is a complete deck with the platform runtime inlined — it opens
   // and presents straight off disk, with no network and no separate runtime.
-  const renderedHtml = await renderUploadedDeckHtml(row.html);
+  let renderedHtml = await renderUploadedDeckHtml(row.html);
+
+  // TRUE offline: inline THIS deck's Asset Vault images as data: URIs. Off disk
+  // there is no deck origin to resolve /d-assets/<slug>/<hash> against, so each
+  // referenced asset's stored bytes are fetched from the vault at download time
+  // and swapped into the src. Best-effort per reference — an asset that can't be
+  // read (deleted, DB blip) keeps its original URL (still fine online) rather
+  // than failing the download. Only this slug's own assets are inlined.
+  renderedHtml = await inlineDeckAssets(renderedHtml, slug);
 
   return new NextResponse(renderedHtml, {
     headers: {
