@@ -18,6 +18,7 @@
     "@codemirror/view": "^6.43.6",
     "codemirror": "^6.0.2",
     "ioredis": "^5.4.1",
+    "jose": "^6.2.3",
     "next": "15.5.19",
     "node-html-parser": "^7.0.1",
     "pg": "^8.22.0",
