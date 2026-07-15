@@ -346,6 +346,149 @@ function InviteRow({
   );
 }
 
+// ---- pending account requests -------------------------------------------------
+
+// Mirrors lib/account-requests AccountRequest (the fields this view shows) —
+// redeclared so this client module never imports the server-only store.
+interface PendingRequest {
+  id: string;
+  provider: string;
+  email: string;
+  name: string | null;
+  requestedAt: string;
+}
+
+// Google sign-ins awaiting approval — the no-Telegram fallback for the same
+// decisions the Telegram buttons make (both funnel into /lib/provision via
+// POST /api/admin/account-requests). Renders NOTHING while empty so the page
+// stays uncluttered when the OAuth feature is unused.
+function AccountRequests() {
+  const [requests, setRequests] = useState<PendingRequest[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch("/api/admin/account-requests", { cache: "no-store" });
+      if (!res.ok) return; // silent: the invites section already surfaces auth problems
+      const data = (await res.json()) as { requests?: PendingRequest[] };
+      setRequests(data.requests ?? []);
+    } catch {
+      /* fail-open: an unreachable list just stays hidden */
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const decide = useCallback(
+    async (id: string, action: "allow" | "reject") => {
+      setBusyId(id);
+      setError(null);
+      try {
+        const res = await fetch("/api/admin/account-requests", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, action }),
+        });
+        if (res.ok || res.status === 409 || res.status === 404) {
+          // Decided (by us, or already by Telegram/another admin, or gone) —
+          // either way the row is no longer pending here.
+          setRequests((prev) => prev.filter((r) => r.id !== id));
+          if (!res.ok) await load(); // reconcile after a surprise
+          return;
+        }
+        let body: { error?: string } = {};
+        try {
+          body = await res.json();
+        } catch {
+          /* ignore */
+        }
+        setError(errorMessage(res.status, body.error));
+      } catch {
+        setError(errorMessage(0));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [load],
+  );
+
+  if (requests.length === 0 && !error) return null;
+
+  const decisionBtn = (primary: boolean, disabled: boolean): React.CSSProperties => ({
+    height: 34,
+    padding: "0 13px",
+    borderRadius: 10,
+    border: primary ? "none" : "1px solid rgba(194,59,39,0.35)",
+    background: primary ? (disabled ? "#54525A" : INK) : "rgba(255,255,255,0.6)",
+    color: primary ? "#F4F2EC" : CORAL,
+    fontFamily: "inherit",
+    fontSize: 13,
+    fontWeight: 500,
+    cursor: disabled ? "default" : "pointer",
+    whiteSpace: "nowrap",
+  });
+
+  return (
+    <div style={{ ...card, padding: 0, overflow: "hidden" }}>
+      <div style={{ padding: "16px 18px 14px", display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
+        <div style={{ fontSize: 15.5, fontWeight: 500, color: "#262229" }}>Account requests</div>
+        <div style={{ fontSize: 12.5, color: MUTED }}>Google sign-ins awaiting approval</div>
+      </div>
+      {error && (
+        <div style={{ padding: "0 18px 12px", fontSize: 13, color: CORAL }}>{error}</div>
+      )}
+      {requests.map((r) => {
+        const busy = busyId === r.id;
+        return (
+          <div
+            key={r.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 14,
+              padding: "14px 16px",
+              borderTop: "1px solid rgba(60,55,45,0.1)",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+              <div style={{ fontSize: 14.5, fontWeight: 450, color: INK, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {r.name ? `${r.name} — ${r.email}` : r.email}
+              </div>
+              <div style={{ marginTop: 3, fontSize: 12, color: MUTED }}>
+                via {r.provider} · Requested {fmtDate(r.requestedAt)}
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: "0 0 auto" }}>
+              <button
+                type="button"
+                className="iv-btn"
+                disabled={busy}
+                onClick={() => void decide(r.id, "allow")}
+                style={decisionBtn(true, busy)}
+              >
+                {busy ? "Working…" : "Approve"}
+              </button>
+              <button
+                type="button"
+                className="iv-btn"
+                disabled={busy}
+                onClick={() => void decide(r.id, "reject")}
+                style={decisionBtn(false, busy)}
+              >
+                Reject
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ---- main -------------------------------------------------------------------
 
 export function InvitesManager() {
@@ -500,6 +643,9 @@ export function InvitesManager() {
             {error}
           </div>
         )}
+
+        {/* pending Google account requests (renders nothing while empty) */}
+        <AccountRequests />
 
         {/* create-invite form */}
         <form onSubmit={onCreate} style={{ ...card, padding: "22px 22px 24px", display: "flex", flexDirection: "column", gap: 16 }}>

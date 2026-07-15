@@ -28,7 +28,12 @@ function b64url(buf: Buffer | string): string {
   return Buffer.from(buf).toString("base64url");
 }
 
-function sign(payload: string): string {
+// Exported for lib/telegram.ts callback tokens — one secret, one HMAC
+// construction, one place to reason about (same reuse rationale as the preview
+// tokens below). Callers MUST domain-separate their payloads: telegram signs
+// strings containing '.'/':' which can never collide with the pure-base64url
+// JSON payloads the session/preview tokens sign.
+export function sign(payload: string): string {
   return crypto.createHmac("sha256", secret()).update(payload).digest("base64url");
 }
 

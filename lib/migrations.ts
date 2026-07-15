@@ -322,6 +322,99 @@ const migration009: Migration = {
   },
 };
 
+// 010_user_identities: link an EXTERNAL identity to a users row — provider
+// 'google' + provider_id = Google's stable `sub` claim (never the email: emails
+// can be reassigned/aliased; `sub` cannot). The composite PRIMARY KEY
+// (provider, provider_id) makes an external identity claimable by exactly ONE
+// user, and the UNIQUE index on (user_id, provider) caps a user at one identity
+// per provider (there is no "second Google account" concept here). `email` is a
+// nullable snapshot of the address seen at link time — display/audit only, NEVER
+// used for lookup. ON DELETE CASCADE: an identity is pure link state with no
+// artifact value, so deleting the user reclaims it (unlike session_reports /
+// deck_recaps, which outlive their subject).
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005/006/007/009): a
+// brand-new table, so every existing row backfills trivially with zero writes.
+// CREATE TABLE/INDEX IF NOT EXISTS for the same reason as 004/006/007: the
+// runner records a migration only AFTER up() succeeds and doesn't wrap up() in a
+// transaction, so a transient failure of the tracking INSERT must not wedge the
+// next boot on "already exists".
+const migration010: Migration = {
+  id: "010_user_identities",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_identities (
+        provider     TEXT NOT NULL,
+        provider_id  TEXT NOT NULL,
+        user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        email        TEXT,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (provider, provider_id)
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS user_identities_one_per_provider
+        ON user_identities (user_id, provider)
+    `);
+  },
+};
+
+// 011_account_requests: a Google sign-in from an UNKNOWN identity parks here as
+// a 'pending' row awaiting the owner's approve/reject (via the Telegram inline
+// buttons or the admin view) — nothing touches `users` until lib/provision.ts
+// approveRequest promotes it. `status` is a three-state CHECK; decided_at /
+// decided_by record the outcome for audit. notify_chat_id / notify_message_id
+// remember WHERE the Telegram ping landed so the approval webhook can edit that
+// exact message to ✅/❌ (both nullable: Telegram may be unconfigured, in which
+// case the request still exists and is decidable from the admin view).
+//
+// The partial UNIQUE index on (provider, provider_id) WHERE status='pending' is
+// the DB-level backstop for "at most one OPEN request per external identity"
+// (same technique as 002's one_main index): createRequest INSERTs against it
+// with ON CONFLICT DO NOTHING, so two racing sign-ins collapse onto one row
+// instead of double-pinging the owner. Decided rows fall out of the index, so
+// history accumulates freely. The (status, requested_at) index serves the one
+// hot read: "pending requests, oldest first" (the admin/webhook view).
+//
+// DELIBERATELY SCHEMA-ONLY (same discipline as 002/003/005/006/007/009/010):
+// a brand-new table, so every existing row backfills trivially with zero
+// writes. `decided_by` is PLAIN TEXT — deliberately NOT a foreign key to
+// users(id): a decision may come from the Telegram webhook (recorded as an
+// actor label, not a user row), and an audit trail must survive its admin being
+// deleted. CREATE TABLE/INDEX IF NOT EXISTS for the same reason as 004/006/007:
+// the runner records a migration only AFTER up() succeeds and doesn't wrap up()
+// in a transaction, so a transient failure of the tracking INSERT must not
+// wedge the next boot on "already exists".
+const migration011: Migration = {
+  id: "011_account_requests",
+  async up(client) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS account_requests (
+        id                 TEXT PRIMARY KEY,
+        provider           TEXT NOT NULL,
+        provider_id        TEXT NOT NULL,
+        email              TEXT NOT NULL,
+        name               TEXT,
+        status             TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending','approved','rejected')),
+        requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        decided_at         TIMESTAMPTZ,
+        decided_by         TEXT,
+        notify_chat_id     TEXT,
+        notify_message_id  TEXT
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS account_requests_one_pending
+        ON account_requests (provider, provider_id) WHERE status = 'pending'
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS account_requests_by_status
+        ON account_requests (status, requested_at)
+    `);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
 export const MIGRATIONS: Migration[] = [
@@ -334,6 +427,8 @@ export const MIGRATIONS: Migration[] = [
   migration007,
   migration008,
   migration009,
+  migration010,
+  migration011,
 ];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
