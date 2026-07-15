@@ -21,6 +21,15 @@
 // (lossless WebP for graphics/alpha where it fits, quality-92 WebP otherwise)
 // so quality is preserved, never gratuitously degraded.
 //
+// GUARANTEED FIT: if even 1920px @ q60 doesn't fit (genuinely incompressible
+// content — e.g. photographic noise), the ladder does NOT give up: the longest
+// side keeps stepping down below 1920 (1600→1280→1024→800→640, then halving,
+// floored at 320px purely as a loop guard), retrying the quality ladder —
+// extended down to q40 — at each step. WebP bytes fall roughly quadratically
+// with dimension, so this always converges. A decodable image is therefore
+// ALWAYS stored at ≤ 10MB; UnsupportedImageError is reserved for inputs sharp
+// cannot decode (not an image / corrupt), never for "too big".
+//
 // hash = sha256 of the FINAL stored bytes — content-addressed, so re-uploading
 // the same image dedupes onto the existing (slug, hash) row, and the serve
 // route can cache immutably (same bytes forever for a given URL).
@@ -47,6 +56,16 @@ export const MAX_RAW_BYTES = 50 * 1024 * 1024; // 50MB
 const QUALITY_STEPS = [92, 85, 78, 70, 60];
 const DIMENSION_STEPS = [4096, 3200, 2560, 1920];
 
+// GUARANTEED-FIT stage (see the policy note): dimension steps below the
+// quality-preserving ladder's 1920px floor, each retried down the quality
+// ladder extended to a q40 floor. Past the listed steps the dimension halves
+// until MIN_GUARANTEED_DIMENSION — that floor exists only to bound the loop
+// (a 320px q40 WebP is a few KB, never anywhere near 10MB), it is never the
+// binding constraint for fitting.
+const GUARANTEED_QUALITY_STEPS = [...QUALITY_STEPS, 50, 40];
+const GUARANTEED_DIMENSION_STEPS = [1600, 1280, 1024, 800, 640];
+const MIN_GUARANTEED_DIMENSION = 320;
+
 // The absolute origin that serves deck assets — the SAME env var uploaded-decks
 // uses for /d-content, because /d-assets lives on the same isolated deck host.
 // Unset → a relative URL (decks reference assets root-relative anyway, which
@@ -58,9 +77,10 @@ export function assetUrlFor(slug: string, hash: string): string {
   return DECK_ORIGIN ? `${DECK_ORIGIN}${path}` : path;
 }
 
-/** Thrown when the input isn't a decodable image (or can't be brought under the
- *  stored-size cap even at the ladder's floor — practically unreachable).
- *  The route maps this to a 4xx, distinct from DB errors (→ 503). */
+/** Thrown ONLY when the input isn't a decodable image (not an image / corrupt).
+ *  Never thrown for size: the guaranteed-fit stage always compresses a
+ *  decodable image under the cap. The route maps this to a 4xx, distinct from
+ *  DB errors (→ 503). */
 export class UnsupportedImageError extends Error {
   constructor(message: string) {
     super(message);
@@ -127,6 +147,50 @@ async function encodeWebp(
 }
 
 /**
+ * GUARANTEED-FIT stage: keep stepping the longest side down below the main
+ * ladder's 1920px floor (1600→1280→1024→800→640, then halving, floored at
+ * MIN_GUARANTEED_DIMENSION as a pure loop guard), retrying the extended
+ * quality ladder (…→50→40) at every step, and return the FIRST fit — so the
+ * result keeps the largest dimension / highest quality that fits. The new low
+ * qualities (50/40) are first tried once at full resolution; dimension caps
+ * that wouldn't shrink the image are skipped. Returns null only if nothing fit
+ * even at the floor — unreachable for a real image (a 320px q40 WebP is a few
+ * KB) short of pathological many-frame animations, which the caller handles.
+ */
+async function encodeSmallestFit(
+  input: Buffer,
+  animated: boolean,
+  longestSide: number,
+): Promise<EncodeResult | null> {
+  // Finish the quality ladder at full resolution first — q92→60 already
+  // failed there, so only the new low floors (50, 40) are worth an attempt.
+  for (const quality of GUARANTEED_QUALITY_STEPS) {
+    if (QUALITY_STEPS.includes(quality)) continue;
+    const attempt = await encodeWebp(input, animated, { quality });
+    if (attempt.data.length <= MAX_STORED_BYTES) return attempt;
+  }
+
+  let step = 0;
+  let maxDim = GUARANTEED_DIMENSION_STEPS[0];
+  for (;;) {
+    // Skip caps that wouldn't shrink the image (resize would be a no-op —
+    // the full-resolution attempts above already covered that case).
+    if (!(longestSide > 0 && longestSide <= maxDim)) {
+      for (const quality of GUARANTEED_QUALITY_STEPS) {
+        const attempt = await encodeWebp(input, animated, { quality, maxDim });
+        if (attempt.data.length <= MAX_STORED_BYTES) return attempt;
+      }
+    }
+    if (maxDim <= MIN_GUARANTEED_DIMENSION) return null;
+    step += 1;
+    maxDim =
+      step < GUARANTEED_DIMENSION_STEPS.length
+        ? GUARANTEED_DIMENSION_STEPS[step]
+        : Math.max(MIN_GUARANTEED_DIMENSION, Math.floor(maxDim / 2));
+  }
+}
+
+/**
  * Decode, normalize, and compress an uploaded image to the ≤10MB stored form.
  * Implements the exact policy in the file header:
  *   1. Decode with sharp (throws UnsupportedImageError on non-images). All
@@ -140,7 +204,13 @@ async function encodeWebp(
  *   4. Still > 10MB at quality 60 → progressive longest-side caps
  *      4096→3200→2560→1920, each retried down the quality ladder, stopping at
  *      the FIRST fit — resolution gives way before quality collapses further.
- *   5. Nothing fits (practically unreachable at 1920px q60) → reject.
+ *   5. Still > 10MB at 1920px q60 (genuinely incompressible content) →
+ *      GUARANTEED-FIT stage: longest side keeps stepping down below 1920 with
+ *      the quality ladder extended to q40 at each step, converging on a fit
+ *      (WebP bytes fall ~quadratically with dimension). As an absolute last
+ *      resort a pathological many-frame animation is flattened to its first
+ *      frame rather than rejected. A decodable image ALWAYS fits; rejection is
+ *      only for undecodable input.
  */
 async function normalizeImage(input: Buffer): Promise<EncodeResult> {
   let meta: Metadata;
@@ -176,14 +246,29 @@ async function normalizeImage(input: Buffer): Promise<EncodeResult> {
     }
 
     // Resolution steps, each retried down the quality ladder.
+    const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
     for (const maxDim of DIMENSION_STEPS) {
       // Skip caps that wouldn't shrink anything (image already smaller).
-      const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
       if (longest > 0 && longest <= maxDim) continue;
       for (const quality of QUALITY_STEPS) {
         const attempt = await encodeWebp(input, animated, { quality, maxDim });
         if (attempt.data.length <= MAX_STORED_BYTES) return attempt;
       }
+    }
+
+    // GUARANTEED-FIT stage: the quality-preserving ladder above is exhausted
+    // (incompressible content can exceed the cap even at 1920px q60). Keep
+    // shrinking the longest side, retrying the extended quality ladder at
+    // each step — this always converges, so no decodable image is rejected
+    // for size.
+    const fitted = await encodeSmallestFit(input, animated, longest);
+    if (fitted) return fitted;
+    if (animated) {
+      // Absolute last resort: a pathological many-frame animation whose
+      // frames can't jointly fit even at the floor — flatten to the first
+      // frame (still ≤10MB, still an image) rather than reject.
+      const still = await encodeSmallestFit(input, false, longest);
+      if (still) return still;
     }
   } catch (err) {
     if (err instanceof UnsupportedImageError) throw err;
@@ -191,6 +276,8 @@ async function normalizeImage(input: Buffer): Promise<EncodeResult> {
     throw new UnsupportedImageError("undecodable_image");
   }
 
+  // Unreachable in practice: a single 320px q40 WebP frame is a few KB. Kept
+  // as a defensive guard so a sharp regression can never store >10MB bytes.
   throw new UnsupportedImageError("cannot_fit_size_cap");
 }
 
