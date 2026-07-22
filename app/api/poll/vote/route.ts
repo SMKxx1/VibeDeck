@@ -5,6 +5,7 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkRateLimit } from "@/lib/kv";
 import { vote } from "@/lib/poll";
+import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 
 // A VIEWER casts (or changes) their vote on the current poll. Publish-gated like
 // the other viewer live routes; the poll's own state machine enforces one vote per
@@ -15,6 +16,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+const LIVE_ID_RE = /^[A-Za-z0-9_-]{12}$/;
 
 function cleanName(raw: unknown): string {
   return (
@@ -47,7 +49,15 @@ export async function POST(req: Request) {
   const slug = (body.slug ?? "").toString();
   const pollId = (body.pollId ?? "").toString();
   const optionIndex = Number(body.optionIndex);
-  if (!slug || !pollId) return NextResponse.json({ error: "missing_fields" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
+  if (!LIVE_ID_RE.test(pollId)) {
+    return NextResponse.json({ error: "bad_poll_id" }, { status: 400 });
+  }
+  if (!Number.isInteger(optionIndex) || optionIndex < 0) {
+    return NextResponse.json({ error: "bad_option" }, { status: 400 });
+  }
 
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
   const isPresenter = verifySessionToken(token);
@@ -56,13 +66,35 @@ export async function POST(req: Request) {
   }
 
   const name = cleanName(body.name);
-  const rl = await checkRateLimit(`vote:${name}`);
-  if (!rl.allowed) {
-    return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
+  // A generous per-address ceiling accommodates classrooms sharing NAT; the
+  // tighter room+display-name bucket still stops one identity from hammering.
+  const [publicLimit, identityLimit] = await Promise.all([
+    checkPublicRateLimit(req, "poll-vote", `${slug}:${name}`, {
+      max: 1_000,
+      windowSeconds: 60,
+    }),
+    checkRateLimit(`vote:${slug}:${name}`, { max: 30, windowSeconds: 60 }),
+  ]);
+  if (!publicLimit.allowed || !identityLimit.allowed) {
+    return NextResponse.json(
+      {
+        error: "rate_limited",
+        retryAfter: Math.max(publicLimit.retryAfter, identityLimit.retryAfter),
+      },
+      { status: 429 },
+    );
   }
 
-  const result = await vote(slug, pollId, name, optionIndex);
+  let result;
+  try {
+    result = await vote(slug, pollId, name, optionIndex);
+  } catch {
+    return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+  }
   if (!result.ok) {
+    if (result.error === "full") {
+      return NextResponse.json({ error: "poll_full" }, { status: 429 });
+    }
     // no_poll / closed / bad_option — a stale client; 409 so the UI can refetch.
     return NextResponse.json({ error: result.error }, { status: 409 });
   }

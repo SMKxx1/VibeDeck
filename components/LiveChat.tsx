@@ -114,6 +114,10 @@ export function LiveChat({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [accessState, setAccessState] = useState<"checking" | "locked" | "unlocked">("checking");
+  const [accessPassword, setAccessPassword] = useState("");
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // The in-flight ask (stream or explain chip): the Stop control aborts it, and
   // aborting the fetch tells the server to stop generating.
@@ -135,6 +139,20 @@ export function LiveChat({
     };
   }, []);
 
+  useEffect(() => {
+    const ac = new AbortController();
+    fetch("/api/ai-access", { cache: "no-store", signal: ac.signal })
+      .then((res) => (res.ok ? res.json() : { required: true, unlocked: false }))
+      .then((data: { required?: boolean; unlocked?: boolean }) => {
+        if (ac.signal.aborted) return;
+        setAccessState(data.required && !data.unlocked ? "locked" : "unlocked");
+      })
+      .catch((err: unknown) => {
+        if ((err as { name?: string })?.name !== "AbortError") setAccessState("locked");
+      });
+    return () => ac.abort();
+  }, []);
+
   // Suggested questions (#9). Refetch when the active slide changes (and on
   // mount): clear the stale list immediately, debounce so scrubbing through
   // slides doesn't fire a request per slide, and abort a still-pending suggest
@@ -142,6 +160,7 @@ export function LiveChat({
   // { questions: [] } on any problem — so there's no error UI, just nothing.
   useEffect(() => {
     setSuggestions([]);
+    if (accessState !== "unlocked") return;
     const ac = new AbortController();
     suggestAbortRef.current = ac;
     const t = setTimeout(() => {
@@ -170,7 +189,7 @@ export function LiveChat({
       clearTimeout(t);
       ac.abort();
     };
-  }, [slug, slideIndex]);
+  }, [slug, slideIndex, accessState]);
 
   // Streamed question path (#1/#9). Appends the question, then reads the SSE
   // stream and grows the assistant bubble token-by-token. `history` is captured
@@ -240,6 +259,11 @@ export function LiveChat({
           code = ((await res.json()) as { error?: string }).error;
         } catch {
           /* non-JSON body */
+        }
+        if (code === "password_required") {
+          setAccessState("locked");
+          setError(null);
+          return;
         }
         setError(errorMessage(code, res.status));
         return;
@@ -323,6 +347,11 @@ export function LiveChat({
         } catch {
           /* non-JSON body */
         }
+        if (code === "password_required") {
+          setAccessState("locked");
+          setError(null);
+          return;
+        }
         setError(errorMessage(code, res.status));
       } else {
         const data = (await res.json()) as { answer?: string; citations?: Citation[] };
@@ -360,6 +389,35 @@ export function LiveChat({
     askAbortRef.current?.abort();
   }
 
+  async function unlockAi(e: React.FormEvent) {
+    e.preventDefault();
+    if (!accessPassword || accessBusy) return;
+    setAccessBusy(true);
+    setAccessError(null);
+    try {
+      const res = await fetch("/api/ai-access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: accessPassword }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setAccessError(
+          data.error === "rate_limited"
+            ? "Too many attempts — wait a few minutes."
+            : "That class code isn't correct.",
+        );
+        return;
+      }
+      setAccessPassword("");
+      setAccessState("unlocked");
+    } catch {
+      setAccessError("Couldn't verify the class code — try again.");
+    } finally {
+      setAccessBusy(false);
+    }
+  }
+
   const lastRole = messages.length ? messages[messages.length - 1].role : null;
   // Show "thinking…" while a request is in flight and no assistant reply has
   // started streaming yet (covers both the pre-first-token gap and the chip path).
@@ -394,9 +452,17 @@ export function LiveChat({
       </header>
 
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 16px 8px", display: "flex", flexDirection: "column", gap: 12 }}>
-        {messages.length === 0 && !busy && (
+        {accessState === "checking" && (
+          <div style={{ fontSize: 13.5, color: "#6E6A62" }}>Checking AI access…</div>
+        )}
+        {accessState === "locked" && (
           <div style={{ fontSize: 13.5, fontWeight: 300, lineHeight: 1.55, color: "#6E6A62" }}>
-            Hi {name.split(" ")[0]} 👋 — ask me anything about what's on screen. I can also look things up on the web.
+            Enter the class code to use the AI tutor. The code is valid for this browser for eight hours.
+          </div>
+        )}
+        {accessState === "unlocked" && messages.length === 0 && !busy && (
+          <div style={{ fontSize: 13.5, fontWeight: 300, lineHeight: 1.55, color: "#6E6A62" }}>
+            Hi {name.split(" ")[0]} 👋 — ask me anything about what’s on screen. I can also look things up on the web.
           </div>
         )}
         {messages.map((m, i) => (
@@ -434,6 +500,50 @@ export function LiveChat({
       </div>
 
       <div style={{ borderTop: "1px solid rgba(60,55,45,0.12)", background: "rgba(248,247,243,0.55)" }}>
+        {accessState === "locked" ? (
+          <form onSubmit={unlockAi} style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="password"
+                value={accessPassword}
+                onChange={(e) => setAccessPassword(e.target.value)}
+                placeholder="Class code"
+                autoComplete="current-password"
+                maxLength={256}
+                autoFocus
+                style={{
+                  flex: 1,
+                  height: 42,
+                  padding: "0 14px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(60,55,45,0.18)",
+                  background: "rgba(255,255,255,0.85)",
+                  fontFamily: "inherit",
+                  fontSize: 14,
+                  color: "#2C2A31",
+                }}
+              />
+              <button
+                type="submit"
+                disabled={!accessPassword || accessBusy}
+                style={{
+                  minWidth: 82,
+                  height: 42,
+                  borderRadius: 12,
+                  border: "none",
+                  background: accessPassword && !accessBusy ? "#2C2A31" : "#B7B2A8",
+                  color: "#F4F2EC",
+                  fontFamily: "inherit",
+                  cursor: accessPassword && !accessBusy ? "pointer" : "default",
+                }}
+              >
+                {accessBusy ? "Checking…" : "Unlock"}
+              </button>
+            </div>
+            {accessError && <div role="alert" style={{ fontSize: 12.5, color: "#C23B27" }}>{accessError}</div>}
+          </form>
+        ) : accessState === "checking" ? null : (
+          <>
         {/* Suggested questions (#9) — tapping one submits it as a streamed question. */}
         {!busy && suggestions.length > 0 && (
           <div style={{ padding: "10px 12px 2px", display: "flex", flexDirection: "column", gap: 6 }}>
@@ -502,6 +612,8 @@ export function LiveChat({
             {busy ? "■" : "↑"}
           </button>
         </form>
+          </>
+        )}
       </div>
     </aside>
   );

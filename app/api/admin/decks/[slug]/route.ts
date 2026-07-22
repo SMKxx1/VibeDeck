@@ -3,13 +3,8 @@ import { cookies } from "next/headers";
 import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
-import {
-  deleteUploadedDeck,
-  getUploadedDeckDeletionInfo,
-  replaceUploadedDeckHtml,
-} from "@/lib/uploaded-decks";
+import { deleteUploadedDeck, replaceUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
-import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { clearSession } from "@/lib/session";
 import { clearPinboard } from "@/lib/pinboard";
 import { clearPresence } from "@/lib/presence";
@@ -100,17 +95,18 @@ export async function PUT(req: Request, { params }: { params: Promise<{ slug: st
   // presenter deliberately set to a given visibility.
   let result: "ok" | "not_found";
   try {
-    result = await replaceUploadedDeckHtml(slug, html);
+    result = await replaceUploadedDeckHtml(
+      slug,
+      html,
+      validation.slides,
+      validation.slideCount,
+    );
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
   }
   if (result === "not_found") {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
-
-  // Re-derive the deck's grounding from the new bundle (and drop any grounding for
-  // slides the replacement removed). Best-effort, same as upload.
-  await replaceUploadedDeckSlides(slug, validation.slides);
 
   return NextResponse.json({ slug, warnings: validation.warnings });
 }
@@ -134,34 +130,23 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ slug:
     return NextResponse.json({ error: perm.error }, { status: perm.status });
   }
 
-  // Look up first: only a kind='uploaded' row is deletable through this flow.
-  let info: { publishStatus: string } | null;
+  // The store locks the row and checks main status in the same transaction as
+  // deletion, so promotion cannot race this guard.
+  let result: Awaited<ReturnType<typeof deleteUploadedDeck>>;
   try {
-    info = await getUploadedDeckDeletionInfo(slug);
+    result = await deleteUploadedDeck(slug); // deck_slides cascade via the FK
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
-  }
-  // Registry slug or missing → not managed here. Registry decks live in code and
-  // are not deletable/replaceable via this flow.
-  if (!info) {
-    return NextResponse.json({ error: "not_deletable" }, { status: 409 });
   }
   // The main deck must be EXPLICITLY demoted first (via /api/admin/publish) — we
   // never auto-demote as a delete side effect. This app prefers explicit state
   // transitions to implicit cascades, and an implicit demote here would silently
   // blank "/" as a bonus surprise.
-  if (info.publishStatus === "main") {
+  if (result === "main") {
     return NextResponse.json({ error: "demote_first" }, { status: 409 });
   }
-
-  let deleted: boolean;
-  try {
-    deleted = await deleteUploadedDeck(slug); // deck_slides cascade via the FK
-  } catch {
-    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
-  }
-  if (!deleted) {
-    // Raced with another delete between the lookup and here — already gone.
+  if (result === "not_found") {
+    // Registry slug, missing row, or a concurrent delete → not managed here.
     return NextResponse.json({ error: "not_deletable" }, { status: 409 });
   }
 

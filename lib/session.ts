@@ -10,7 +10,7 @@
 // instance only). A tiny in-instance read cache dedupes bursts of viewer polls so
 // a room of phones doesn't hammer Redis.
 
-import { getRedis } from "./redis";
+import { getRedis, hasRedis, type RedisClient } from "./redis";
 
 export interface SessionState {
   index: number;
@@ -37,6 +37,9 @@ export function isLive(state: SessionState): boolean {
 
 const DEFAULT: SessionState = { index: 0, max: 0, updatedAt: 0, seenAt: 0 };
 const keyFor = (slug: string) => `live:session:${slug}`;
+const TTL_S = 60 * 60 * 8;
+const MEM_TTL_MS = TTL_S * 1000;
+const MAX_MEM_SESSIONS = 500;
 
 // Store the in-memory fallback on globalThis so Next's dev hot-reload (which
 // re-evaluates modules) doesn't wipe the live session between edits. In
@@ -45,7 +48,55 @@ const g = globalThis as unknown as { __liveSessionMem?: Map<string, SessionState
 const mem = (g.__liveSessionMem ??= new Map<string, SessionState>());
 
 const CACHE_MS = 750;
+const MAX_CACHE_ENTRIES = 1_000;
 const cache = new Map<string, { at: number; state: SessionState }>();
+
+const MUTATE_SESSION_SCRIPT = `
+local raw = redis.call('GET', KEYS[1])
+local state = { index = 0, max = 0, updatedAt = 0, seenAt = 0 }
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == 'table' then state = decoded end
+end
+
+state.index = math.max(0, math.floor(tonumber(state.index) or 0))
+state.max = math.max(0, math.floor(tonumber(state.max) or state.index))
+state.updatedAt = tonumber(state.updatedAt) or 0
+state.seenAt = tonumber(state.seenAt) or 0
+if type(state.driverId) ~= 'string' or state.driverId == '' then state.driverId = nil end
+
+local action = ARGV[1]
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local requestedIndex = math.max(0, math.floor(tonumber(ARGV[4]) or 0))
+local driverId = ARGV[5]
+
+if action == 'move' then
+  if driverId ~= '' and state.driverId and state.driverId ~= driverId then
+    return cjson.encode(state)
+  end
+  state.index = requestedIndex
+  state.max = math.max(state.max, requestedIndex)
+  state.updatedAt = now
+  state.seenAt = now
+  if not state.driverId and driverId ~= '' then state.driverId = driverId end
+elseif action == 'take' then
+  state.driverId = driverId
+  state.seenAt = now
+elseif action == 'reset' then
+  state.max = state.index
+  state.updatedAt = now
+  state.seenAt = now
+elseif action == 'heartbeat' then
+  state.seenAt = now
+else
+  return redis.error_reply('unknown session action')
+end
+
+local encoded = cjson.encode(state)
+redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+return encoded
+`;
 
 function normalize(s: unknown): SessionState | null {
   if (!s || typeof s !== "object") return null;
@@ -60,32 +111,138 @@ function normalize(s: unknown): SessionState | null {
   };
 }
 
+function cacheState(slug: string, state: SessionState, now = Date.now()): void {
+  if (cache.size >= MAX_CACHE_ENTRIES && !cache.has(slug)) {
+    for (const [key, entry] of cache) {
+      if (now - entry.at >= CACHE_MS) cache.delete(key);
+    }
+    while (cache.size >= MAX_CACHE_ENTRIES) {
+      const oldest = cache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      cache.delete(oldest);
+    }
+  }
+  cache.set(slug, { at: now, state });
+}
+
+function sweepMemory(now: number): void {
+  if (mem.size < MAX_MEM_SESSIONS) return;
+  for (const [slug, state] of mem) {
+    const last = Math.max(state.updatedAt, state.seenAt);
+    if (last <= 0 || now - last >= MEM_TTL_MS) {
+      mem.delete(slug);
+      cache.delete(slug);
+    }
+  }
+  while (mem.size >= MAX_MEM_SESSIONS) {
+    const oldest = mem.keys().next().value as string | undefined;
+    if (!oldest) break;
+    mem.delete(oldest);
+    cache.delete(oldest);
+  }
+}
+
+function readMemory(slug: string, now = Date.now()): SessionState {
+  const state = mem.get(slug);
+  if (!state) return DEFAULT;
+  const last = Math.max(state.updatedAt, state.seenAt);
+  if (last <= 0 || now - last >= MEM_TTL_MS) {
+    mem.delete(slug);
+    cache.delete(slug);
+    return DEFAULT;
+  }
+  return state;
+}
+
 /** Fresh read (bypasses the poll cache) — for presenter writes. */
 async function readRaw(slug: string): Promise<SessionState> {
+  if (!hasRedis()) return readMemory(slug);
   const redis = await getRedis();
   if (redis) {
     try {
       const s = normalize(await redis.get<SessionState>(keyFor(slug)));
       if (s) return s;
     } catch {
-      /* fall through to memory */
+      return DEFAULT;
     }
   }
-  return mem.get(slug) ?? DEFAULT;
+  return DEFAULT;
 }
 
-async function persist(slug: string, state: SessionState): Promise<void> {
+function persistMemory(slug: string, state: SessionState): SessionState {
+  sweepMemory(Date.now());
   mem.set(slug, state);
-  cache.set(slug, { at: Date.now(), state });
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      // 8h TTL: a session key shouldn't outlive the day it was presented.
-      await redis.set(keyFor(slug), state, { ex: 60 * 60 * 8 });
-    } catch {
-      /* best-effort; memory still holds it for this instance */
-    }
+  cacheState(slug, state);
+  return state;
+}
+
+type SessionAction = "move" | "take" | "reset" | "heartbeat";
+
+function mutateMemory(
+  slug: string,
+  action: SessionAction,
+  index = 0,
+  driverId = "",
+): SessionState {
+  const prev = readMemory(slug);
+  const now = Date.now();
+  if (action === "move" && driverId && prev.driverId && prev.driverId !== driverId) {
+    return prev;
   }
+  let next: SessionState;
+  if (action === "move") {
+    const idx = Math.max(0, Math.floor(index));
+    next = {
+      index: idx,
+      max: Math.max(prev.max, idx),
+      updatedAt: now,
+      seenAt: now,
+      ...(prev.driverId ?? driverId ? { driverId: prev.driverId ?? driverId } : {}),
+    };
+  } else if (action === "take") {
+    next = { ...prev, driverId, seenAt: now };
+  } else if (action === "reset") {
+    next = { ...prev, max: prev.index, updatedAt: now, seenAt: now };
+  } else {
+    next = { ...prev, seenAt: now };
+  }
+  return persistMemory(slug, next);
+}
+
+async function mutateRedis(
+  redis: RedisClient,
+  slug: string,
+  action: SessionAction,
+  index = 0,
+  driverId = "",
+): Promise<SessionState> {
+  const raw = await redis.eval<string>(
+    MUTATE_SESSION_SCRIPT,
+    [keyFor(slug)],
+    [action, Date.now(), TTL_S, index, driverId],
+  );
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    /* normalize below turns a malformed script response into a write failure */
+  }
+  const state = normalize(parsed);
+  if (!state) throw new Error("session_state_unavailable");
+  cacheState(slug, state);
+  return state;
+}
+
+async function mutate(
+  slug: string,
+  action: SessionAction,
+  index = 0,
+  driverId = "",
+): Promise<SessionState> {
+  if (!hasRedis()) return mutateMemory(slug, action, index, driverId);
+  const redis = await getRedis();
+  if (!redis) throw new Error("session_store_unavailable");
+  return mutateRedis(redis, slug, action, index, driverId);
 }
 
 /** Cached read — what viewers poll. */
@@ -94,7 +251,7 @@ export async function getSession(slug: string): Promise<SessionState> {
   const c = cache.get(slug);
   if (c && now - c.at < CACHE_MS) return c.state;
   const state = await readRaw(slug);
-  cache.set(slug, { at: now, state });
+  cacheState(slug, state, now);
   return state;
 }
 
@@ -108,19 +265,27 @@ export async function getSession(slug: string): Promise<SessionState> {
  * Callers that pass no driverId (legacy behavior) drive unconditionally, as today.
  */
 export async function setPresenterIndex(slug: string, index: number, driverId?: string): Promise<SessionState> {
-  const prev = await readRaw(slug);
-  if (driverId && prev.driverId && prev.driverId !== driverId) return prev;
-  const idx = Math.max(0, Math.floor(index));
-  const now = Date.now();
-  const next: SessionState = {
-    index: idx,
-    max: Math.max(prev.max, idx),
-    updatedAt: now,
-    seenAt: now,
-    ...(prev.driverId ?? driverId ? { driverId: prev.driverId ?? driverId } : {}),
-  };
-  await persist(slug, next);
-  return next;
+  return mutate(slug, "move", Math.max(0, Math.floor(index)), driverId ?? "");
+}
+
+/**
+ * Internal companion for a transition that must update another in-memory live
+ * store in the same event-loop turn. Production Redis callers must use an
+ * atomic multi-key script instead; accepting them here would reintroduce the
+ * split-brain fallback this module deliberately prevents.
+ */
+export function setPresenterIndexMemoryOnly(
+  slug: string,
+  index: number,
+  driverId?: string,
+): SessionState {
+  if (hasRedis()) throw new Error("memory_session_disabled");
+  return mutateMemory(slug, "move", Math.max(0, Math.floor(index)), driverId ?? "");
+}
+
+/** Drop a short-lived read snapshot after another live-state script wrote this key. */
+export function invalidateSessionCache(slug: string): void {
+  cache.delete(slug);
 }
 
 /**
@@ -129,10 +294,7 @@ export async function setPresenterIndex(slug: string, index: number, driverId?: 
  * are untouched; seenAt bumps so the claim also counts as presenter liveness.
  */
 export async function takeClicker(slug: string, driverId: string): Promise<SessionState> {
-  const prev = await readRaw(slug);
-  const next: SessionState = { ...prev, driverId, seenAt: Date.now() };
-  await persist(slug, next);
-  return next;
+  return mutate(slug, "take", 0, driverId);
 }
 
 /** Who holds the clicker (undefined = unclaimed — first presenter to drive wins). */
@@ -142,25 +304,12 @@ export async function getDriverId(slug: string): Promise<string | undefined> {
 
 /** Presenter hit "reset lock": the current slide becomes the viewer ceiling. */
 export async function resetLock(slug: string): Promise<SessionState> {
-  const prev = await readRaw(slug);
-  const now = Date.now();
-  const next: SessionState = {
-    index: prev.index,
-    max: prev.index,
-    updatedAt: now,
-    seenAt: now,
-    ...(prev.driverId ? { driverId: prev.driverId } : {}),
-  };
-  await persist(slug, next);
-  return next;
+  return mutate(slug, "reset");
 }
 
 /** Presenter is still here — keep the session "live" without changing position. */
 export async function heartbeat(slug: string): Promise<SessionState> {
-  const prev = await readRaw(slug);
-  const next: SessionState = { ...prev, seenAt: Date.now() };
-  await persist(slug, next);
-  return next;
+  return mutate(slug, "heartbeat");
 }
 
 /**
@@ -173,6 +322,7 @@ export async function heartbeat(slug: string): Promise<SessionState> {
 export async function clearSession(slug: string): Promise<void> {
   mem.delete(slug);
   cache.delete(slug);
+  if (!hasRedis()) return;
   const redis = await getRedis();
   if (redis) {
     try {

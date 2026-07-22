@@ -4,7 +4,8 @@ import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkRateLimit } from "@/lib/kv";
-import { addQuestion, upvote, setAnswered, setDismissed, getQuestions } from "@/lib/qna";
+import { addQuestion, upvote, setAnswered, setDismissed, getQuestions, MAX_TEXT } from "@/lib/qna";
+import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 
 // Upvotable Q&A queue (#5).
 //   GET  ?slug=            — the queue (publish-gated; the presenter also sees
@@ -17,6 +18,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+const LIVE_ID_RE = /^[A-Za-z0-9_-]{12}$/;
 
 function cleanName(raw: unknown): string {
   return (
@@ -36,7 +38,9 @@ async function isPresenterReq(): Promise<boolean> {
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
   const isPresenter = await isPresenterReq();
   if (!(await isDeckViewable(slug, isPresenter))) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
@@ -65,7 +69,9 @@ export async function POST(req: Request) {
   }
   const slug = (body.slug ?? "").toString();
   const action = (body.action ?? "").toString();
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
 
   // --- Presenter curation (answer / dismiss / undismiss) ---
   if (action === "answer" || action === "dismiss" || action === "undismiss") {
@@ -73,11 +79,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "forbidden" }, { status: 403 });
     }
     const qid = (body.qid ?? "").toString();
-    if (!qid) return NextResponse.json({ error: "missing_qid" }, { status: 400 });
-    const ok =
-      action === "answer"
-        ? await setAnswered(slug, qid, true)
-        : await setDismissed(slug, qid, action === "dismiss");
+    if (!LIVE_ID_RE.test(qid)) {
+      return NextResponse.json({ error: "bad_qid" }, { status: 400 });
+    }
+    let ok: boolean;
+    try {
+      ok =
+        action === "answer"
+          ? await setAnswered(slug, qid, true)
+          : await setDismissed(slug, qid, action === "dismiss");
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
     if (!ok) return NextResponse.json({ error: "not_found" }, { status: 404 });
     const questions = await getQuestions(slug, true);
     return NextResponse.json({ ok: true, questions }, { headers: NO_STORE });
@@ -91,24 +104,65 @@ export async function POST(req: Request) {
   const name = cleanName(body.name);
 
   if (action === "ask") {
-    const rl = await checkRateLimit(`qna:${name}`);
-    if (!rl.allowed) {
-      return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
+    const text = (body.text ?? "").toString();
+    if (!text.trim() || text.length > MAX_TEXT) {
+      return NextResponse.json({ error: "bad_question" }, { status: 400 });
     }
-    const q = await addQuestion(slug, name, (body.text ?? "").toString());
-    if (!q) return NextResponse.json({ error: "rejected" }, { status: 400 }); // empty or queue full
+    const [publicLimit, identityLimit] = await Promise.all([
+      checkPublicRateLimit(req, "qna-ask", `${slug}:${name}`, {
+        max: 1_000,
+        windowSeconds: 60,
+      }),
+      checkRateLimit(`qna:${slug}:${name}`, { max: 10, windowSeconds: 60 }),
+    ]);
+    if (!publicLimit.allowed || !identityLimit.allowed) {
+      return NextResponse.json(
+        {
+          error: "rate_limited",
+          retryAfter: Math.max(publicLimit.retryAfter, identityLimit.retryAfter),
+        },
+        { status: 429 },
+      );
+    }
+    let q;
+    try {
+      q = await addQuestion(slug, name, text);
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
+    if (!q) return NextResponse.json({ error: "queue_full" }, { status: 429 });
     return NextResponse.json({ ok: true, question: q }, { headers: NO_STORE });
   }
 
   if (action === "upvote") {
     const qid = (body.qid ?? "").toString();
-    if (!qid) return NextResponse.json({ error: "missing_qid" }, { status: 400 });
-    const rl = await checkRateLimit(`qnavote:${name}`);
-    if (!rl.allowed) {
-      return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
+    if (!LIVE_ID_RE.test(qid)) {
+      return NextResponse.json({ error: "bad_qid" }, { status: 400 });
     }
-    const votes = await upvote(slug, qid, name);
+    const [publicLimit, identityLimit] = await Promise.all([
+      checkPublicRateLimit(req, "qna-upvote", `${slug}:${name}`, {
+        max: 1_000,
+        windowSeconds: 60,
+      }),
+      checkRateLimit(`qnavote:${slug}:${name}`, { max: 60, windowSeconds: 60 }),
+    ]);
+    if (!publicLimit.allowed || !identityLimit.allowed) {
+      return NextResponse.json(
+        {
+          error: "rate_limited",
+          retryAfter: Math.max(publicLimit.retryAfter, identityLimit.retryAfter),
+        },
+        { status: 429 },
+      );
+    }
+    let votes;
+    try {
+      votes = await upvote(slug, qid, name);
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
     if (votes === null) return NextResponse.json({ error: "not_found" }, { status: 404 });
+    if (votes === "full") return NextResponse.json({ error: "vote_full" }, { status: 429 });
     return NextResponse.json({ ok: true, votes }, { headers: NO_STORE });
   }
 

@@ -3,6 +3,7 @@ import { AUTH_COOKIE, SESSION_MAX_AGE, createSessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getUserByEmail, verifyPassword, checkLoginRateLimit } from "@/lib/users";
 import { DUMMY_HASH } from "@/lib/password";
+import { checkPublicRateLimit } from "@/lib/request-security";
 
 // Login (Phase 4): email/username + password against the users table (scrypt).
 // The seeded admin's identifier is PRESENTER_USERNAME (may be a plain username,
@@ -30,8 +31,16 @@ export async function POST(req: Request) {
   }
   const identifier = (body.email ?? body.username ?? "").toString().trim();
   const password = (body.password ?? "").toString();
-  if (!identifier || !password) {
+  if (!identifier || identifier.length > 320 || !password || password.length > 200) {
     return NextResponse.json({ error: "invalid_credentials" }, { status: 401 });
+  }
+
+  const ingressLimit = await checkPublicRateLimit(req, "login", "global", {
+    max: 30,
+    windowSeconds: 5 * 60,
+  });
+  if (!ingressLimit.allowed) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
   // Rate-limit per identifier BEFORE scrypt — the hash cost must not be a DoS on
@@ -40,7 +49,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
-  const user = await getUserByEmail(identifier);
+  let user: Awaited<ReturnType<typeof getUserByEmail>>;
+  try {
+    user = await getUserByEmail(identifier);
+  } catch {
+    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
+  }
   // ALWAYS run scrypt — against a fixed dummy hash when the user is absent — so a
   // missing account costs the same as a real one (no user-enumeration timing
   // oracle). The dummy hash can never match a real password. The response is a

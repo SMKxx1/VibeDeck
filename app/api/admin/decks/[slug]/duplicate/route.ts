@@ -11,7 +11,6 @@ import {
   insertUploadedDeck,
 } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
-import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { copyAssets } from "@/lib/deck-assets";
 
 // Owner-gated DUPLICATE (POST) — fork an existing uploaded deck into a brand-new
@@ -135,6 +134,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
       description: meta.description ?? null,
       html: forkHtml,
       ownerId: session.userId, // the fork belongs to whoever duplicated it
+      slideCount: validation.slideCount,
+      slides: validation.slides,
     });
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
@@ -142,11 +143,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
   if (result === "conflict") {
     return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
   }
-
-  // Copy the source's per-slide AI grounding + speaker notes onto the fork, derived
-  // from its validated bundle (best-effort, same as the create route — a DB hiccup
-  // here just leaves the fork's grounding empty, it doesn't fail the stored copy).
-  await replaceUploadedDeckSlides(newSlug, validation.slides);
 
   // Copy the source's stored vault assets onto the fork so it owns its OWN
   // deck_assets rows (the html above already points at /d-assets/<newSlug>/…).

@@ -9,7 +9,7 @@
 // concurrent upvotes converge without a lost-update read-modify-write on a count.
 
 import { randomBytes } from "crypto";
-import { getRedis } from "./redis";
+import { getRedis, hasRedis, type RedisClient } from "./redis";
 
 export interface Question {
   id: string;
@@ -31,24 +31,86 @@ interface QRecord {
 
 export const MAX_QUESTIONS = 200;
 export const MAX_TEXT = 400;
+export const MAX_UPVOTES_PER_QUESTION = 1_000;
 
 const qKey = (slug: string) => `live:qna:${slug}`;
 const cKey = (slug: string) => `live:qnacount:${slug}`;
 const vKey = (slug: string, id: string) => `live:qnavoters:${slug}:${id}`;
 const TTL_S = 60 * 60 * 8;
+const MEM_TTL_MS = TTL_S * 1000;
+const MAX_MEM_ROOMS = 500;
+
+const ADD_QUESTION_SCRIPT = `
+if redis.call('HLEN', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`;
+
+const UPVOTE_SCRIPT = `
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then return -1 end
+local exists = redis.call('HEXISTS', KEYS[2], ARGV[2])
+if exists == 0 and redis.call('HLEN', KEYS[2]) >= tonumber(ARGV[3]) then return -2 end
+redis.call('HSET', KEYS[2], ARGV[2], 1)
+local count = redis.call('HLEN', KEYS[2])
+redis.call('HSET', KEYS[3], ARGV[1], count)
+local ttl = tonumber(ARGV[4])
+redis.call('EXPIRE', KEYS[1], ttl)
+redis.call('EXPIRE', KEYS[2], ttl)
+redis.call('EXPIRE', KEYS[3], ttl)
+return count
+`;
+
+const PATCH_QUESTION_SCRIPT = `
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 0 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then return 0 end
+record[ARGV[2]] = ARGV[3] == '1'
+redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(record))
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`;
 
 const g = globalThis as unknown as {
   __qnaMem?: Map<string, Map<string, QRecord>>;
   __qnaVotesMem?: Map<string, Map<string, Set<string>>>; // slug -> qid -> voter names
+  __qnaMemAt?: Map<string, number>;
 };
 const qMem = (g.__qnaMem ??= new Map<string, Map<string, QRecord>>());
 const vMem = (g.__qnaVotesMem ??= new Map<string, Map<string, Set<string>>>());
+const memAt = (g.__qnaMemAt ??= new Map<string, number>());
 
 function newId(): string {
   return randomBytes(9).toString("base64url");
 }
 function cleanText(raw: string): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, MAX_TEXT);
+}
+
+function sweepMemory(now: number): void {
+  for (const [slug, questions] of qMem) {
+    const fallbackAt = Math.max(0, ...Array.from(questions.values(), (record) => record.at));
+    const at = memAt.get(slug) ?? fallbackAt;
+    if (now - at >= MEM_TTL_MS) {
+      qMem.delete(slug);
+      vMem.delete(slug);
+      memAt.delete(slug);
+    }
+  }
+  while (qMem.size >= MAX_MEM_ROOMS) {
+    const slug = qMem.keys().next().value as string | undefined;
+    if (!slug) break;
+    qMem.delete(slug);
+    vMem.delete(slug);
+    memAt.delete(slug);
+  }
+}
+
+async function requireRedis(): Promise<RedisClient> {
+  const redis = await getRedis();
+  if (!redis) throw new Error("qna_store_unavailable");
+  return redis;
 }
 
 /** Post a new question. Returns null when the queue is full. */
@@ -61,18 +123,18 @@ export async function addQuestion(
   if (!text) return null;
   const rec: QRecord = { name: name.slice(0, 40) || "Someone", text, at: Date.now(), answered: false, dismissed: false };
   const id = newId();
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      const existing = await redis.hgetall<QRecord>(qKey(slug));
-      if (Object.keys(existing).length >= MAX_QUESTIONS) return null;
-      await redis.hset(qKey(slug), id, rec);
-      await redis.expire(qKey(slug), TTL_S);
-      return { id, ...rec, votes: 0 };
-    } catch {
-      /* fall through */
-    }
+  if (hasRedis()) {
+    const redis = await requireRedis();
+    const added = Number(
+      await redis.eval<number>(
+        ADD_QUESTION_SCRIPT,
+        [qKey(slug)],
+        [id, JSON.stringify(rec), MAX_QUESTIONS, TTL_S],
+      ),
+    );
+    return added === 1 ? { id, ...rec, votes: 0 } : null;
   }
+  sweepMemory(rec.at);
   let m = qMem.get(slug);
   if (!m) {
     m = new Map();
@@ -80,27 +142,30 @@ export async function addQuestion(
   }
   if (m.size >= MAX_QUESTIONS) return null;
   m.set(id, rec);
+  memAt.set(slug, rec.at);
   return { id, ...rec, votes: 0 };
 }
 
 /** Upvote (idempotent per name). Returns the new distinct-voter count. */
-export async function upvote(slug: string, id: string, name: string): Promise<number | null> {
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      const q = await redis.hgetall<QRecord>(qKey(slug));
-      if (!q[id]) return null; // no such question
-      await redis.hset(vKey(slug, id), name, 1);
-      await redis.expire(vKey(slug, id), TTL_S);
-      const voters = await redis.hgetall<number>(vKey(slug, id));
-      const count = Object.keys(voters).length;
-      await redis.hset(cKey(slug), id, count);
-      await redis.expire(cKey(slug), TTL_S);
-      return count;
-    } catch {
-      /* fall through */
-    }
+export async function upvote(
+  slug: string,
+  id: string,
+  name: string,
+): Promise<number | null | "full"> {
+  if (hasRedis()) {
+    const redis = await requireRedis();
+    const result = Number(
+      await redis.eval<number>(
+        UPVOTE_SCRIPT,
+        [qKey(slug), vKey(slug, id), cKey(slug)],
+        [id, name, MAX_UPVOTES_PER_QUESTION, TTL_S],
+      ),
+    );
+    if (result === -1) return null;
+    if (result === -2) return "full";
+    return result;
   }
+  sweepMemory(Date.now());
   const qm = qMem.get(slug);
   if (!qm || !qm.has(id)) return null;
   let vm = vMem.get(slug);
@@ -113,18 +178,23 @@ export async function upvote(slug: string, id: string, name: string): Promise<nu
     set = new Set();
     vm.set(id, set);
   }
+  if (!set.has(name) && set.size >= MAX_UPVOTES_PER_QUESTION) return "full";
   set.add(name);
+  memAt.set(slug, Date.now());
   return set.size;
 }
 
 /** The queue, sorted by votes desc then oldest-first. `includeHidden` for presenter. */
 export async function getQuestions(slug: string, includeHidden: boolean): Promise<Question[]> {
-  const redis = await getRedis();
   let list: Question[] = [];
-  if (redis) {
+  if (hasRedis()) {
+    const redis = await getRedis();
     try {
-      const recs = await redis.hgetall<QRecord>(qKey(slug));
-      const counts = await redis.hgetall<number>(cKey(slug));
+      if (!redis) return [];
+      const [recs, counts] = await Promise.all([
+        redis.hgetall<QRecord>(qKey(slug)),
+        redis.hgetall<number>(cKey(slug)),
+      ]);
       list = Object.entries(recs).map(([id, r]) => ({
         id,
         name: r.name,
@@ -138,6 +208,7 @@ export async function getQuestions(slug: string, includeHidden: boolean): Promis
       list = []; // Redis blip → degrade to empty (same stance as the other reads)
     }
   } else {
+    sweepMemory(Date.now());
     const qm = qMem.get(slug);
     const vm = vMem.get(slug);
     if (qm) {
@@ -157,22 +228,26 @@ export async function getQuestions(slug: string, includeHidden: boolean): Promis
 }
 
 async function patch(slug: string, id: string, fields: Partial<QRecord>): Promise<boolean> {
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      const q = await redis.hgetall<QRecord>(qKey(slug));
-      const rec = q[id];
-      if (!rec) return false;
-      await redis.hset(qKey(slug), id, { ...rec, ...fields });
-      return true;
-    } catch {
-      /* fall through */
-    }
+  const field = fields.answered !== undefined ? "answered" : "dismissed";
+  const value = field === "answered" ? fields.answered === true : fields.dismissed === true;
+  if (hasRedis()) {
+    const redis = await requireRedis();
+    return (
+      Number(
+        await redis.eval<number>(
+          PATCH_QUESTION_SCRIPT,
+          [qKey(slug)],
+          [id, field, value ? 1 : 0, TTL_S],
+        ),
+      ) === 1
+    );
   }
+  sweepMemory(Date.now());
   const qm = qMem.get(slug);
   const rec = qm?.get(id);
   if (!rec) return false;
   qm!.set(id, { ...rec, ...fields });
+  memAt.set(slug, Date.now());
   return true;
 }
 
@@ -187,6 +262,8 @@ export function setDismissed(slug: string, id: string, dismissed: boolean): Prom
 export async function clearQna(slug: string): Promise<void> {
   qMem.delete(slug);
   vMem.delete(slug);
+  memAt.delete(slug);
+  if (!hasRedis()) return;
   const redis = await getRedis();
   if (redis) {
     try {

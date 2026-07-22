@@ -10,6 +10,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 // ?error= codes minted by app/api/auth/google/callback → friendly copy.
 function oauthErrorMessage(code: string): string {
@@ -241,9 +242,9 @@ export function LoginForm({
           </div>
         )}
 
-        <a href="/" style={{ fontSize: 12.5, color: "#8A857C", textDecoration: "none", textAlign: "center" }}>
+        <Link href="/" style={{ fontSize: 12.5, color: "#8A857C", textDecoration: "none", textAlign: "center" }}>
           ← I&apos;m a viewer, take me to the deck
-        </a>
+        </Link>
       </form>
     </main>
   );

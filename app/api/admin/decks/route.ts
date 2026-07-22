@@ -5,7 +5,6 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { staticDecks } from "@/lib/decks/static";
 import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
-import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 
 // Presenter-gated deck UPLOAD — THE route that first lets new deck content enter
 // the system at runtime. Containment is NOT this route's job: the origin
@@ -180,6 +179,8 @@ export async function POST(req: Request) {
       description,
       html,
       ownerId: session.userId, // null for a legacy admin cookie — an admin can manage anything anyway
+      slideCount: validation.slideCount,
+      slides: validation.slides,
     });
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
@@ -187,11 +188,6 @@ export async function POST(req: Request) {
   if (result === "conflict") {
     return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
   }
-
-  // Populate the deck's per-slide AI grounding + presenter notes from its
-  // validated bundle so it works with the AI tutor immediately (best-effort — a
-  // DB hiccup here just leaves grounding empty, it doesn't fail the stored upload).
-  await replaceUploadedDeckSlides(slug, validation.slides);
 
   return NextResponse.json({ slug, warnings: validation.warnings }, { status: 201 });
 }

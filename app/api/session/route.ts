@@ -7,6 +7,7 @@ import { isDeckViewable } from "@/lib/publish-store";
 import { getActivePoll, pollForViewer } from "@/lib/poll";
 import { getRecap } from "@/lib/recap";
 import { getActivity } from "@/lib/activity";
+import { isValidDeckSlug } from "@/lib/request-security";
 
 // The live-session channel. Viewers GET the presenter's position (polled);
 // the presenter POSTs its position (and can "reset the lock"). Only a valid
@@ -32,7 +33,9 @@ function driverIdFor(session: Session): string {
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
 
   // Publish gate: don't leak the live position of an unpublished deck to a
   // non-presenter. 404 (no "unknown_deck" convention pre-exists on this route, so
@@ -104,16 +107,35 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
   const slug = (body.slug ?? "").toString();
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
+
+  if (
+    !body.takeClicker &&
+    !body.reset &&
+    !body.heartbeat &&
+    (typeof body.index !== "number" ||
+      !Number.isInteger(body.index) ||
+      body.index < 0 ||
+      body.index > 10_000)
+  ) {
+    return NextResponse.json({ error: "bad_index" }, { status: 400 });
+  }
 
   const me = driverIdFor(auth);
-  const state = body.takeClicker
-    ? await takeClicker(slug, me)
-    : body.reset
-      ? await resetLock(slug)
-      : body.heartbeat
-        ? await heartbeat(slug)
-        : await setPresenterIndex(slug, Number.isFinite(body.index) ? Number(body.index) : 0, me);
+  let state;
+  try {
+    state = body.takeClicker
+      ? await takeClicker(slug, me)
+      : body.reset
+        ? await resetLock(slug)
+        : body.heartbeat
+          ? await heartbeat(slug)
+          : await setPresenterIndex(slug, body.index as number, me);
+  } catch {
+    return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+  }
   // Same shape discipline as GET: no raw driverId out, `isDriver` for the caller.
   const { driverId, ...pub } = state;
   return NextResponse.json(

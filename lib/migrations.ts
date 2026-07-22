@@ -7,13 +7,13 @@
 // never run against a live DB. Tracked, ordered, forward-only migrations fix
 // that: each runs exactly once and is recorded in `schema_migrations`.
 //
-// CRITICAL LIVE-DB CONSTRAINT: local dev and Railway production point at the SAME
-// physical Postgres, and `decks`/`deck_slides` already exist there with real,
-// presenter-edited rows. Migration 001 therefore reproduces the EXACT current
-// DDL verbatim under `IF NOT EXISTS`, so adopting the pre-existing schema as the
-// baseline touches zero rows. Re-running the whole runner is a genuine no-op.
+// Migration 001 reproduces the original DDL under `IF NOT EXISTS` so repositories
+// upgrading from the pre-runner schema can adopt it without touching rows. Local,
+// staging, and production MUST use separate databases and credentials; migration
+// serialization is not an isolation boundary between environments.
 
 import type { Pool, PoolClient } from "pg";
+import { validateDeckHtml } from "./deck-validator";
 
 // A migration runs its DDL through the ONE dedicated client that holds the
 // advisory lock (see runMigrations) — never via pool.query(), because advisory
@@ -415,6 +415,79 @@ const migration011: Migration = {
   },
 };
 
+// 012_uploaded_slide_count: repair rows created before bundle persistence became
+// atomic. Those uploads stored slide_count=0 and only later attempted a best-effort
+// deck_slides write. Re-validate the canonical HTML, replace its derived metadata,
+// and then enforce that every uploaded deck has at least one slide.
+const migration012: Migration = {
+  id: "012_uploaded_slide_count",
+  async up(client) {
+    const uploaded = await client.query<{ slug: string; html: string }>(
+      `SELECT slug, html FROM decks WHERE kind = 'uploaded'`,
+    );
+    for (const row of uploaded.rows) {
+      const validation = validateDeckHtml(row.html);
+      if (!validation.ok) {
+        throw new Error(`Migration 012: uploaded deck ${row.slug} no longer validates`);
+      }
+      await client.query(
+        `DELETE FROM deck_slides WHERE deck_slug = $1 AND slide_index >= $2`,
+        [row.slug, validation.slideCount],
+      );
+      for (const slide of validation.slides) {
+        await client.query(
+          `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (deck_slug, slide_index) DO UPDATE
+             SET label = EXCLUDED.label,
+                 speaker_notes = CASE
+                   WHEN EXCLUDED.speaker_notes = '' THEN deck_slides.speaker_notes
+                   ELSE EXCLUDED.speaker_notes
+                 END,
+                 ai_context = CASE
+                   WHEN EXCLUDED.ai_context = '' THEN deck_slides.ai_context
+                   ELSE EXCLUDED.ai_context
+                 END,
+                 updated_at = now()`,
+          [row.slug, slide.index, slide.label, slide.speakerNotes, slide.aiContext],
+        );
+      }
+      await client.query(`UPDATE decks SET slide_count = $2 WHERE slug = $1`, [
+        row.slug,
+        validation.slideCount,
+      ]);
+    }
+    await client.query(`
+      ALTER TABLE decks
+        ADD CONSTRAINT uploaded_slide_count_valid
+        CHECK (kind <> 'uploaded' OR (slide_count IS NOT NULL AND slide_count > 0))
+    `);
+  },
+};
+
+// 013_case_insensitive_email: application lookups have always treated email as
+// case-insensitive, so persistence must enforce the same identity rule. Abort on
+// an existing collision instead of guessing which account should survive.
+const migration013: Migration = {
+  id: "013_case_insensitive_email",
+  async up(client) {
+    const duplicates = await client.query(
+      `SELECT 1
+         FROM users
+        GROUP BY lower(btrim(email))
+       HAVING count(*) > 1
+        LIMIT 1`,
+    );
+    if ((duplicates.rowCount ?? 0) > 0) {
+      throw new Error("Migration 013: case-insensitive duplicate user emails require manual resolution");
+    }
+    await client.query(`UPDATE users SET email = lower(btrim(email))`);
+    await client.query(`UPDATE invites SET email = lower(btrim(email)) WHERE email IS NOT NULL`);
+    await client.query(`UPDATE account_requests SET email = lower(btrim(email))`);
+    await client.query(`CREATE UNIQUE INDEX users_email_case_insensitive ON users (lower(email))`);
+  },
+};
+
 // Ordered migration list. Order is array order; ids are also lexically sortable
 // as a defense. Append new migrations here — never edit or reorder applied ones.
 export const MIGRATIONS: Migration[] = [
@@ -429,6 +502,8 @@ export const MIGRATIONS: Migration[] = [
   migration009,
   migration010,
   migration011,
+  migration012,
+  migration013,
 ];
 
 // Bootstrap DDL for the tracking table itself — the one irreducible statement we
@@ -449,10 +524,10 @@ async function ensureMigrationsTable(client: PoolClient): Promise<void> {
 // advisory lock held on a single dedicated client.
 //
 // SESSION lock (pg_advisory_lock), NOT transaction lock (pg_advisory_xact_lock):
-// each migration commits independently, so a later failure can't roll back an
-// earlier good migration that was already recorded. An xact lock would force all
-// pending migrations into one surrounding transaction (all-or-nothing); a
-// session lock spans multiple statements/transactions on the one client and is
+// each migration and its marker commit together in their own transaction, so a
+// later failure can't roll back an earlier good migration that was already
+// recorded. An xact lock would cover only one of those transactions; the session
+// lock spans all pending migration transactions on the dedicated client and is
 // released explicitly in finally. `client.release()` in the outer finally
 // guarantees the connection returns to the pool — and, if unlock somehow failed,
 // the session-scoped lock drops when the session ends — even if a migration
@@ -468,11 +543,23 @@ export async function runMigrations(pool: Pool): Promise<void> {
 
     for (const m of MIGRATIONS) {
       if (applied.has(m.id)) continue;
-      await m.up(client);
-      await client.query(
-        "INSERT INTO schema_migrations (id, checksum) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
-        [m.id, null],
-      );
+      try {
+        await client.query("BEGIN");
+        await m.up(client);
+        await client.query(
+          "INSERT INTO schema_migrations (id, checksum) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+          [m.id, null],
+        );
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // The original migration error is the useful failure. The outer
+          // finally still releases the client if the connection itself died.
+        }
+        throw err;
+      }
     }
   } finally {
     try {

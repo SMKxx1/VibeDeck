@@ -3,6 +3,7 @@ import { AUTH_COOKIE, SESSION_MAX_AGE, createSessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { signupWithInvite, checkLoginRateLimit } from "@/lib/users";
 import { hashPassword } from "@/lib/password";
+import { checkPublicRateLimit } from "@/lib/request-security";
 
 // Signup (Phase 4): invite-only. The role is taken from the invite ROW server-side
 // (never the request body), and the whole thing is atomic (see signupWithInvite):
@@ -12,7 +13,7 @@ import { hashPassword } from "@/lib/password";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MIN_PASSWORD = 8;
+const MIN_PASSWORD = 12;
 const MAX_PASSWORD = 200;
 
 interface Body {
@@ -33,15 +34,25 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
   const token = (body.token ?? "").toString();
-  const email = (body.email ?? "").toString().trim();
+  const email = (body.email ?? "").toString().trim().toLowerCase();
   const password = (body.password ?? "").toString();
 
-  if (!token) return NextResponse.json({ error: "missing_token" }, { status: 400 });
+  if (!/^[A-Za-z0-9_-]{32}$/.test(token)) {
+    return NextResponse.json({ error: "invalid_invite" }, { status: 400 });
+  }
   if (!email || !email.includes("@") || email.length > 320) {
     return NextResponse.json({ error: "invalid_email" }, { status: 400 });
   }
   if (password.length < MIN_PASSWORD || password.length > MAX_PASSWORD) {
     return NextResponse.json({ error: "weak_password" }, { status: 400 });
+  }
+
+  const ingressLimit = await checkPublicRateLimit(req, "signup", "global", {
+    max: 20,
+    windowSeconds: 15 * 60,
+  });
+  if (!ingressLimit.allowed) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
   // Blunt abuse against a single invite token.
