@@ -28,9 +28,15 @@ const nextConfig = {
         // Deliberately limited to directives that do not require unsafe-inline.
         // Script/style nonces can be rolled out separately without weakening the
         // immediately useful anti-framing, base, object, and form protections.
-        value: "base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'",
+        // frame-ancestors must be 'self', NOT 'none': the app frames its OWN
+        // origin — LiveDeck/PresenterConsole/SlideMetaEditor iframe the embed
+        // deck's static html (e.g. /decks/build-host-website/index.html), so
+        // 'none' breaks the main live view with a full-page "refused to
+        // connect". 'self' keeps the clickjacking protection (no other origin
+        // may frame us) without blocking first-party framing.
+        value: "base-uri 'self'; form-action 'self'; frame-ancestors 'self'; object-src 'none'",
       },
-      { key: "X-Frame-Options", value: "DENY" },
+      { key: "X-Frame-Options", value: "SAMEORIGIN" },
       { key: "X-Content-Type-Options", value: "nosniff" },
       { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
       {
