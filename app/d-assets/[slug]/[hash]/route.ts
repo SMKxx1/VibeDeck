@@ -51,9 +51,12 @@ export async function GET(
       "Content-Type": asset.contentType,
       "Content-Length": String(asset.byteSize),
       "X-Content-Type-Options": "nosniff",
-      // Only the deck origin itself may embed these bytes cross-origin-wise —
-      // same posture as /d-content.
-      "Cross-Origin-Resource-Policy": "same-origin",
+      // The prod deck HTML runs in a sandboxed (no allow-same-origin) frame, so
+      // its <img> requests originate from an OPAQUE origin — a "same-origin"
+      // CORP check would block every vault image. "cross-origin" is safe here:
+      // the unguessable sha256 in the URL is the capability, nosniff pins the
+      // type, and immutable content-addressed caching is unaffected.
+      "Cross-Origin-Resource-Policy": "cross-origin",
       // Content-addressed URL → the bytes can never change → cache forever.
       "Cache-Control": "public, max-age=31536000, immutable",
     },

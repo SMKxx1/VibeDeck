@@ -74,14 +74,20 @@ export async function POST(req: Request) {
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
   const action = typeof body.action === "string" ? body.action : "";
 
-  if (action === "draft") return draft(slug);
+  if (action === "draft") return draft(session, slug);
   if (action === "publish") return publish(req, session, slug, body);
   return NextResponse.json({ error: "bad_action" }, { status: 400 });
 }
 
 // ---- draft: one model call → { markdown }, persists nothing ------------------
 
-async function draft(slug: string) {
+async function draft(session: Session, slug: string) {
+  // Ownership (admin or the deck's owner; uniform 404 per S10) — the draft reads
+  // the deck's FULL grounding + speaker notes + revealed poll + Q&A, so a bare
+  // presenter session isn't enough: only an owner may extract their own deck.
+  const perm = await checkDeckManage(session, slug);
+  if (!perm.ok) return NextResponse.json({ error: perm.error }, { status: perm.status });
+
   const deck = await getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
 

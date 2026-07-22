@@ -93,6 +93,34 @@ export async function getPendingByProvider(
 }
 
 /**
+ * Was this external identity REJECTED within the last `withinDays`? The pending
+ * dedupe index (partial, WHERE status='pending') stops covering a row the moment
+ * it's rejected, so without this an unwanted identity could re-sign-in, park a
+ * fresh pending row, and re-ping the owner indefinitely. Callers use this to
+ * short-circuit BEFORE createRequest. Read → fails open (false), so a DB blip
+ * never blocks a legitimate first-time request; it just skips the suppression.
+ */
+export async function hasRecentRejection(
+  provider: string,
+  providerId: string,
+  withinDays: number,
+): Promise<boolean> {
+  await ensureSchema();
+  try {
+    const res = await query(
+      `SELECT 1 FROM account_requests
+        WHERE provider = $1 AND provider_id = $2 AND status = 'rejected'
+          AND decided_at > now() - make_interval(days => $3)
+        LIMIT 1`,
+      [provider, providerId, withinDays],
+    );
+    return (res.rowCount ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Create (or return the existing) pending request for an external identity.
  * Deduplication is enforced by the DB, not a check-then-act: the INSERT
  * arbitrates on migration 011's partial unique index (provider, provider_id)

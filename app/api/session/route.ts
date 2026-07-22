@@ -44,17 +44,24 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
 
-  const state = await getSession(slug);
-  // Deliver the current live poll on the SAME poll viewers already run (#3) — no
-  // new viewer request. Viewer-safe projection: no correct answer/tally pre-reveal.
-  const poll = pollForViewer(await getActivePoll(slug));
-  // The active room recap rides here too (comprehension checkpoint). Viewer-safe
-  // as-is: it's presenter-authored/approved text about a slide they can already see.
-  const recap = await getRecap(slug);
-  // The Turn & Talk activity rides here too. Viewer-safe as-is: it's a
-  // presenter-authored prompt + a wall-clock deadline; viewers count down
-  // client-side from `endsAt`, so this poll's cadence never changes.
-  const activity = await getActivity(slug);
+  // Batch the four independent reads into ONE round-trip — each is keyed only by
+  // slug and none depends on another's result, so awaiting them separately just
+  // paid four sequential RTTs per viewer tick. Promise.all lets ioredis pipeline
+  // them over the single connection.
+  const [state, activePoll, recap, activity] = await Promise.all([
+    getSession(slug),
+    // The current live poll on the SAME poll viewers already run (#3) — no new
+    // viewer request. Viewer-safe projection below: no correct answer/tally pre-reveal.
+    getActivePoll(slug),
+    // The active room recap (comprehension checkpoint). Viewer-safe as-is: it's
+    // presenter-authored/approved text about a slide they can already see.
+    getRecap(slug),
+    // The Turn & Talk activity. Viewer-safe as-is: a presenter-authored prompt + a
+    // wall-clock deadline; viewers count down client-side from `endsAt`, so this
+    // poll's cadence never changes.
+    getActivity(slug),
+  ]);
+  const poll = pollForViewer(activePoll);
   // Co-host mode: driverId is a userId — never leak it to the room. A presenter
   // caller instead gets `isDriver` for THEIR identity (an unclaimed session counts
   // as driving, so a solo console never shows a handoff button).

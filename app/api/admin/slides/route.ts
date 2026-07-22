@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { AUTH_COOKIE, getSession, canManageDeck } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getDeckOwner } from "@/lib/uploaded-decks";
+import { getDeck } from "@/lib/decks";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides, updateSlideMeta } from "@/lib/slides-store";
@@ -107,7 +108,13 @@ export async function PUT(req: Request) {
     if (body.branches === null || (Array.isArray(body.branches) && body.branches.length === 0)) {
       patch.branches = null;
     } else {
-      const cleaned = sanitizeBranches(body.branches);
+      // Range-check targets against the deck's real length so an out-of-range
+      // path (e.g. a stale from:500 on a 20-slide deck) is dropped, not saved.
+      // slideCount from getDeck (slideCount for embed/uploaded, else slides.length),
+      // matching how the other routes read a deck's length.
+      const deck = await getDeck(slug);
+      const slideCount = deck ? deck.slideCount ?? deck.slides.length : undefined;
+      const cleaned = sanitizeBranches(body.branches, slideCount);
       if (!cleaned) return NextResponse.json({ error: "bad_branches" }, { status: 400 });
       patch.branches = cleaned;
     }

@@ -93,7 +93,7 @@ export async function POST(req: Request) {
 
   // The viewer's own AI limiter — a catch-up spends from the same per-name pool
   // as their tutor questions.
-  const rl = await checkRateLimit(name);
+  const rl = await checkRateLimit(`u:${name}`);
   if (!rl.allowed) {
     return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
   }
@@ -243,7 +243,7 @@ export async function POST(req: Request) {
       usage?: { total_tokens?: number };
     };
     const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens(name, tokens); // PRIVACY: only { name, timestamp, count }
+    await recordTokens(`u:${name}`, tokens); // PRIVACY: only { name, timestamp, count }
     await recordBudgetTokens(tokens);
     const answer = (data.choices?.[0]?.message?.content ?? "").trim();
     if (!answer) return NextResponse.json({ error: "bad_generation" }, { status: 502 });

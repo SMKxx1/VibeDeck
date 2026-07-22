@@ -7,6 +7,8 @@ import { generatePollExplanation } from "@/lib/poll-explain";
 import { getSlideBranches } from "@/lib/slides-store";
 import { setPresenterIndex, getSession } from "@/lib/session";
 import { bumpPulse } from "@/lib/pulse";
+import { getDeck } from "@/lib/decks";
+import { getRedis } from "@/lib/redis";
 
 // Live poll control — PRESENTER ONLY.
 //   POST { action: "open" | "reveal" | "close" | "route", ... } drives the poll
@@ -23,6 +25,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+
+// TTL for the "this poll's wrong votes were already counted" once-flag — matches
+// the 8h horizon lib/poll.ts and lib/pulse.ts give their session-scoped keys.
+const COUNTED_TTL_S = 60 * 60 * 8;
 
 async function isPresenter(): Promise<boolean> {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
@@ -126,9 +132,21 @@ export async function POST(req: Request) {
     if (prior && !prior.revealed && poll.correctIndex !== null && poll.tally) {
       const wrong = Math.max(0, (poll.total ?? 0) - (poll.tally[poll.correctIndex] ?? 0));
       if (wrong > 0) {
-        void getSession(slug)
-          .then((s) => bumpPulse(slug, s.index, "poll_wrong", wrong))
-          .catch(() => {});
+        // The prior.revealed read above isn't atomic: two concurrent Reveal taps
+        // (co-host mode) can both see it false and both bump, double-counting the
+        // struggle signal. Claim an atomic once-flag on this poll's identity
+        // (hsetnx — the field is set exactly once) and only the winner bumps.
+        // Still fire-and-forget: it must never affect (or fail) the reveal.
+        void (async () => {
+          const redis = await getRedis();
+          if (redis) {
+            const first = await redis.hsetnx(`pulse:counted:${slug}`, poll.id, 1);
+            if (first !== 1) return; // another reveal already counted this poll
+            await redis.expire(`pulse:counted:${slug}`, COUNTED_TTL_S);
+          }
+          const s = await getSession(slug);
+          await bumpPulse(slug, s.index, "poll_wrong", wrong);
+        })().catch(() => {});
       }
     }
     // "Why that answer": kick off the ONE room-wide grounded explanation without
@@ -155,11 +173,20 @@ export async function POST(req: Request) {
         : undefined;
     if (!target) return NextResponse.json({ error: "bad_option" }, { status: 400 });
 
+    // Clamp the (possibly stale/oversized) branch target to the deck's real range
+    // so a bad `from` can't jump the whole room past the last slide and jam the
+    // unlock ceiling. slideCount from getDeck (slideCount for embed/uploaded, else
+    // slides.length), matching how the other routes read a deck's length.
+    const deck = await getDeck(slug);
+    const slideCount = deck ? deck.slideCount ?? deck.slides.length : 0;
+    const from =
+      slideCount > 0 ? Math.min(Math.max(0, target.from), slideCount - 1) : Math.max(0, target.from);
+
     // Clicker rule: with a mismatching driver on record this is a NO-OP that
     // returns the current state — a moderator can reveal the vote but only the
     // driver moves the room. `routed` tells the caller which one happened.
-    const state = await setPresenterIndex(slug, target.from, driverIdFor(auth));
-    const routed = state.index === target.from;
+    const state = await setPresenterIndex(slug, from, driverIdFor(auth));
+    const routed = state.index === from;
     const updated = routed ? await setBranchTaken(slug, poll.id, optionIndex as number) : null;
     return NextResponse.json(
       { poll: updated ?? poll, index: state.index, max: state.max, routed },

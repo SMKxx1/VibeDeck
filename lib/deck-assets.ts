@@ -45,6 +45,12 @@ import sharp, { type Metadata } from "sharp";
 import { query } from "./db";
 import { ensureSchema } from "./schema";
 
+// Bound sharp's libvips thread pool to a single thread process-wide. The
+// compression ladder below can run many encode passes on a worst-case
+// incompressible image; without a cap sharp would fan those out across every
+// core and starve live-presentation traffic on the single Railway instance.
+sharp.concurrency(1);
+
 // The one size rule: final stored bytes per image. See the policy note above.
 export const MAX_STORED_BYTES = 10 * 1024 * 1024; // 10MB
 // Generous RAW upload ceiling so a large original has headroom to compress;
@@ -314,6 +320,28 @@ export async function putAsset(slug: string, input: Buffer): Promise<StoredAsset
     width,
     height,
   };
+}
+
+/**
+ * Copy every stored asset from one deck onto another — used when a deck is
+ * duplicated so the fork owns its OWN deck_assets rows instead of silently
+ * depending on the source deck's. Without this the fork's <img> tags resolve to
+ * the source's rows, and deleting the source CASCADE-deletes the shared bytes
+ * (migration 009), breaking the fork permanently. A single content-addressed
+ * INSERT … SELECT re-homes every row with toSlug substituted for deck_slug;
+ * created_at defaults to now, and ON CONFLICT DO NOTHING keeps it idempotent if
+ * some (toSlug, hash) rows already exist. WRITE semantics: throws on DB error
+ * (the caller — the duplicate route — invokes this best-effort).
+ */
+export async function copyAssets(fromSlug: string, toSlug: string): Promise<void> {
+  await ensureSchema();
+  await query(
+    `INSERT INTO deck_assets (hash, deck_slug, bytes, content_type, byte_size, width, height)
+     SELECT hash, $2, bytes, content_type, byte_size, width, height
+     FROM deck_assets WHERE deck_slug = $1
+     ON CONFLICT (deck_slug, hash) DO NOTHING`,
+    [fromSlug, toSlug],
+  );
 }
 
 /**

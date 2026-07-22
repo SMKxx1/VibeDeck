@@ -305,8 +305,13 @@ export async function replaceUploadedDeckSlides(
     if (slides.length > 0) {
       // Build one multi-row INSERT ... ON CONFLICT DO UPDATE. Params per row:
       // (deck_slug, slide_index, label, speaker_notes, ai_context, branches).
-      // branches overwrite too (the author is re-declaring the WHOLE deck; a
-      // replace that drops a branch directive must not leave a stale vote path).
+      // Preserve DB-authored values the incoming source can't represent: an
+      // absent branches binds to SQL NULL (see the push below — sanitizeBranches
+      // returns null for the HTML-publish path, which the validator never emits
+      // branches for), and empty speaker_notes/ai_context mean "the HTML carried
+      // none", so both COALESCE/CASE back to the row's existing value. The
+      // markdown importer supplies a real branches array (non-null) and non-empty
+      // notes, so those still overwrite.
       const rows: string[] = [];
       const values: unknown[] = [];
       let n = 1;
@@ -320,9 +325,9 @@ export async function replaceUploadedDeckSlides(
          VALUES ${rows.join(", ")}
          ON CONFLICT (deck_slug, slide_index) DO UPDATE
            SET label = EXCLUDED.label,
-               speaker_notes = EXCLUDED.speaker_notes,
-               ai_context = EXCLUDED.ai_context,
-               branches = EXCLUDED.branches,
+               speaker_notes = CASE WHEN EXCLUDED.speaker_notes IS NULL OR EXCLUDED.speaker_notes = '' THEN deck_slides.speaker_notes ELSE EXCLUDED.speaker_notes END,
+               ai_context = CASE WHEN EXCLUDED.ai_context IS NULL OR EXCLUDED.ai_context = '' THEN deck_slides.ai_context ELSE EXCLUDED.ai_context END,
+               branches = COALESCE(EXCLUDED.branches, deck_slides.branches),
                updated_at = now()`,
         values,
       );

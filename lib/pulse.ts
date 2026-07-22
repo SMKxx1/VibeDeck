@@ -45,6 +45,11 @@ export interface PulseAggregates {
 const keyFor = (slug: string) => `live:pulse:${slug}`;
 const TTL_S = 60 * 60 * 8;
 const START_FIELD = "startedAt"; // never matches the `{index}:{event}` pattern
+// Hard ceiling on the slide index: a real deck never has thousands of slides, so
+// anything beyond this is a hostile/garbage index. Bounding it here (no caller can
+// exceed it) keeps the Redis hash AND the in-memory shadow Map from growing without
+// bound when a viewer sends indices 0,1,…,1e9.
+const MAX_SLIDE_INDEX = 5000;
 
 // Persist the in-memory fallback across dev hot-reloads (see lib/recap.ts).
 interface MemPulse {
@@ -72,6 +77,7 @@ export async function bumpPulse(
 ): Promise<void> {
   if (!slug || !Number.isFinite(slideIndex)) return;
   const idx = Math.max(0, Math.floor(slideIndex));
+  if (idx > MAX_SLIDE_INDEX) return; // out-of-range index: never mint a hash field/Map entry for it
   const n = Math.floor(count);
   if (!Number.isFinite(n) || n <= 0) return;
   const field = fieldFor(idx, event);
