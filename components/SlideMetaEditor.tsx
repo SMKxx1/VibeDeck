@@ -569,6 +569,10 @@ function SlideCard({
     }
   }
 
+  // Once the user edits again, drop a terminal save result (error/saved) so the
+  // pill returns to its dirty/idle state. Leaves an in-flight "saving" untouched.
+  const clearStatus = useCallback(() => setStatus((s) => (s === "saving" ? s : "idle")), []);
+
   const genBusy = genStatus === "generating";
   const genDisabled = !dbAvailable || genBusy || bulkRunning;
 
@@ -684,7 +688,10 @@ function SlideCard({
       <Field
         label="Speaker notes"
         value={notes}
-        onChange={setNotes}
+        onChange={(v) => {
+          setNotes(v);
+          clearStatus();
+        }}
         disabled={!dbAvailable}
         rows={3}
       />
@@ -692,12 +699,22 @@ function SlideCard({
       <Field
         label="AI context (chatbot grounding)"
         value={ctx}
-        onChange={setCtx}
+        onChange={(v) => {
+          setCtx(v);
+          clearStatus();
+        }}
         disabled={!dbAvailable}
         rows={6}
       />
       <div style={{ height: 14 }} />
-      <BranchEditor branches={branches} onChange={setBranches} disabled={!dbAvailable} />
+      <BranchEditor
+        branches={branches}
+        onChange={(b) => {
+          setBranches(b);
+          clearStatus();
+        }}
+        disabled={!dbAvailable}
+      />
 
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 16 }}>
         <button
@@ -759,14 +776,16 @@ function StatusPill({
   if (status === "saving") {
     return <span style={{ fontSize: 13, color: "#8A857C" }}>Saving…</span>;
   }
-  // `dirty` is checked before both the "error" and "saved" terminal states so
-  // that editing the text after a failed (or successful) save flips the pill
-  // back to "Unsaved changes" instead of leaving a stale message on screen.
-  if (dirty) {
-    return <span style={{ fontSize: 13, color: "#B08900" }}>Unsaved changes</span>;
-  }
+  // A fresh save error is shown BEFORE the "Unsaved changes" hint: a failed save
+  // always leaves `dirty` true (the saved* values are unchanged), so checking
+  // `dirty` first would make this branch dead and hide 401/503 errors. Editing any
+  // field clears `status` back to idle (see the onChange wrappers), which drops the
+  // pill back to "Unsaved changes" instead of leaving a stale error on screen.
   if (status === "error") {
     return <span style={{ fontSize: 13, color: "#C23B27" }}>{errorMsg ?? "Couldn't save."}</span>;
+  }
+  if (dirty) {
+    return <span style={{ fontSize: 13, color: "#B08900" }}>Unsaved changes</span>;
   }
   if (status === "saved") {
     return <span style={{ fontSize: 13, color: "#4F7A2E" }}>Saved ✓</span>;
@@ -1088,7 +1107,14 @@ function DeckPreview({
       if (d.type === "ready") {
         gotoIndex(targetRef.current.index);
       } else if (d.type === "slidechange") {
-        const next = { index: d.index ?? 0, total: d.total ?? 0, label: d.label ?? "" };
+        // SECURITY (untrusted content): clamp the deck-reported `total` and cap the
+        // `label` before storing, mirroring UploadedDeckFrame. Only displayed as text
+        // today, but keeps the invariant if a render loop ever consumes `total`.
+        const next = {
+          index: d.index ?? 0,
+          total: Math.min(Math.max(0, Math.floor(Number(d.total) || 0)), 9999),
+          label: String(d.label ?? "").slice(0, 200),
+        };
         setDeck(next);
         // One-shot boot sync: if the presenter focused a slide before the bridge was
         // ready, snap to it once the deck first reports — then navigation stays free.

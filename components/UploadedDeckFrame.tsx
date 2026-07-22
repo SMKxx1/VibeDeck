@@ -353,7 +353,15 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ slug, ...opts }),
         });
-        if (res.ok) setSession((await res.json()) as SessionState);
+        if (res.ok) {
+          // Only record a SERVER-CONFIRMED index. A failed POST must NOT advance the
+          // dedupe ref, or re-navigating to that index would be silently dropped.
+          if (typeof opts.index === "number") lastPostedIdxRef.current = opts.index;
+          // Taking the clicker makes THIS frame the driver: forget the followed index
+          // so the first local navigation always posts.
+          else if (opts.takeClicker) lastPostedIdxRef.current = -1;
+          setSession((await res.json()) as SessionState);
+        }
       } catch {
         /* ignore — presenter keeps presenting */
       }
@@ -382,7 +390,8 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         const next = pendingIdxRef.current;
         pendingIdxRef.current = null;
         if (next == null || next === lastPostedIdxRef.current) return;
-        lastPostedIdxRef.current = next;
+        // The ref is advanced only once postPresenter confirms the write, so a
+        // failed POST leaves it on the last server-held index (retry stays possible).
         void postPresenter({ index: next });
       }, 250);
     },
@@ -863,7 +872,13 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
         }
       } else if (d.type === "slidechange") {
         const idx = d.index ?? 0;
-        setDeck({ index: idx, total: d.total ?? 0, label: d.label ?? "" });
+        // SECURITY (untrusted content): `total`/`label` are attacker-controlled just
+        // like `index`. Clamp `total` (it drives a per-slide render loop in
+        // PulseHeatStrip — an unbounded value freezes/OOM-crashes the tab) and cap the
+        // label, mirroring the index clamp in schedulePresenterPost.
+        const total = Math.min(Math.max(0, Math.floor(Number(d.total) || 0)), 9999);
+        const label = String(d.label ?? "").slice(0, 200);
+        setDeck({ index: idx, total, label });
         // LOOP-SAFETY: only the PRESENTER's OWN navigation drives the session. A
         // followed move is reported with reason 'api' (init/sync for boot pings) —
         // never re-POSTed. Viewers never drive at all.
@@ -942,7 +957,12 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
           // Co-host mode: a moderator follows the driver (the goto reports back as
           // reason 'api', so it never re-drives). The driver drives locally, never
           // from this poll.
-          if (s.isDriver === false) followTo(s.index);
+          if (s.isDriver === false) {
+            // Keep the dedupe ref on the server-confirmed index while following, so
+            // reclaiming the clicker and navigating back here still posts.
+            lastPostedIdxRef.current = s.index;
+            followTo(s.index);
+          }
           return;
         }
         setPoll(s.poll ?? null);

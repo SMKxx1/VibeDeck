@@ -64,6 +64,30 @@ export function middleware(req: NextRequest) {
   // the app's origin, or we'd have re-created the very same-origin exposure F1
   // is about. 404 it. Everything else on the app host passes through untouched.
   if (isDeckServing) return new NextResponse(null, { status: 404 });
+
+  // Central request-body ceiling (DoS guard). next.config.mjs sets
+  // experimental.middlewareClientMaxBodySize="55mb" GLOBALLY — needed so the
+  // Deck Asset Vault upload routes can receive multi-MB images — but that cap
+  // applies to EVERY /api/* route this middleware matches. Without a ceiling
+  // here, any anonymous viewer POST (/api/ask, /api/poll/vote, /api/login, ...)
+  // could stream up to 55MB into the Node heap before the handler's req.json()
+  // even runs; a few dozen concurrent 55MB bodies would OOM-kill the single
+  // Railway instance. So we apply the same DEFAULT-DENY ALLOWLIST philosophy to
+  // body size: cap everyone at a small ceiling, and allowlist only the routes
+  // that legitimately need large bodies. This is a best-effort header check — we
+  // cannot read the body on Edge — that defeats the realistic
+  // "Content-Length: 55000000" attack; the framework 55mb cap stays the
+  // absolute backstop for chunked / mislabeled bodies.
+  const MAX_BODY = 2 * 1024 * 1024; // 2MB — generous for every JSON route (largest legit viewer body is a short question).
+  // Only the /api/admin/decks/* upload routes need large bodies — this prefix
+  // covers create, [slug] replace, [slug]/assets, [slug]/draft, and import, all
+  // of which are session + CSRF gated and enforce their own size checks.
+  const allowsLargeBody = pathname.startsWith("/api/admin/decks");
+  const len = Number(req.headers.get("content-length") || 0);
+  if (!allowsLargeBody && len > MAX_BODY) {
+    return new NextResponse(null, { status: 413 }); // Payload Too Large.
+  }
+
   return NextResponse.next();
 }
 

@@ -130,18 +130,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
   }
 
-  const rl = await checkRateLimit(name);
+  const rl = await checkRateLimit(`u:${name}`);
   if (!rl.allowed) {
     return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
   }
-  // Insight Engine: count this as a per-slide struggle signal for the presenter's
-  // heat strip — a real tutor question is 'ask', a reframe chip is 'explain'.
-  // CONTENT-FREE (a count against (slug, slide) only — never the question) and
-  // fire-and-forget: it must never affect this response. Placed after the publish
-  // + rate-limit gates (garbage doesn't count) but BEFORE the explain cache — a
-  // cached reframe still evidences a struggling viewer. Covers the stream and
-  // non-stream paths alike (one bump per accepted request).
-  void bumpPulse(slug, slideIndex, explainMode ? "explain" : "ask").catch(() => {});
   // Explain-mode fast path (#10): a room-shared cached reframe returns instantly
   // and spends no tokens/budget. Checked AFTER the publish gate + rate limit (so a
   // hidden deck can't be probed via cache) but BEFORE the budget gate (a cached
@@ -199,6 +191,20 @@ export async function POST(req: Request) {
     fullText = deckToText(deck);
   }
   const humanIdx = clamp(slideIndex, 0, Math.max(0, total - 1)) + 1;
+
+  // Insight Engine: count this as a per-slide struggle signal for the presenter's
+  // heat strip — a real tutor question is 'ask', a reframe chip is 'explain'.
+  // CONTENT-FREE (a count against (slug, slide) only — never the question) and
+  // fire-and-forget: it must never affect this response. Placed AFTER the budget
+  // gate so a request the daily cap rejected can't rack up free pulse writes (a
+  // name-rotating abuser gets nothing that will actually be served), and bounded to
+  // the deck's real slide count (`total`) now that grounding has computed it.
+  // Covers the stream and non-stream paths alike (one bump per served request).
+  void bumpPulse(
+    slug,
+    clamp(slideIndex, 0, Math.max(0, total - 1)),
+    explainMode ? "explain" : "ask",
+  ).catch(() => {});
 
   const label = body.slideLabel ? ` ("${body.slideLabel}")` : "";
 
@@ -407,7 +413,7 @@ export async function POST(req: Request) {
               .filter((c) => c.url && !seen.has(c.url) && (seen.add(c.url), true))
               .slice(0, 5);
             try {
-              await recordTokens(name, tokens); // PRIVACY: only { name, timestamp, count }
+              await recordTokens(`u:${name}`, tokens); // PRIVACY: only { name, timestamp, count }
               await recordBudgetTokens(tokens);
             } catch {
               /* best-effort accounting — never block the stream close */
@@ -469,7 +475,7 @@ export async function POST(req: Request) {
       .slice(0, 5);
 
     const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens(name, tokens); // PRIVACY: only { name, timestamp, count }
+    await recordTokens(`u:${name}`, tokens); // PRIVACY: only { name, timestamp, count }
     await recordBudgetTokens(tokens);
     // Cache a reframe so the rest of the room reuses it for free (#10).
     if (explainMode) await setExplainCache(explainKey, answer);

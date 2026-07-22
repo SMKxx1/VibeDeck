@@ -11,7 +11,7 @@ import {
 } from "@/lib/google-oauth";
 import { getIdentity, linkIdentity } from "@/lib/identities";
 import { getUserByEmail, getUserById } from "@/lib/users";
-import { createRequest } from "@/lib/account-requests";
+import { createRequest, hasRecentRejection } from "@/lib/account-requests";
 import { notifyAccountRequest } from "@/lib/telegram";
 
 // Google OAuth callback — step 2. Verifies state (CSRF), exchanges the code,
@@ -121,8 +121,19 @@ export async function GET(req: NextRequest) {
       return toDashboard(origin, byEmail.id, byEmail.role);
     }
 
-    // (c) Unknown → park an approval request. createRequest dedupes on the
-    // partial unique index, returning the EXISTING pending row on a re-sign-in.
+    // (c) Unknown → park an approval request. But an identity the owner already
+    // REJECTED must not re-park + re-ping: the pending dedupe index stops covering
+    // a rejected row, so without this a rejected user could spam the owner (each
+    // ping carrying live Approve buttons) and grow account_requests unbounded. If
+    // there's a rejection within the window, land on the same /login?pending=1 the
+    // pending case uses — no new row, no Telegram ping.
+    const REJECTION_COOLDOWN_DAYS = 30;
+    if (await hasRecentRejection("google", identity.sub, REJECTION_COOLDOWN_DAYS)) {
+      return toLogin(origin, { pending: "1" });
+    }
+
+    // createRequest dedupes on the partial unique index, returning the EXISTING
+    // pending row on a re-sign-in.
     const created = await createRequest({
       provider: "google",
       providerId: identity.sub,

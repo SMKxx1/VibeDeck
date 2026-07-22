@@ -523,7 +523,9 @@ export function LiveDeck({
   useEffect(() => {
     function onMsg(e: MessageEvent) {
       const d = e.data as { source?: string; type?: string; reason?: string } & Partial<DeckState>;
-      if (!d || d.source !== "deck") return;
+      // SECURITY GUARD — object-identity of OUR frame + the deck marker, so a
+      // hostile page that holds a window ref to the app can't forge deck messages.
+      if (!(e.source === iframeRef.current?.contentWindow && d?.source === "deck")) return;
       if (d.type === "ready") {
         pushRole();
         if (role === "presenter") channelRef.current?.post({ type: "request" });
@@ -744,7 +746,8 @@ export function LiveDeck({
     };
     const onActivity = (e: MessageEvent) => {
       const m = e.data as { source?: string; type?: string };
-      if (m && m.source === "deck" && m.type === "activity") show();
+      // Same receive guard as the main bridge listener — only OUR iframe's window.
+      if (e.source === iframeRef.current?.contentWindow && m && m.source === "deck" && m.type === "activity") show();
     };
     window.addEventListener("mousemove", show);
     window.addEventListener("keydown", show);

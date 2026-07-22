@@ -136,6 +136,19 @@ export function DeckWorkbench({ slug }: { slug: string }) {
     };
   }, [phase]);
 
+  // ── warn before discarding unsaved edits ─────────────────────────────────
+  // Drafts persist only on Save, so a tab-close/refresh/Back with a dirty buffer
+  // silently destroys everything since the last save. Guard those exits.
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [dirty]);
+
   const getDoc = useCallback(() => viewRef.current?.state.doc.toString() ?? "", []);
 
   const setDoc = useCallback((next: string) => {
@@ -327,12 +340,23 @@ export function DeckWorkbench({ slug }: { slug: string }) {
       const get = await fetch(`/api/admin/decks/${slug}/draft`);
       const data = (await get.json().catch(() => ({}))) as DraftGetResponse;
       if (get.ok && typeof data.html === "string") {
+        // Reload succeeded: the buffer now matches the published version.
         setDoc(data.html);
         setPreviewUrl(data.previewUrl ?? null);
+        setHasDraft(false);
+        setDirty(false);
+        setNote({ kind: "ok", text: "Draft discarded — back to the published version." });
+      } else {
+        // The draft is gone server-side but we couldn't reload the published
+        // HTML — the editor still shows the old draft, matching no server state.
+        // Mark it dirty so it isn't mistaken for the live version and isn't lost.
+        setDirty(true);
+        setNote({
+          kind: "warn",
+          text:
+            "Draft discarded, but couldn't reload the published version — the editor still shows the old content. Save to keep it, or reload the page.",
+        });
       }
-      setHasDraft(false);
-      setDirty(false);
-      setNote({ kind: "ok", text: "Draft discarded — back to the published version." });
     } catch {
       setNote({ kind: "error", text: "Network error — try again." });
     }

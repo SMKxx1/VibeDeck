@@ -189,6 +189,22 @@ function renderBody(md: string): string {
   return out.join("\n");
 }
 
+// Neutralize any <img> whose src is NOT same-origin relative ("/…", but not a
+// protocol-relative "//…") or a data: URI — dropping the tag. Unlike the deck
+// (served under "img-src 'self' data:"), the study-handout fragment renders on
+// the APP origin, which has NO CSP, so a remote http(s) image would fire a live
+// cross-origin request from every reader (a tracking-pixel / IP-leak channel).
+// This post-processes ONLY the fragment output; the shared inline()/renderBody
+// the full deck renderer uses is left untouched (the deck's CSP handles it there).
+function stripRemoteImages(html: string): string {
+  return html.replace(/<img\b[^>]*>/gi, (tag) => {
+    const m = tag.match(/\ssrc="([^"]*)"/i);
+    const src = m ? m[1] : "";
+    const local = (src.startsWith("/") && !src.startsWith("//")) || /^data:/i.test(src);
+    return local ? tag : "";
+  });
+}
+
 /**
  * Render a Markdown FRAGMENT (no slide splitting, no <deck-stage> wrapper) to
  * HTML-escaped markup — the SAME zero-dependency block renderer the deck
@@ -196,10 +212,12 @@ function renderBody(md: string): string {
  * page + its offline download) reuse this one escaping renderer instead of
  * growing a second one. Same fidelity boundary as the deck subset: headings,
  * paragraphs, lists, bold/italic/inline-code, fenced code, blockquotes, and
- * http(s) links — all text HTML-escaped; no tables/images/raw HTML.
+ * http(s) links — all text HTML-escaped; no tables/raw HTML. Images are allowed
+ * ONLY when same-origin relative or data: (remote srcs are stripped) — this page
+ * has no CSP, so a remote <img> would be a reader-side tracking/IP-leak request.
  */
 export function renderMarkdownFragment(markdown: string): string {
-  return renderBody(markdown ?? "");
+  return stripRemoteImages(renderBody(markdown ?? ""));
 }
 
 // ── Branch directive (branch points) ────────────────────────────────────────

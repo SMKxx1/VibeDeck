@@ -4,7 +4,7 @@ import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
-import { getAsset } from "@/lib/deck-assets";
+import { getAsset, listAssets } from "@/lib/deck-assets";
 
 // Owner-gated DOWNLOAD (GET) — hand back a fully self-contained, offline-capable
 // copy of an uploaded deck for low-bandwidth / offline use. This DELIBERATELY
@@ -34,6 +34,16 @@ function assetRefRe(slug: string): RegExp {
   );
 }
 
+// Defensive ceiling on the offline-inline size: every referenced vault asset is
+// base64'd into ONE in-memory HTML string, so a photo-heavy deck (many ~10MB
+// images) could spike hundreds of MB on the single instance. Measured in STORED
+// bytes (byte_size); base64 inflates ~4/3, so 150MB of assets → a ~200MB string.
+const MAX_INLINE_TOTAL_BYTES = 150 * 1024 * 1024; // 150MB of stored asset bytes
+
+// Signals the referenced assets exceed MAX_INLINE_TOTAL_BYTES — the GET handler
+// maps it to 413 instead of building the giant string.
+class DeckTooLargeError extends Error {}
+
 // Replace every vault reference with a data: URI of the stored bytes. Two
 // passes: collect the unique hashes and read each ONCE (an image reused across
 // slides costs one query), then a synchronous replace from the map.
@@ -42,6 +52,15 @@ async function inlineDeckAssets(html: string, slug: string): Promise<string> {
   const hashes = new Set<string>();
   for (const m of html.matchAll(re)) hashes.add(m[2]);
   if (hashes.size === 0) return html;
+
+  // OOM guard: sum the referenced assets' stored sizes from the metadata-only
+  // listing (NO bytes loaded) and bail before inlining anything if the offline
+  // bundle would be oversized. Fail-open [] from listAssets just skips the guard
+  // (getAsset then fails closed per-asset), so a DB blip can't false-positive.
+  const sizes = new Map((await listAssets(slug)).map((a) => [a.hash, a.byteSize] as const));
+  let total = 0;
+  for (const hash of hashes) total += sizes.get(hash) ?? 0;
+  if (total > MAX_INLINE_TOTAL_BYTES) throw new DeckTooLargeError();
 
   const dataUris = new Map<string, string>();
   for (const hash of hashes) {
@@ -90,7 +109,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ slug: s
   // and swapped into the src. Best-effort per reference — an asset that can't be
   // read (deleted, DB blip) keeps its original URL (still fine online) rather
   // than failing the download. Only this slug's own assets are inlined.
-  renderedHtml = await inlineDeckAssets(renderedHtml, slug);
+  try {
+    renderedHtml = await inlineDeckAssets(renderedHtml, slug);
+  } catch (err) {
+    if (err instanceof DeckTooLargeError) {
+      return NextResponse.json({ error: "deck_too_large_to_export" }, { status: 413 });
+    }
+    throw err;
+  }
 
   return new NextResponse(renderedHtml, {
     headers: {

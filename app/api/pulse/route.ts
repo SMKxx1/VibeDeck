@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { randomBytes } from "crypto";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { AUTH_COOKIE, getSession, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
+import { checkDeckManage } from "@/lib/deck-authz";
 import { getDeck } from "@/lib/decks";
 import { slideToText } from "@/lib/deckUtils";
 import { contextForSlide } from "@/lib/decks/build-host-website-context";
@@ -71,7 +72,8 @@ export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  if (!(await isPresenterReq())) {
+  const session = getSession((await cookies()).get(AUTH_COOKIE)?.value);
+  if (!session) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   let body: PostBody;
@@ -85,6 +87,14 @@ export async function POST(req: Request) {
   if (body.action !== "debrief") {
     return NextResponse.json({ error: "bad_action" }, { status: 400 });
   }
+
+  // debrief PERSISTS a session_reports row AND CLEARS the live pulse counters, so
+  // it requires deck OWNERSHIP (checkDeckManage), not just a presenter session: a
+  // non-owner must not wipe the real presenter's live counters mid-session or
+  // persist a report for a deck they don't own. (The GET heat-strip and any live
+  // any-presenter reads stay ungated — only this persist+clear action gates here.)
+  const perm = await checkDeckManage(session, slug);
+  if (!perm.ok) return NextResponse.json({ error: perm.error }, { status: perm.status });
 
   const deck = await getDeck(slug);
   if (!deck) return NextResponse.json({ error: "unknown_deck" }, { status: 404 });

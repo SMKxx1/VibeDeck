@@ -12,6 +12,7 @@ import {
 } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
 import { replaceUploadedDeckSlides } from "@/lib/slides-store";
+import { copyAssets } from "@/lib/deck-assets";
 
 // Owner-gated DUPLICATE (POST) — fork an existing uploaded deck into a brand-new
 // one owned by the CURRENT session. Gate order mirrors the sibling PUT/DELETE
@@ -115,6 +116,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
   }
 
+  // Re-home the fork's vault-asset URLs onto the NEW slug BEFORE storing them, so
+  // the fork's <img src="/d-assets/<newSlug>/…"> tags resolve against its OWN
+  // copied rows (see copyAssets below) rather than the source deck's. The path
+  // shape is fixed, so a plain global replace of the exact /d-assets/<slug>/
+  // prefix is exact and preserves validity (only the slug segment changes).
+  const forkHtml = source.html.split(`/d-assets/${slug}/`).join(`/d-assets/${newSlug}/`);
+
   // Insert the fork under the CURRENT user (not the original owner). insertUploaded
   // Deck forces publish_status 'unpublished', so a fork is never instantly public.
   // ON CONFLICT DO NOTHING → "conflict" if the slug raced past firstFreeSlug (409).
@@ -125,7 +133,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
       title: `${meta.title} (copy)`,
       date: todayIso(),
       description: meta.description ?? null,
-      html: source.html,
+      html: forkHtml,
       ownerId: session.userId, // the fork belongs to whoever duplicated it
     });
   } catch {
@@ -139,6 +147,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
   // from its validated bundle (best-effort, same as the create route — a DB hiccup
   // here just leaves the fork's grounding empty, it doesn't fail the stored copy).
   await replaceUploadedDeckSlides(newSlug, validation.slides);
+
+  // Copy the source's stored vault assets onto the fork so it owns its OWN
+  // deck_assets rows (the html above already points at /d-assets/<newSlug>/…).
+  // Best-effort like the grounding copy: copyAssets throws on a DB error, but the
+  // fork is already stored, so a hiccup here must not fail the request.
+  try {
+    await copyAssets(slug, newSlug);
+  } catch {
+    // swallow — the fork is stored; its assets can be re-copied later.
+  }
 
   return NextResponse.json({ slug: newSlug }, { status: 201 });
 }
