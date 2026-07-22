@@ -35,18 +35,27 @@ function logDbUnreachableOnce(err: unknown): void {
 
 let poolPromise: Promise<Pool | null> | null = null;
 
-// Decide the SSL mode from the connection host. Railway's private network host
-// (…​.railway.internal) speaks plaintext inside the project and rejects TLS; the
-// public proxy (and anything else) needs TLS but presents a cert we don't pin,
-// so we accept it without verification (same posture as sslmode=require).
-function sslFor(url: string): false | { rejectUnauthorized: false } {
+// Railway's private network host speaks plaintext inside the project. Every
+// public connection must authenticate the server certificate; DATABASE_CA_CERT
+// supports providers using a private CA (literal PEM or base64-encoded PEM).
+function sslFor(url: string): false | { rejectUnauthorized: true; ca?: string } {
   try {
     const host = new URL(url).hostname;
     if (host.endsWith(".railway.internal")) return false;
   } catch {
-    /* unparseable URL — fall through to permissive SSL */
+    /* The pool will surface the malformed URL without exposing it in logs. */
   }
-  return { rejectUnauthorized: false };
+  const configuredCa = process.env.DATABASE_CA_CERT?.trim();
+  if (!configuredCa) return { rejectUnauthorized: true };
+  const ca = configuredCa.includes("BEGIN CERTIFICATE")
+    ? configuredCa.replace(/\\n/g, "\n")
+    : Buffer.from(configuredCa, "base64").toString("utf8");
+  return { rejectUnauthorized: true, ca };
+}
+
+function poolSize(): number {
+  const parsed = Number(process.env.DATABASE_POOL_MAX ?? 5);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 20 ? parsed : 5;
 }
 
 /** The shared pool, or null when no `DATABASE_URL` is configured / pg is absent. */
@@ -62,13 +71,16 @@ export function getPool(): Promise<Pool | null> {
           ssl: sslFor(url),
           // Serverless-friendly: a small pool per warm instance, drop idle
           // clients quickly, and fail fast if the DB is unreachable.
-          max: 5,
+          max: poolSize(),
           idleTimeoutMillis: 30_000,
-          connectionTimeoutMillis: 10_000,
+          connectionTimeoutMillis: 5_000,
+          query_timeout: 15_000,
+          statement_timeout: 15_000,
+          lock_timeout: 5_000,
+          idle_in_transaction_session_timeout: 15_000,
+          application_name: "vibedeck-web",
         });
-        // Swallow idle-client errors so a DB blip never becomes an unhandled
-        // exception — every caller already falls back to the static data.
-        pool.on("error", () => {});
+        pool.on("error", logDbUnreachableOnce);
         return pool;
       } catch (err) {
         logDbUnreachableOnce(err);

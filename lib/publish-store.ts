@@ -8,6 +8,7 @@
 // column + uniqueness index live in migration 002; the initial main deck is
 // chosen by ensureMainSet() in the boot sequence (lib/slides-store.ts).
 
+import type { PoolClient } from "pg";
 import { getPool, isDbReachable, query } from "./db";
 import { ensureSchema } from "./schema";
 
@@ -83,10 +84,9 @@ export async function isDeckViewable(slug: string, isPresenter: boolean): Promis
  * The 'main' case is the interesting one: at most one deck may be main (enforced
  * by the `one_main` partial unique index from migration 002). We DEMOTE the
  * current main and PROMOTE this slug inside ONE transaction on ONE pinned client
- * so the pair is atomic. If two presenters race to promote different decks, one
- * transaction wins and the other trips the unique index (Postgres 23505) on
- * COMMIT — we ROLLBACK and return the CURRENT reality instead of a 500, because
- * the loser should simply see the winner's choice, not an error.
+ * so the pair is atomic. The target row is locked and verified before the current
+ * main is demoted, preventing a raced delete/missing slug from leaving no main.
+ * The partial unique index remains the concurrent-promotion backstop.
  *
  * For 'normal'/'unpublished' there's no main invariant to maintain, so a single
  * UPDATE of that one row suffices (no demotion, no transaction).
@@ -104,7 +104,11 @@ export async function setPublishStatus(
   if (status !== "main") {
     // Simple path: no main invariant to protect — update the one row.
     try {
-      await pool.query(`UPDATE decks SET publish_status = $2 WHERE slug = $1`, [slug, status]);
+      const res = await pool.query(`UPDATE decks SET publish_status = $2 WHERE slug = $1`, [
+        slug,
+        status,
+      ]);
+      if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
       return { ok: true, statusMap: await getPublishStatusMap() };
     } catch (err) {
       console.error("[publish-store] setPublishStatus failed:", err);
@@ -114,16 +118,35 @@ export async function setPublishStatus(
 
   // Promote-to-main: demote the incumbent + promote this slug atomically on one
   // pinned client (a transaction spans multiple statements on a single connection).
-  const client = await pool.connect();
+  let client: PoolClient;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    console.error("[publish-store] setPublishStatus (main) could not acquire a connection:", err);
+    return { ok: false, error: "database_unavailable" };
+  }
   try {
     await client.query("BEGIN");
+    const target = await client.query(
+      `SELECT 1 FROM decks WHERE slug = $1 FOR UPDATE`,
+      [slug],
+    );
+    if ((target.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, error: "not_found" };
+    }
     await client.query(
       `UPDATE decks SET publish_status = 'normal' WHERE publish_status = 'main' AND slug <> $1`,
       [slug],
     );
-    await client.query(`UPDATE decks SET publish_status = 'main' WHERE slug = $1`, [slug]);
+    const promoted = await client.query(
+      `UPDATE decks SET publish_status = 'main' WHERE slug = $1`,
+      [slug],
+    );
+    if ((promoted.rowCount ?? 0) === 0) {
+      throw new Error("setPublishStatus: target disappeared while locked");
+    }
     await client.query("COMMIT");
-    return { ok: true, statusMap: await getPublishStatusMap() };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -133,12 +156,16 @@ export async function setPublishStatus(
     // 23505 = unique_violation on the `one_main` index: a genuine concurrent-
     // promote race we lost. That's not a server error — return current reality.
     const code = (err as { code?: string })?.code;
-    if (code === "23505") {
-      return { ok: true, statusMap: await getPublishStatusMap() };
+    if (code !== "23505") {
+      console.error("[publish-store] setPublishStatus (main) failed:", err);
+      return { ok: false, error: "database_unavailable" };
     }
-    console.error("[publish-store] setPublishStatus (main) failed:", err);
-    return { ok: false, error: "database_unavailable" };
   } finally {
     client.release();
   }
+
+  // Do not ask the pool for another connection until the pinned transaction
+  // client is released. With a one-connection pool, the old in-try call could
+  // wait forever for the very client held by this function.
+  return { ok: true, statusMap: await getPublishStatusMap() };
 }

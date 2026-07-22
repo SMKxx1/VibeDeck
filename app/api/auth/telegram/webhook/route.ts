@@ -1,6 +1,12 @@
 import crypto from "crypto";
 import { NextResponse, type NextRequest } from "next/server";
-import { verifyCallbackData, answerCallback, editApprovalMessage } from "@/lib/telegram";
+import {
+  answerCallback,
+  editApprovalMessage,
+  getTelegramAdminIdentity,
+  normalizeTelegramId,
+  verifyCallbackData,
+} from "@/lib/telegram";
 import { approveRequest, rejectRequest } from "@/lib/provision";
 import { getRequest } from "@/lib/account-requests";
 
@@ -12,7 +18,11 @@ import { getRequest } from "@/lib/account-requests";
 //      webhook (setWebhook secret_token=...). Telegram echoes it on every
 //      delivery; only a caller holding TELEGRAM_WEBHOOK_SECRET gets past this.
 //      Unset env → 404: the route is inert until explicitly configured.
-//   2. The callback_data itself is HMAC-signed (lib/telegram buildCallbackData,
+//   2. The callback must come from the configured admin user, in the configured
+//      admin chat, on the original notification message. A valid Telegram
+//      delivery alone does not prove that the person tapping a group-chat button
+//      is the administrator.
+//   3. The callback_data itself is HMAC-signed (lib/telegram buildCallbackData,
 //      keyed by AUTH_SECRET) binding {requestId, action} — so even a leaked bot
 //      token / forged delivery cannot approve anything: verifyCallbackData
 //      rejects any payload we didn't mint.
@@ -30,6 +40,11 @@ interface TgUpdate {
   callback_query?: {
     id?: unknown;
     data?: unknown;
+    from?: { id?: unknown };
+    message?: {
+      message_id?: unknown;
+      chat?: { id?: unknown };
+    };
   };
 }
 
@@ -44,7 +59,8 @@ const OK = () => NextResponse.json({ ok: true });
 
 export async function POST(req: NextRequest) {
   const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (!expected) return new NextResponse(null, { status: 404 }); // unconfigured → inert
+  const admin = getTelegramAdminIdentity();
+  if (!expected || !admin) return new NextResponse(null, { status: 404 }); // unconfigured → inert
   if (!secretHeaderOk(req, expected)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
@@ -57,7 +73,16 @@ export async function POST(req: NextRequest) {
   }
 
   const cq = update.callback_query;
-  if (!cq || typeof cq.id !== "string") return OK(); // not a button press — ignore
+  if (!cq || typeof cq.id !== "string" || cq.id.length > 256) return OK(); // not a button press — ignore
+
+  const actorId = normalizeTelegramId(cq.from?.id, false);
+  const chatId = normalizeTelegramId(cq.message?.chat?.id, true);
+  const messageId = normalizeTelegramId(cq.message?.message_id, false);
+  if (actorId !== admin.userId || chatId !== admin.chatId || !messageId) {
+    console.warn("[telegram-webhook] rejected callback from an unexpected actor or chat");
+    await answerCallback(cq.id, "This button is restricted to the administrator.");
+    return OK();
+  }
 
   try {
     const parsed = verifyCallbackData(typeof cq.data === "string" ? cq.data : null);
@@ -66,20 +91,22 @@ export async function POST(req: NextRequest) {
       return OK();
     }
 
-    // Read the request BEFORE deciding — we need its email + notify refs for
-    // the message edit, and getRequest is fail-open (null on DB blip).
+    // Bind the callback to the exact notification row/message before deciding.
+    // A DB blip or an old/copied button fails closed; the admin UI remains usable.
     const request = await getRequest(parsed.rid);
+    if (
+      !request ||
+      normalizeTelegramId(request.notifyChatId, true) !== admin.chatId ||
+      normalizeTelegramId(request.notifyMessageId, false) !== messageId
+    ) {
+      await answerCallback(cq.id, "Invalid or expired button.");
+      return OK();
+    }
 
     if (parsed.act === "allow") {
       const result = await approveRequest(parsed.rid, "telegram");
       if (result.ok) {
-        if (request?.notifyChatId && request.notifyMessageId) {
-          await editApprovalMessage(
-            request.notifyChatId,
-            request.notifyMessageId,
-            `✅ Approved ${request.email}`,
-          );
-        }
+        await editApprovalMessage(admin.chatId, messageId, `✅ Approved ${request.email}`);
         await answerCallback(cq.id, "Approved — account provisioned.");
       } else if (result.already) {
         // The first tap already edited the message; just acknowledge.
@@ -90,13 +117,7 @@ export async function POST(req: NextRequest) {
     } else {
       const result = await rejectRequest(parsed.rid, "telegram");
       if (result.ok) {
-        if (request?.notifyChatId && request.notifyMessageId) {
-          await editApprovalMessage(
-            request.notifyChatId,
-            request.notifyMessageId,
-            `❌ Rejected ${request.email}`,
-          );
-        }
+        await editApprovalMessage(admin.chatId, messageId, `❌ Rejected ${request.email}`);
         await answerCallback(cq.id, "Rejected.");
       } else {
         await answerCallback(cq.id, "Already decided.");

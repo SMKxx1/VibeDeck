@@ -7,12 +7,15 @@
 // PRESENTER_PASSWORD out of the client bundle (this module is server-only).
 
 import crypto from "crypto";
+import { authSecretConfigError } from "./config";
 
 export const AUTH_COOKIE = "presenter_session";
 const MAX_AGE_SECONDS = 60 * 60 * 12; // a session lasts a workday
 
 function secret(): string {
   const s = process.env.AUTH_SECRET;
+  const configError = authSecretConfigError(s);
+  if (configError) throw new Error(configError);
   if (s) return s;
   // FAIL CLOSED in production. Without AUTH_SECRET the HMAC key would be the
   // public default, so ANYONE could mint a validly-signed `{v:2, role:"admin"}`

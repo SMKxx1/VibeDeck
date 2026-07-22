@@ -7,6 +7,7 @@ import { checkRateLimit } from "@/lib/kv";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
+import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 
 // Viewer→presenter backchannel (#2).
 //   POST — a VIEWER sends one signal (👍 up / 🎉 party / 🐢 slow / 🙋 hand /
@@ -57,7 +58,9 @@ export async function POST(req: Request) {
   }
   const slug = (body.slug ?? "").toString();
   const kind = (body.kind ?? "").toString();
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
   if (!isSignalKind(kind)) return NextResponse.json({ error: "bad_kind" }, { status: 400 });
 
   if (!(await isDeckViewable(slug, await isPresenterReq()))) {
@@ -67,12 +70,28 @@ export async function POST(req: Request) {
   const name = cleanName(body.name);
   // Dedicated rate-limit bucket (`rl:signal:*`), distinct from the AI limiter, so
   // reacting never counts against a viewer's chat budget and vice-versa.
-  const rl = await checkRateLimit(`signal:${name}`);
-  if (!rl.allowed) {
-    return NextResponse.json({ error: "rate_limited", retryAfter: rl.retryAfter }, { status: 429 });
+  const [publicLimit, identityLimit] = await Promise.all([
+    checkPublicRateLimit(req, "signal", `${slug}:${name}`, {
+      max: 1_000,
+      windowSeconds: 60,
+    }),
+    checkRateLimit(`signal:${slug}:${name}`, { max: 30, windowSeconds: 60 }),
+  ]);
+  if (!publicLimit.allowed || !identityLimit.allowed) {
+    return NextResponse.json(
+      {
+        error: "rate_limited",
+        retryAfter: Math.max(publicLimit.retryAfter, identityLimit.retryAfter),
+      },
+      { status: 429 },
+    );
   }
 
-  await addSignal(slug, name, kind);
+  try {
+    await addSignal(slug, name, kind);
+  } catch {
+    return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+  }
   // Insight Engine: an "I'm lost" tap is a struggle signal for the heat strip.
   // Signals aren't per-slide, so attribute it to the room's CURRENT live slide
   // (getSession — the slide being presented when the viewer got lost). Content-
@@ -88,7 +107,9 @@ export async function POST(req: Request) {
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
 
   if (!(await isPresenterReq())) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });

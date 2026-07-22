@@ -1510,7 +1510,7 @@ function UploadPanel({ panel, onClose, onDone }: { panel: PanelState; onClose: (
                 below only shows for the OTHER failure modes (auth/slug/size/…). */}
             {issues.length > 0 && (
               <div style={noticeStyle("error")}>
-                <div style={{ marginBottom: 4 }}>This deck can't be used yet:</div>
+                <div style={{ marginBottom: 4 }}>This deck can’t be used yet:</div>
                 <ul style={{ margin: 0, paddingLeft: 18, fontWeight: 400 }}>
                   {issues.map((it, i) => (
                     <li key={i} style={{ marginTop: 2 }}>{it}</li>
@@ -1752,7 +1752,7 @@ function ImportPanel({ onClose, onDone }: { onClose: () => void; onDone: () => v
           <>
             <div style={noticeStyle("ok")}>
               {slideCount != null ? `Built ${slideCount} ${slideCount === 1 ? "slide" : "slides"}. ` : ""}
-              Saved as a hidden deck — set it Public or Live from its card when you're ready.
+              Saved as a hidden deck — set it Public or Live from its card when you’re ready.
             </div>
             {warnings.length > 0 && (
               <div style={noticeStyle("warn")}>
@@ -1769,7 +1769,7 @@ function ImportPanel({ onClose, onDone }: { onClose: () => void; onDone: () => v
           <>
             <div style={{ fontSize: 13, lineHeight: 1.5, color: "#6E6A62" }}>
               Paste Markdown to build a deck. It lands hidden and owned by you, with AI context
-              derived automatically — publish it from its card when you're ready.
+              derived automatically — publish it from its card when you’re ready.
             </div>
 
             <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -2056,7 +2056,7 @@ function BootCheck({ slug }: { slug: string }) {
   }
   return (
     <div style={noticeStyle("warn")}>
-      This deck didn't boot in a browser — check the structure and use Replace.
+      This deck didn’t boot in a browser — check the structure and use Replace.
     </div>
   );
 }

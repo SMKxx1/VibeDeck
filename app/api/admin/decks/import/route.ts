@@ -5,7 +5,6 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { staticDecks } from "@/lib/decks/static";
 import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
-import { replaceUploadedDeckSlides } from "@/lib/slides-store";
 import { markdownToDeck, type DeckTheme } from "@/lib/markdown-deck";
 
 // Markdown → deck import (#21). Widens authoring to non-coders: paste Markdown, get
@@ -107,6 +106,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
   }
 
+  // Attach branch directives before persistence: branches live in deck_slides,
+  // not the generated HTML, and the whole bundle commits atomically below.
+  const slides = validation.slides.map((s) =>
+    rendered.branches[s.index] ? { ...s, branches: rendered.branches[s.index] } : s,
+  );
+
   let result: "ok" | "conflict";
   try {
     result = await insertUploadedDeck({
@@ -116,18 +121,13 @@ export async function POST(req: Request) {
       description: null,
       html: rendered.html,
       ownerId: session.userId,
+      slideCount: validation.slideCount,
+      slides,
     });
   } catch {
     return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
   }
   if (result === "conflict") return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
-
-  // Attach the branch directives (branch points) to the validator's per-slide
-  // metadata — they live in deck_slides, not the HTML, so the merge happens here.
-  const slides = validation.slides.map((s) =>
-    rendered.branches[s.index] ? { ...s, branches: rendered.branches[s.index] } : s,
-  );
-  await replaceUploadedDeckSlides(slug, slides);
 
   return NextResponse.json(
     { slug, slideCount: validation.slideCount, warnings: validation.warnings },

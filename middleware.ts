@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { authSecretConfigError } from "./lib/config";
 
 // Origin isolation for untrusted deck HTML (architecture review finding F1).
 //
@@ -26,7 +27,7 @@ import type { NextRequest } from "next/server";
 // configured" and the deck-host branch below can never match — so /d-content/*
 // fails closed (404) on every host until infra sets this. That is intentional:
 // a missing config must not silently expose deck content on the app origin.
-const DECK_HOST = process.env.DECK_HOST;
+const DECK_HOST = normalizeHost(process.env.DECK_HOST ?? null);
 
 // Normalize a Host header for comparison: lowercase, and drop any trailing
 // ":port" (Railway/local dev often carry one, e.g. "decks.test.local:3000").
@@ -46,6 +47,16 @@ function normalizeHost(host: string | null): string {
 }
 
 export function middleware(req: NextRequest) {
+  // A weak signing key is an authentication bypass, not a warning. Enforce this
+  // at the request boundary as well as in lib/auth so a bad production deploy is
+  // visibly unhealthy even before somebody attempts to sign in.
+  if (authSecretConfigError()) {
+    return new NextResponse(null, {
+      status: 503,
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+    });
+  }
+
   const host = normalizeHost(req.headers.get("host"));
   const pathname = req.nextUrl.pathname;
   // The deck-host allowlist: untrusted deck HTML and its vault-served images.
@@ -79,24 +90,48 @@ export function middleware(req: NextRequest) {
   // "Content-Length: 55000000" attack; the framework 55mb cap stays the
   // absolute backstop for chunked / mislabeled bodies.
   const MAX_BODY = 2 * 1024 * 1024; // 2MB — generous for every JSON route (largest legit viewer body is a short question).
-  // Only the /api/admin/decks/* upload routes need large bodies — this prefix
-  // covers create, [slug] replace, [slug]/assets, [slug]/draft, and import, all
-  // of which are session + CSRF gated and enforce their own size checks.
-  const allowsLargeBody = pathname.startsWith("/api/admin/decks");
-  const len = Number(req.headers.get("content-length") || 0);
-  if (!allowsLargeBody && len > MAX_BODY) {
+  // Only the raw asset POST needs more than 2MB. Deck create/replace/import/draft
+  // routes have much smaller handler limits and must not inherit the 55MB escape.
+  const allowsLargeBody =
+    req.method === "POST" && /^\/api\/admin\/decks\/[^/]+\/assets\/?$/.test(pathname);
+  const rawLength = req.headers.get("content-length");
+  const transferEncoding = req.headers.get("transfer-encoding");
+
+  // Reject ambiguous request framing before a proxy/runtime disagreement can
+  // become either a body-limit bypass or request-smuggling primitive.
+  if (rawLength !== null && transferEncoding !== null) {
+    return new NextResponse(null, { status: 400 });
+  }
+
+  let length: number | null = null;
+  if (rawLength !== null) {
+    if (!/^\d+$/.test(rawLength)) return new NextResponse(null, { status: 400 });
+    length = Number(rawLength);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      return new NextResponse(null, { status: 400 });
+    }
+  }
+  if (!allowsLargeBody && length !== null && length > MAX_BODY) {
     return new NextResponse(null, { status: 413 }); // Payload Too Large.
+  }
+
+  // All current API POST/PUT/PATCH handlers except these two parse a body. Requiring
+  // its byte length closes the chunked/missing-header hole in the best-effort cap;
+  // the two allowlisted POSTs are intentionally bodyless actions.
+  const isBodyMethod = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+  const isBodylessAction =
+    req.method === "POST" &&
+    (pathname === "/api/logout" || /^\/api\/admin\/decks\/[^/]+\/duplicate\/?$/.test(pathname));
+  if (pathname.startsWith("/api/") && isBodyMethod && !isBodylessAction && length === null) {
+    return new NextResponse(null, { status: 411 });
   }
 
   return NextResponse.next();
 }
 
-// Match everything EXCEPT Next's own internal static/image assets and the
-// favicon. Crucially this DOES cover /api/* — the whole design depends on API
-// routes being gated on the deck host. We intentionally do NOT use Next's
-// stock "exclude anything with a file extension" matcher: that would silently
-// stop gating asset-looking paths and give a false sense that the matcher
-// narrows scope. Scope is decided by the host/path logic above, not the matcher.
+// Match every path, including Next internals. Otherwise the supposedly
+// default-deny deck host would still expose /_next/image and /_next/static.
+// Scope is decided by the host/path logic above, not by matcher exceptions.
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/:path*"],
 };

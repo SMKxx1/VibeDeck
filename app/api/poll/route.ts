@@ -2,13 +2,23 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession, type Session } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
-import { openPoll, revealPoll, closePoll, getLiveTally, getActivePoll, setBranchTaken } from "@/lib/poll";
+import {
+  MAX_OPTION_LEN,
+  MAX_OPTIONS,
+  MAX_QUESTION,
+  openPoll,
+  revealPollWithStatus,
+  closePoll,
+  getLiveTally,
+  getActivePoll,
+  routeBranch,
+} from "@/lib/poll";
 import { generatePollExplanation } from "@/lib/poll-explain";
 import { getSlideBranches } from "@/lib/slides-store";
-import { setPresenterIndex, getSession } from "@/lib/session";
+import { getSession } from "@/lib/session";
 import { bumpPulse } from "@/lib/pulse";
 import { getDeck } from "@/lib/decks";
-import { getRedis } from "@/lib/redis";
+import { isValidDeckSlug } from "@/lib/request-security";
 
 // Live poll control — PRESENTER ONLY.
 //   POST { action: "open" | "reveal" | "close" | "route", ... } drives the poll
@@ -25,10 +35,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
-
-// TTL for the "this poll's wrong votes were already counted" once-flag — matches
-// the 8h horizon lib/poll.ts and lib/pulse.ts give their session-scoped keys.
-const COUNTED_TTL_S = 60 * 60 * 8;
 
 async function isPresenter(): Promise<boolean> {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
@@ -76,7 +82,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
   const slug = (body.slug ?? "").toString();
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
   const action = (body.action ?? "").toString();
 
   // Branch vote (branch points): options ARE the slide's authored branch labels,
@@ -84,20 +92,30 @@ export async function POST(req: Request) {
   // can only ever offer the paths the deck actually declares.
   if (action === "open" && body.kind === "branch") {
     const index = body.index;
-    if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+    if (
+      typeof index !== "number" ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index > 10_000
+    ) {
       return NextResponse.json({ error: "bad_index" }, { status: 400 });
     }
     const branches = await getSlideBranches(slug, index);
     if (!branches) return NextResponse.json({ error: "no_branches" }, { status: 400 });
     const question =
       (body.question ?? "").toString().trim().slice(0, 400) || "Where should we go next?";
-    const poll = await openPoll(slug, {
-      question,
-      options: branches.map((b) => b.label),
-      correctIndex: null,
-      kind: "branch",
-      branches,
-    });
+    let poll;
+    try {
+      poll = await openPoll(slug, {
+        question,
+        options: branches.map((b) => b.label),
+        correctIndex: null,
+        kind: "branch",
+        branches,
+      });
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
     return NextResponse.json(
       { poll, tally: new Array(poll.options.length).fill(0), total: 0 },
       { headers: NO_STORE },
@@ -107,43 +125,42 @@ export async function POST(req: Request) {
   if (action === "open") {
     const question = (body.question ?? "").toString().trim();
     const options = Array.isArray(body.options)
-      ? body.options.map((o) => (o ?? "").toString())
+      ? body.options.slice(0, MAX_OPTIONS).map((o) => (o ?? "").toString().slice(0, MAX_OPTION_LEN))
       : [];
     const cleaned = options.map((o) => o.trim()).filter((o) => o.length > 0);
-    if (!question) return NextResponse.json({ error: "missing_question" }, { status: 400 });
+    if (!question || question.length > MAX_QUESTION) {
+      return NextResponse.json({ error: "bad_question" }, { status: 400 });
+    }
     if (cleaned.length < 2) return NextResponse.json({ error: "need_options" }, { status: 400 });
     const correctIndex =
       typeof body.correctIndex === "number" ? body.correctIndex : null;
-    const poll = await openPoll(slug, { question, options, correctIndex });
+    let poll;
+    try {
+      poll = await openPoll(slug, { question, options, correctIndex });
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
     return NextResponse.json({ poll, tally: new Array(poll.options.length).fill(0), total: 0 }, { headers: NO_STORE });
   }
 
   if (action === "reveal") {
-    // Read the pre-reveal state first so a repeated "reveal" (idempotent for the
-    // poll itself) can't double-count the wrong votes below.
-    const prior = await getActivePoll(slug);
-    const poll = await revealPoll(slug);
-    if (!poll) return NextResponse.json({ error: "no_poll" }, { status: 404 });
+    let result;
+    try {
+      result = await revealPollWithStatus(slug);
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
+    if (!result) return NextResponse.json({ error: "no_poll" }, { status: 404 });
+    const { poll, revealedNow } = result;
     // Insight Engine: a knowledge-check with a correct answer just froze its
     // tally — count the WRONG votes as struggle signals on the heat strip.
     // Polls aren't per-slide, so attribute them to the room's CURRENT live slide
     // (same convention as an "I'm lost" signal). Content-free (a count only —
     // never who voted) and fire-and-forget: it must never affect the reveal.
-    if (prior && !prior.revealed && poll.correctIndex !== null && poll.tally) {
+    if (revealedNow && poll.correctIndex !== null && poll.tally) {
       const wrong = Math.max(0, (poll.total ?? 0) - (poll.tally[poll.correctIndex] ?? 0));
       if (wrong > 0) {
-        // The prior.revealed read above isn't atomic: two concurrent Reveal taps
-        // (co-host mode) can both see it false and both bump, double-counting the
-        // struggle signal. Claim an atomic once-flag on this poll's identity
-        // (hsetnx — the field is set exactly once) and only the winner bumps.
-        // Still fire-and-forget: it must never affect (or fail) the reveal.
         void (async () => {
-          const redis = await getRedis();
-          if (redis) {
-            const first = await redis.hsetnx(`pulse:counted:${slug}`, poll.id, 1);
-            if (first !== 1) return; // another reveal already counted this poll
-            await redis.expire(`pulse:counted:${slug}`, COUNTED_TTL_S);
-          }
           const s = await getSession(slug);
           await bumpPulse(slug, s.index, "poll_wrong", wrong);
         })().catch(() => {});
@@ -185,17 +202,32 @@ export async function POST(req: Request) {
     // Clicker rule: with a mismatching driver on record this is a NO-OP that
     // returns the current state — a moderator can reveal the vote but only the
     // driver moves the room. `routed` tells the caller which one happened.
-    const state = await setPresenterIndex(slug, from, driverIdFor(auth));
-    const routed = state.index === from;
-    const updated = routed ? await setBranchTaken(slug, poll.id, optionIndex as number) : null;
-    return NextResponse.json(
-      { poll: updated ?? poll, index: state.index, max: state.max, routed },
-      { headers: NO_STORE },
-    );
+    const me = driverIdFor(auth);
+    try {
+      const result = await routeBranch(slug, poll.id, optionIndex as number, from, me);
+      if (!result) {
+        return NextResponse.json({ error: "stale_poll" }, { status: 409 });
+      }
+      return NextResponse.json(
+        {
+          poll: result.poll,
+          index: result.state.index,
+          max: result.state.max,
+          routed: result.routed,
+        },
+        { headers: NO_STORE },
+      );
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
   }
 
   if (action === "close") {
-    await closePoll(slug);
+    try {
+      await closePoll(slug);
+    } catch {
+      return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+    }
     return NextResponse.json({ ok: true }, { headers: NO_STORE });
   }
 
@@ -207,7 +239,9 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
   const live = await getLiveTally(slug);
   if (!live) return NextResponse.json({ poll: null }, { headers: NO_STORE });
   return NextResponse.json(

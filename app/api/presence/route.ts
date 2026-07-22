@@ -4,14 +4,14 @@ import { markPresent, getRoster } from "@/lib/presence";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
+import { checkRateLimit } from "@/lib/kv";
+import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 
 // Live presence / roster (#1).
 //   POST — a VIEWER heartbeat: "I'm here, on slide N, following=Y". Records
 //          presence and returns the current headcount so the viewer's "N watching"
-//          chip updates without a second request. Deliberately NOT rate-limited:
-//          it's an interval heartbeat (not a user-triggered action), and sharing
-//          the per-name AI limiter would starve the tutor. Writes are a cheap
-//          per-field hset and the roster is bounded + freshness-pruned.
+//          chip updates without a second request. Uses dedicated heartbeat limits
+//          (not the AI limiter); writes and roster cardinality are bounded.
 //   GET  — the PRESENTER reads the full roster (names + each viewer's slide +
 //          follow state). Presenter-gated so the room's name list is a presenter
 //          tool, not public.
@@ -56,7 +56,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
   const slug = (body.slug ?? "").toString();
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
 
   // Publish gate: no presence on a deck the caller can't view (indistinguishable
   // 404, matching the other live routes).
@@ -65,15 +67,43 @@ export async function POST(req: Request) {
   }
 
   const name = cleanName(body.name);
-  const index = Number.isFinite(body.index) ? Number(body.index) : 0;
-  await markPresent(slug, name, index, body.follow === true);
-  const roster = await getRoster(slug);
-  return NextResponse.json({ watching: roster.length }, { headers: NO_STORE });
+  const index = body.index;
+  if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > 10_000) {
+    return NextResponse.json({ error: "bad_index" }, { status: 400 });
+  }
+  const [publicLimit, identityLimit] = await Promise.all([
+    checkPublicRateLimit(req, "presence", `${slug}:${name}`, {
+      max: 30_000,
+      windowSeconds: 60,
+    }),
+    checkRateLimit(`presence:${slug}:${name}`, { max: 120, windowSeconds: 60 }),
+  ]);
+  if (!publicLimit.allowed || !identityLimit.allowed) {
+    return NextResponse.json(
+      {
+        error: "rate_limited",
+        retryAfter: Math.max(publicLimit.retryAfter, identityLimit.retryAfter),
+      },
+      { status: 429 },
+    );
+  }
+  let result: Awaited<ReturnType<typeof markPresent>>;
+  try {
+    result = await markPresent(slug, name, index, body.follow === true);
+  } catch {
+    return NextResponse.json({ error: "live_state_unavailable" }, { status: 503 });
+  }
+  if (result.status === "full") {
+    return NextResponse.json({ error: "roster_full" }, { status: 429 });
+  }
+  return NextResponse.json({ watching: result.watching }, { headers: NO_STORE });
 }
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
-  if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
+  if (!isValidDeckSlug(slug)) {
+    return NextResponse.json({ error: "bad_slug" }, { status: 400 });
+  }
 
   // Presenter-only: the detailed roster (names + positions) is a presenter tool.
   if (!(await isPresenterReq())) {

@@ -10,6 +10,7 @@
 // Seeding is insert-only (ON CONFLICT DO NOTHING) so a redeploy never clobbers a
 // presenter's later edits.
 
+import type { PoolClient } from "pg";
 import { getPool, isDbReachable, query } from "./db";
 import { ensureSchema, SEEDS } from "./schema";
 import type { DeckSlideMeta } from "./deck-validator";
@@ -255,24 +256,91 @@ export async function updateSlideMeta(
 }
 
 /**
- * Replace an UPLOADED deck's per-slide grounding wholesale from its validated
- * bundle (label + AI context + speaker notes derived by lib/deck-validator from
- * the deck's <section>s and its vibedeck-context manifest). Called on upload and
- * on replace.
+ * Join an existing transaction and replace an uploaded deck's derived slide
+ * metadata. The caller owns BEGIN/COMMIT/ROLLBACK so it can commit these rows
+ * together with the deck HTML and slide_count.
  *
- * Unlike updateSlideMeta (a presenter's partial edit of ONE slide), this is the
- * author RE-DECLARING the whole deck, so it overwrites every field for every
- * slide and — critically — deletes any stale rows at indices beyond the new
- * slide count (a replace that shrinks the deck must not leave orphaned grounding
- * that /api/ask's getFullContextText would still feed to the model). The delete
- * + multi-row upsert run in ONE transaction on a pinned client so a concurrent
- * read never sees a half-applied deck. Batched into a single INSERT (not N
- * round-trips) so a 300-slide deck is one query, not 300.
- *
- * Best-effort by design: returns void and swallows on no-DB / error. A missing
- * DB just means the deck has no authored grounding yet (generic AI answers),
- * which is a graceful degrade, not an upload failure — the deck HTML itself is
- * already stored by the caller regardless.
+ * Empty notes/context and absent branches intentionally preserve presenter edits,
+ * matching the previous upload/replace behavior. On a shrink, every retained
+ * branch list is revalidated against the new count so it cannot point at a slide
+ * that no longer exists.
+ */
+export async function replaceUploadedDeckSlidesOnClient(
+  client: PoolClient,
+  slug: string,
+  slides: DeckSlideMeta[],
+  slideCount: number,
+): Promise<void> {
+  if (
+    !Number.isInteger(slideCount) ||
+    slideCount < 0 ||
+    slides.length !== slideCount ||
+    slides.some((slide, index) => slide.index !== index)
+  ) {
+    throw new Error("replaceUploadedDeckSlidesOnClient: inconsistent slide metadata");
+  }
+
+  // Drop grounding rows for slides removed by a replacement/draft publish.
+  await client.query(`DELETE FROM deck_slides WHERE deck_slug = $1 AND slide_index >= $2`, [
+    slug,
+    slideCount,
+  ]);
+
+  if (slides.length > 0) {
+    // Build one multi-row INSERT ... ON CONFLICT DO UPDATE. Params per row:
+    // (deck_slug, slide_index, label, speaker_notes, ai_context, branches).
+    const rows: string[] = [];
+    const values: unknown[] = [];
+    let n = 1;
+    for (const slide of slides) {
+      rows.push(`($${n++}, $${n++}, $${n++}, $${n++}, $${n++}, $${n++})`);
+      const branches = sanitizeBranches(slide.branches, slideCount);
+      values.push(
+        slug,
+        slide.index,
+        slide.label,
+        slide.speakerNotes,
+        slide.aiContext,
+        branches ? JSON.stringify(branches) : null,
+      );
+    }
+    await client.query(
+      `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches)
+       VALUES ${rows.join(", ")}
+       ON CONFLICT (deck_slug, slide_index) DO UPDATE
+         SET label = EXCLUDED.label,
+             speaker_notes = CASE WHEN EXCLUDED.speaker_notes IS NULL OR EXCLUDED.speaker_notes = '' THEN deck_slides.speaker_notes ELSE EXCLUDED.speaker_notes END,
+             ai_context = CASE WHEN EXCLUDED.ai_context IS NULL OR EXCLUDED.ai_context = '' THEN deck_slides.ai_context ELSE EXCLUDED.ai_context END,
+             branches = COALESCE(EXCLUDED.branches, deck_slides.branches),
+             updated_at = now()`,
+      values,
+    );
+  }
+
+  // HTML validation knows the new slide count but does not carry manually edited
+  // branches. Re-sanitize retained JSONB after the upsert so preserved branches
+  // cannot retain out-of-range destinations after a shrink.
+  const branchRows = await client.query<{ slide_index: number; branches: unknown }>(
+    `SELECT slide_index, branches
+       FROM deck_slides
+      WHERE deck_slug = $1 AND branches IS NOT NULL`,
+    [slug],
+  );
+  for (const row of branchRows.rows) {
+    const branches = sanitizeBranches(row.branches, slideCount);
+    await client.query(
+      `UPDATE deck_slides
+          SET branches = $3, updated_at = now()
+        WHERE deck_slug = $1 AND slide_index = $2`,
+      [slug, row.slide_index, branches ? JSON.stringify(branches) : null],
+    );
+  }
+}
+
+/**
+ * Legacy best-effort wrapper for callers that only replace slide metadata. New
+ * deck create/replace/publish paths use replaceUploadedDeckSlidesOnClient inside
+ * their own transaction so HTML, slide_count, and deck_slides cannot diverge.
  */
 export async function replaceUploadedDeckSlides(
   slug: string,
@@ -282,13 +350,7 @@ export async function replaceUploadedDeckSlides(
   const pool = await getPool();
   if (!pool) return;
 
-  // Acquire the pinned client OUTSIDE the transaction try, guarded: pool.connect()
-  // itself can reject (pool exhausted past connectionTimeoutMillis, or the DB
-  // dropped between the html write and here). This function is best-effort — the
-  // deck's html is ALREADY stored by the caller — so a failure to acquire must
-  // swallow and return, never propagate as a 5xx that falsely fails a request
-  // whose durable work already succeeded.
-  let client;
+  let client: PoolClient;
   try {
     client = await pool.connect();
   } catch (err) {
@@ -297,41 +359,11 @@ export async function replaceUploadedDeckSlides(
   }
   try {
     await client.query("BEGIN");
-    // Drop any grounding rows at indices this deck no longer has.
-    await client.query(`DELETE FROM deck_slides WHERE deck_slug = $1 AND slide_index >= $2`, [
-      slug,
-      slides.length,
-    ]);
-    if (slides.length > 0) {
-      // Build one multi-row INSERT ... ON CONFLICT DO UPDATE. Params per row:
-      // (deck_slug, slide_index, label, speaker_notes, ai_context, branches).
-      // Preserve DB-authored values the incoming source can't represent: an
-      // absent branches binds to SQL NULL (see the push below — sanitizeBranches
-      // returns null for the HTML-publish path, which the validator never emits
-      // branches for), and empty speaker_notes/ai_context mean "the HTML carried
-      // none", so both COALESCE/CASE back to the row's existing value. The
-      // markdown importer supplies a real branches array (non-null) and non-empty
-      // notes, so those still overwrite.
-      const rows: string[] = [];
-      const values: unknown[] = [];
-      let n = 1;
-      for (const s of slides) {
-        rows.push(`($${n++}, $${n++}, $${n++}, $${n++}, $${n++}, $${n++})`);
-        const branches = sanitizeBranches(s.branches);
-        values.push(slug, s.index, s.label, s.speakerNotes, s.aiContext, branches ? JSON.stringify(branches) : null);
-      }
-      await client.query(
-        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches)
-         VALUES ${rows.join(", ")}
-         ON CONFLICT (deck_slug, slide_index) DO UPDATE
-           SET label = EXCLUDED.label,
-               speaker_notes = CASE WHEN EXCLUDED.speaker_notes IS NULL OR EXCLUDED.speaker_notes = '' THEN deck_slides.speaker_notes ELSE EXCLUDED.speaker_notes END,
-               ai_context = CASE WHEN EXCLUDED.ai_context IS NULL OR EXCLUDED.ai_context = '' THEN deck_slides.ai_context ELSE EXCLUDED.ai_context END,
-               branches = COALESCE(EXCLUDED.branches, deck_slides.branches),
-               updated_at = now()`,
-        values,
-      );
-    }
+    await client.query(
+      `UPDATE decks SET slide_count = $2 WHERE slug = $1 AND kind = 'uploaded'`,
+      [slug, slides.length],
+    );
+    await replaceUploadedDeckSlidesOnClient(client, slug, slides, slides.length);
     await client.query("COMMIT");
   } catch (err) {
     try {

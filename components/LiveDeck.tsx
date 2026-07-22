@@ -1717,6 +1717,8 @@ function mapCatchUpError(code?: string): string {
       return "Those slides have no notes to recap yet.";
     case "ai_not_configured":
       return "AI isn't configured yet — ask the presenter.";
+    case "password_required":
+      return "Open the AI chat and enter the class code first.";
     case "timeout":
       return "That took too long — try again.";
     default:

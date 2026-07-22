@@ -14,8 +14,8 @@
 
 import { getPool, query } from "./db";
 import { ensureSchema } from "./schema";
-import { validateDeckHtml } from "./deck-validator";
-import { replaceUploadedDeckSlides } from "./slides-store";
+import { validateDeckHtml, type DeckSlideMeta } from "./deck-validator";
+import { replaceUploadedDeckSlidesOnClient } from "./slides-store";
 import type { Deck } from "./types";
 
 // The absolute origin that serves uploaded-deck HTML. A NEW env var, distinct from
@@ -139,10 +139,11 @@ export async function deckSlugExists(slug: string): Promise<boolean> {
  * Insert a new uploaded deck. publish_status is 'unpublished' EXPLICITLY — an
  * upload must never be instantly public (never defaulted to anything else).
  * embed_url is NULL (uploaded decks render via the sandboxed contentUrl frame,
- * never the trusted embed path) and slide_count starts 0 (deck_slides is empty —
- * no AI grounding authored yet). ON CONFLICT (slug) DO NOTHING + rowCount 0 →
- * "conflict": a slug that raced past the caller's staticDecks/DB pre-checks, which
- * the DB is the final arbiter of. Throws on DB error (caller → 503).
+ * never the trusted embed path). The top-level row, validated slide_count, and
+ * derived deck_slides rows commit in one transaction. ON CONFLICT (slug) DO
+ * NOTHING + rowCount 0 → "conflict": a slug that raced past the caller's
+ * staticDecks/DB pre-checks, which the DB is the final arbiter of. Throws on DB
+ * error (caller → 503).
  */
 export async function insertUploadedDeck(fields: {
   slug: string;
@@ -151,15 +152,52 @@ export async function insertUploadedDeck(fields: {
   description: string | null;
   html: string;
   ownerId: string | null; // the creating user (Phase 4). NULL for a legacy-admin session.
+  slideCount: number;
+  slides: DeckSlideMeta[];
 }): Promise<"ok" | "conflict"> {
   await ensureSchema();
-  const res = await query(
-    `INSERT INTO decks (slug, title, date, description, kind, publish_status, html, embed_url, slide_count, owner_id)
-     VALUES ($1, $2, $3, $4, 'uploaded', 'unpublished', $5, NULL, 0, $6)
-     ON CONFLICT (slug) DO NOTHING`,
-    [fields.slug, fields.title, fields.date, fields.description, fields.html, fields.ownerId],
-  );
-  return (res.rowCount ?? 0) === 0 ? "conflict" : "ok";
+  const pool = await getPool();
+  if (!pool) throw new Error("insertUploadedDeck: no database configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const res = await client.query(
+      `INSERT INTO decks (slug, title, date, description, kind, publish_status, html, embed_url, slide_count, owner_id)
+       VALUES ($1, $2, $3, $4, 'uploaded', 'unpublished', $5, NULL, $6, $7)
+       ON CONFLICT (slug) DO NOTHING`,
+      [
+        fields.slug,
+        fields.title,
+        fields.date,
+        fields.description,
+        fields.html,
+        fields.slideCount,
+        fields.ownerId,
+      ],
+    );
+    if ((res.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return "conflict";
+    }
+    await replaceUploadedDeckSlidesOnClient(
+      client,
+      fields.slug,
+      fields.slides,
+      fields.slideCount,
+    );
+    await client.query("COMMIT");
+    return "ok";
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* preserve the original write error */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -219,13 +257,39 @@ export async function getAllDeckOwners(): Promise<Record<string, string | null>>
 export async function replaceUploadedDeckHtml(
   slug: string,
   html: string,
+  slides: DeckSlideMeta[],
+  slideCount: number,
 ): Promise<"ok" | "not_found"> {
   await ensureSchema();
-  const res = await query(
-    `UPDATE decks SET html = $2, updated_at = now() WHERE slug = $1 AND kind = 'uploaded'`,
-    [slug, html],
-  );
-  return (res.rowCount ?? 0) === 0 ? "not_found" : "ok";
+  const pool = await getPool();
+  if (!pool) throw new Error("replaceUploadedDeckHtml: no database configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const res = await client.query(
+      `UPDATE decks
+          SET html = $2, slide_count = $3, updated_at = now()
+        WHERE slug = $1 AND kind = 'uploaded'`,
+      [slug, html, slideCount],
+    );
+    if ((res.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return "not_found";
+    }
+    await replaceUploadedDeckSlidesOnClient(client, slug, slides, slideCount);
+    await client.query("COMMIT");
+    return "ok";
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* preserve the original write error */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -248,15 +312,50 @@ export async function getUploadedDeckDeletionInfo(
 }
 
 /**
- * Hard-delete an uploaded deck row; its deck_slides rows cascade via the FK ON
- * DELETE CASCADE (migration 001). `AND kind = 'uploaded'` is defense-in-depth — a
- * registry slug can never be deleted here even if a caller's prior guard regressed.
- * Returns false when nothing matched (already gone / not uploaded). Throws on DB error.
+ * Lock, guard, and hard-delete an uploaded deck in one transaction. The main
+ * status is checked under the same row lock as the DELETE, closing the old race
+ * where a deck could be promoted between a route-level check and deletion.
+ * deck_slides rows cascade via the FK ON DELETE CASCADE (migration 001).
  */
-export async function deleteUploadedDeck(slug: string): Promise<boolean> {
+export type DeleteUploadedDeckResult = "deleted" | "main" | "not_found";
+
+export async function deleteUploadedDeck(slug: string): Promise<DeleteUploadedDeckResult> {
   await ensureSchema();
-  const res = await query(`DELETE FROM decks WHERE slug = $1 AND kind = 'uploaded'`, [slug]);
-  return (res.rowCount ?? 0) > 0;
+  const pool = await getPool();
+  if (!pool) throw new Error("deleteUploadedDeck: no database configured");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const res = await client.query<{ publish_status: string }>(
+      `SELECT publish_status
+         FROM decks
+        WHERE slug = $1 AND kind = 'uploaded'
+        FOR UPDATE`,
+      [slug],
+    );
+    const row = res.rows[0];
+    if (!row) {
+      await client.query("ROLLBACK");
+      return "not_found";
+    }
+    if (row.publish_status === "main") {
+      await client.query("ROLLBACK");
+      return "main";
+    }
+    await client.query(`DELETE FROM decks WHERE slug = $1 AND kind = 'uploaded'`, [slug]);
+    await client.query("COMMIT");
+    return "deleted";
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* preserve the original write error */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // --- DRAFTS (VDML Workbench, migration 008) ------------------------------------
@@ -345,13 +444,11 @@ export type PublishDraftResult =
  * client inside a transaction with the row locked (FOR UPDATE), so the html that
  * goes live is EXACTLY the html that passed validateDeckHtml — a concurrent
  * saveDraftHtml blocks until the swap commits rather than slipping unvalidated
- * bytes into `html`. On success the draft is cleared and deck_slides is
- * re-derived from the validated bundle via replaceUploadedDeckSlides (best-effort
- * AFTER commit, mirroring the upload/replace routes — the durable swap already
- * happened, so a grounding hiccup must not fail the publish). Deliberately does
- * NOT touch publish_status — publishing bytes must never silently re-expose or
- * hide a deck (same rule as replaceUploadedDeckHtml). Throws on DB error
- * (caller → 503).
+ * bytes into `html`. On success the draft is cleared and the validated
+ * slide_count + deck_slides rows commit in the SAME transaction as the live HTML.
+ * Deliberately does NOT touch publish_status — publishing bytes must never
+ * silently re-expose or hide a deck (same rule as replaceUploadedDeckHtml).
+ * Throws on DB error (caller → 503).
  */
 export async function publishDraft(slug: string): Promise<PublishDraftResult> {
   await ensureSchema();
@@ -359,7 +456,6 @@ export async function publishDraft(slug: string): Promise<PublishDraftResult> {
   if (!pool) throw new Error("publishDraft: no database configured");
 
   const client = await pool.connect();
-  let validation: ReturnType<typeof validateDeckHtml> | null = null;
   try {
     await client.query("BEGIN");
     const res = await client.query<{ draft_html: string | null }>(
@@ -378,18 +474,29 @@ export async function publishDraft(slug: string): Promise<PublishDraftResult> {
 
     // Same conformance gate as upload/replace: only a valid VibeDeck bundle may
     // become the live bytes. Never throws (a parse failure is an issue).
-    validation = validateDeckHtml(row.draft_html);
+    const validation = validateDeckHtml(row.draft_html);
     if (!validation.ok) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "invalid", issues: validation.issues, warnings: validation.warnings };
     }
 
     await client.query(
-      `UPDATE decks SET html = draft_html, draft_html = NULL, updated_at = now()
+      `UPDATE decks
+          SET html = draft_html,
+              draft_html = NULL,
+              slide_count = $2,
+              updated_at = now()
        WHERE slug = $1 AND kind = 'uploaded'`,
-      [slug],
+      [slug, validation.slideCount],
+    );
+    await replaceUploadedDeckSlidesOnClient(
+      client,
+      slug,
+      validation.slides,
+      validation.slideCount,
     );
     await client.query("COMMIT");
+    return { ok: true, warnings: validation.warnings };
   } catch (err) {
     // Surface the write failure (route → 503) — but never leave the transaction
     // open on the pooled client.
@@ -402,14 +509,4 @@ export async function publishDraft(slug: string): Promise<PublishDraftResult> {
   } finally {
     client.release();
   }
-
-  // Reaching here means the COMMIT happened, and every path that leaves
-  // `validation` unset or not-ok returned/threw inside the try — assert for TS.
-  if (!validation?.ok) throw new Error("publishDraft: unreachable — committed without validation");
-
-  // Re-derive grounding from the newly published bundle (and drop rows for slides
-  // the draft removed). Best-effort by construction — it swallows its own errors.
-  await replaceUploadedDeckSlides(slug, validation.slides);
-
-  return { ok: true, warnings: validation.warnings };
 }

@@ -9,7 +9,8 @@
 //
 // GRACEFUL DEGRADATION: ensureSchema resolves WITHOUT throwing when there's no DB
 // or any error occurs — callers that follow it with a read/write take their own
-// static fallback. Memoized so the advisory lock is taken at most once per process.
+// static fallback. Successful initialization is memoized; a failed attempt clears
+// the memo so a later request can retry after a transient database outage.
 
 import { randomBytes } from "crypto";
 import type { Pool } from "pg";
@@ -131,20 +132,25 @@ async function ensureAdminUser(pool: Pool): Promise<void> {
  */
 export function ensureSchema(): Promise<void> {
   if (!schemaPromise) {
-    schemaPromise = (async () => {
+    const attempt = (async () => {
       const pool = await getPool();
       if (!pool) return; // no DATABASE_URL / pg missing — nothing to do
-      try {
-        await runMigrations(pool); // DDL: versioned + advisory-locked
-        await seedDecks(pool); // DATA: idempotent insert-only per-slide seed
-        await ensureDeckRows(pool); // DATA: a decks row for every registry deck
-        await ensureMainSet(pool); // DATA: pick the initial main deck if none yet
-        await ensureAdminUser(pool); // DATA: seed the initial admin (Phase 4)
-      } catch (err) {
-        // Log once, then degrade: reads/writes will fall back on their own.
-        console.error("[schema] ensureSchema failed — using static fallback:", err);
-      }
+      await runMigrations(pool); // DDL: versioned + advisory-locked
+      await seedDecks(pool); // DATA: idempotent insert-only per-slide seed
+      await ensureDeckRows(pool); // DATA: a decks row for every registry deck
+      await ensureMainSet(pool); // DATA: pick the initial main deck if none yet
+      await ensureAdminUser(pool); // DATA: seed the initial admin (Phase 4)
     })();
+
+    const guarded: Promise<void> = attempt.catch((err) => {
+      // Preserve the non-throwing store contract for this request, but do not
+      // permanently memoize a transient failure. The identity check prevents an
+      // older attempt from clearing a newer retry if the implementation changes
+      // to overlap attempts in the future.
+      if (schemaPromise === guarded) schemaPromise = null;
+      console.error("[schema] ensureSchema failed — using static fallback; will retry:", err);
+    });
+    schemaPromise = guarded;
   }
   return schemaPromise;
 }

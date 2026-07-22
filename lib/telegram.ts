@@ -1,8 +1,8 @@
 // Telegram admin notify/approval channel (server-only). Telegram is NOT a
 // sign-in method: it is how the OWNER hears about a new account request and
 // approves/rejects it with one tap. Everything here is best-effort — when
-// TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID are unset (both optional, read at
-// CALL time, never at import/build time) or the API is down, the request row is
+// TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID / TELEGRAM_ADMIN_USER_ID are unset
+// (read at CALL time, never at import/build time) or the API is down, the request row is
 // already safely persisted and decidable from the admin view, so nothing throws
 // on the degrade path.
 //
@@ -26,6 +26,7 @@ import { sign } from "./auth";
 import { setNotifyRefs, type AccountRequest } from "./account-requests";
 
 const API_BASE = "https://api.telegram.org";
+const API_TIMEOUT_MS = 10_000;
 
 export type CallbackAction = "allow" | "reject";
 
@@ -33,11 +34,42 @@ const CB_VERSION = "v1";
 const CB_SIG_CHARS = 22; // 128 bits of base64url HMAC-SHA256
 const CB_MAX_BYTES = 64; // Telegram's hard callback_data limit
 
-function config(): { token: string; chatId: string } | null {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_ADMIN_CHAT_ID;
-  if (!token || !chatId) return null;
-  return { token, chatId };
+export interface TelegramAdminIdentity {
+  userId: string;
+  chatId: string;
+}
+
+/** Canonicalize a Telegram JSON/env id without accepting floats or junk. */
+export function normalizeTelegramId(value: unknown, allowNegative: boolean): string | null {
+  let raw: string;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) return null;
+    raw = String(value);
+  } else if (typeof value === "string") {
+    raw = value.trim();
+  } else {
+    return null;
+  }
+  if (!(allowNegative ? /^-?[1-9]\d{0,19}$/ : /^[1-9]\d{0,19}$/).test(raw)) return null;
+  try {
+    return BigInt(raw).toString();
+  } catch {
+    return null;
+  }
+}
+
+/** The one Telegram actor and chat authorized to make account decisions. */
+export function getTelegramAdminIdentity(): TelegramAdminIdentity | null {
+  const userId = normalizeTelegramId(process.env.TELEGRAM_ADMIN_USER_ID, false);
+  const chatId = normalizeTelegramId(process.env.TELEGRAM_ADMIN_CHAT_ID, true);
+  return userId && chatId ? { userId, chatId } : null;
+}
+
+function config(): ({ token: string } & TelegramAdminIdentity) | null {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const identity = getTelegramAdminIdentity();
+  if (!token || !identity) return null;
+  return { token, ...identity };
 }
 
 // One-shot "not configured" signal, mirroring lib/db's logDbUnreachableOnce:
@@ -47,7 +79,7 @@ function logUnconfiguredOnce(): void {
   if (unconfiguredLogged) return;
   unconfiguredLogged = true;
   console.log(
-    "[telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID not set — account requests are persisted but no Telegram ping is sent (approve them from the admin view)",
+    "[telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID / TELEGRAM_ADMIN_USER_ID not fully configured — account requests are persisted but no Telegram ping is sent (approve them from the admin view)",
   );
 }
 
@@ -95,12 +127,22 @@ interface TgResponse {
 }
 
 async function tgPost(token: string, method: string, body: unknown): Promise<TgResponse | null> {
-  const res = await fetch(`${API_BASE}/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return (await res.json().catch(() => null)) as TgResponse | null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    return (await res.json().catch(() => null)) as TgResponse | null;
+  } catch {
+    // Do not propagate the fetch error: its URL may contain the bot token.
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
@@ -138,8 +180,13 @@ export async function notifyAccountRequest(request: AccountRequest): Promise<voi
         ],
       },
     });
-    if (body?.ok && body.result?.message_id != null && body.result.chat?.id != null) {
-      await setNotifyRefs(request.id, String(body.result.chat.id), String(body.result.message_id));
+    const responseChatId = normalizeTelegramId(body?.result?.chat?.id, true);
+    if (
+      body?.ok &&
+      body.result?.message_id != null &&
+      responseChatId === cfg.chatId
+    ) {
+      await setNotifyRefs(request.id, cfg.chatId, String(body.result.message_id));
     } else {
       console.error("[telegram] sendMessage failed:", body?.description ?? "no/invalid response");
     }
@@ -160,10 +207,16 @@ export async function editApprovalMessage(
 ): Promise<void> {
   const cfg = config();
   if (!cfg) return;
+  if (normalizeTelegramId(chatId, true) !== cfg.chatId) {
+    console.warn("[telegram] refused to edit an approval message outside the configured admin chat");
+    return;
+  }
+  const normalizedMessageId = normalizeTelegramId(messageId, false);
+  if (!normalizedMessageId) return;
   try {
     const body = await tgPost(cfg.token, "editMessageText", {
-      chat_id: chatId,
-      message_id: Number(messageId),
+      chat_id: cfg.chatId,
+      message_id: Number(normalizedMessageId),
       text,
     });
     if (!body?.ok) {

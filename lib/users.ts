@@ -4,10 +4,10 @@
 // lib/password directly) to avoid a cycle with this route-facing module.
 
 import { randomBytes } from "crypto";
-import { getPool, query } from "./db";
+import { getPool, hasDb, query } from "./db";
 import { ensureSchema } from "./schema";
 import { verifyPassword } from "./password";
-import { getRedis } from "./redis";
+import { getRedis, hasRedis } from "./redis";
 
 export type Role = "admin" | "presenter";
 
@@ -25,6 +25,10 @@ export function randomId(bytes = 18): string {
 
 // ---- users ------------------------------------------------------------------
 
+export function canonicalAccountIdentifier(value: string): string {
+  return value.trim().toLowerCase();
+}
+
 function rowToUser(r: {
   id: string;
   email: string;
@@ -40,10 +44,11 @@ export async function getUserByEmail(email: string): Promise<User | null> {
   try {
     const res = await query<{ id: string; email: string; password_hash: string; role: string }>(
       `SELECT id, email, password_hash, role FROM users WHERE lower(email) = lower($1)`,
-      [email],
+      [canonicalAccountIdentifier(email)],
     );
     return res.rows[0] ? rowToUser(res.rows[0]) : null;
-  } catch {
+  } catch (err) {
+    if (hasDb()) throw err;
     return null;
   }
 }
@@ -70,23 +75,39 @@ export async function getUserById(id: string): Promise<User | null> {
 const LOGIN_MAX = 8;
 const LOGIN_WINDOW = 300; // 5 min
 const loginBuckets = new Map<string, { count: number; resetAt: number }>();
+const MAX_LOGIN_BUCKETS = 5_000;
+const LOGIN_LIMIT_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+return count
+`;
 
 export async function checkLoginRateLimit(key: string): Promise<boolean> {
   const redis = await getRedis();
   if (redis) {
     try {
-      const k = `login:${key}`;
-      const n = await redis.incr(k);
-      if (n === 1) await redis.expire(k, LOGIN_WINDOW);
+      const k = `login:${canonicalAccountIdentifier(key).slice(0, 320)}`;
+      const n = Number(await redis.eval(LOGIN_LIMIT_SCRIPT, [k], [LOGIN_WINDOW]));
       return n <= LOGIN_MAX;
     } catch {
-      /* fall through to memory */
+      if (process.env.NODE_ENV === "production") return false;
     }
+  } else if (hasRedis() && process.env.NODE_ENV === "production") {
+    return false;
   }
   const now = Date.now();
-  const b = loginBuckets.get(key);
-  if (!b || now > b.resetAt) {
-    loginBuckets.set(key, { count: 1, resetAt: now + LOGIN_WINDOW * 1000 });
+  for (const [bucketKey, bucket] of loginBuckets) {
+    if (bucket.resetAt <= now) loginBuckets.delete(bucketKey);
+  }
+  while (loginBuckets.size >= MAX_LOGIN_BUCKETS) {
+    const oldest = loginBuckets.keys().next().value as string | undefined;
+    if (!oldest) break;
+    loginBuckets.delete(oldest);
+  }
+  const normalizedKey = canonicalAccountIdentifier(key).slice(0, 320);
+  const b = loginBuckets.get(normalizedKey);
+  if (!b || now >= b.resetAt) {
+    loginBuckets.set(normalizedKey, { count: 1, resetAt: now + LOGIN_WINDOW * 1000 });
     return true;
   }
   b.count += 1;
@@ -122,7 +143,7 @@ export async function createInvite(
     await query(
       `INSERT INTO invites (token, email, role, created_by, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
-      [token, email, role, createdBy, expires],
+      [token, email ? canonicalAccountIdentifier(email) : null, role, createdBy, expires],
     );
     return { ok: true, token };
   } catch (err) {
@@ -185,6 +206,7 @@ export async function signupWithInvite(params: {
   passwordHash: string;
 }): Promise<{ ok: true; userId: string; role: Role } | { ok: false; error: string }> {
   await ensureSchema();
+  const email = canonicalAccountIdentifier(params.email);
   const pool = await getPool();
   if (!pool) return { ok: false, error: "database_unavailable" };
 
@@ -206,7 +228,7 @@ export async function signupWithInvite(params: {
       await client.query("ROLLBACK");
       return { ok: false, error: "invalid_invite" };
     }
-    if (row.email && row.email.toLowerCase() !== params.email.toLowerCase()) {
+    if (row.email && canonicalAccountIdentifier(row.email) !== email) {
       await client.query("ROLLBACK");
       return { ok: false, error: "email_mismatch" };
     }
@@ -215,7 +237,7 @@ export async function signupWithInvite(params: {
     try {
       await client.query(
         `INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)`,
-        [userId, params.email, params.passwordHash, role],
+        [userId, email, params.passwordHash, role],
       );
     } catch (err) {
       await client.query("ROLLBACK");

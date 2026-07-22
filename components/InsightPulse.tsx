@@ -260,7 +260,7 @@ export function InsightPanel({
           <div style={{ ...label, marginBottom: 6 }}>Struggling now</div>
           {worst.length === 0 ? (
             <div style={{ color: p.dim, fontSize: 12.5 }}>
-              No struggle signals yet — questions, reframes, catch-ups, “I'm lost” taps and wrong
+              No struggle signals yet — questions, reframes, catch-ups, “I’m lost” taps and wrong
               poll votes will show up here by slide.
             </div>
           ) : (
@@ -331,7 +331,7 @@ export function InsightPanel({
             )}
             <div style={{ fontSize: 11.5, color: p.dim, lineHeight: 1.5 }}>
               Snapshots the anonymous per-slide counts and asks the AI for concrete rework
-              suggestions. Only numbers are ever stored — never anyone's name or question.
+              suggestions. Only numbers are ever stored — never anyone’s name or question.
             </div>
           </>
         )}
