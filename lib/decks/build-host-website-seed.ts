@@ -33,7 +33,7 @@ export const buildHostWebsiteSeed: DeckSeed = {
     {
       index: 1,
       label: `Today's journey — four phases (Understand / Build / Launch / Grow)`,
-      speakerNotes: `Option C — glass lift. Cards float up higher with a gentler tilt, a sharp light streak sweeps across and the edge lights up.`,
+      speakerNotes: `Cards float up higher with a gentler tilt, a sharp light streak sweeps across and the edge lights up.`,
       aiContext: `The agenda, titled 'Today's journey', shown as four phase cards. Phase 01 Understand — 'How the web works and the core languages behind every modern page.' Phase 02 Build — 'Leverage AI and modern development tools to craft your unique personal site.' Phase 03 Launch — 'Deploy your project to a live global server for the world to see and visit.' Phase 04 Grow — 'Explore the next steps in your tech journey, from APIs to automation.' It maps the whole session from learning the fundamentals through to publishing and continuing beyond the workshop.`,
     },
     {
