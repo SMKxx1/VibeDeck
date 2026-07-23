@@ -59,7 +59,7 @@ It is **anonymous** and **same-origin only** — exactly like `/api/ask`. Like e
 | `429` | `{ "error": "ai_budget_exceeded" }` | daily platform-key token cap reached |
 | `503` | `{ "error": "ai_not_configured" }` | no `OPENROUTER_API_KEY` |
 | `502` | `{ "error": "upstream_error" }` | OpenRouter non-2xx |
-| `504` | `{ "error": "timeout" }` | upstream exceeded 110s |
+| `504` | `{ "error": "timeout" }` | upstream exceeded the request timeout (180s) |
 | `500` | `{ "error": "request_failed" }` | anything else |
 
 **Gate order** (each cheaper than the next; the paid call runs only after all pass): `assertSameOrigin` (403) → parse + validate/trim (400) → **AI-access gate** (401) → `checkPublicRateLimit` — dual IP + viewer-name buckets (429) → **API-key check** (503) → `checkTokenBudget` (429). The API-key check runs **before** the budget reservation so a missing key can't leak a token reservation against the daily ceiling on every call.
@@ -97,7 +97,14 @@ On **any** later tweak request, the model re-emits the **FULL updated file** in 
 
 - **Single self-contained HTML file**; all CSS inline in one `<style>`.
 - **ZERO external requests** — no CDNs, no web fonts, no remote images. **System font stacks only** (`ui-sans-serif` / `Georgia` / `ui-monospace`, per the style direction). Visuals via **CSS gradients and inline SVG** only.
-- **Fully responsive** — usable at 360px and on desktop.
+- **Laptop/desktop-first layout** — must look intentional and polished at **~1280-1536px** AND stay fully responsive down to **360px** (mirrors system-prompt rule 5):
+  - Content **centered** in a container: `max-width ~1080-1160px`, `margin-inline:auto`, horizontal padding `clamp(20px, 5vw, 64px)` — **never** stretches edge-to-edge on a wide screen; any nav/header aligns to this **same** centered width.
+  - Running text (bio, paragraphs) held to a comfortable **~60-72ch** measure.
+  - **Fluid type** via `clamp()` — hero heading around `clamp(2.6rem, 6vw, 5rem)`, large and impactful on a laptop yet still fits mobile.
+  - Generous desktop vertical rhythm — section padding around `clamp(56px, 9vh, 128px)` and a large hero.
+  - **Grid / multi-column** on wide screens that collapses gracefully to one column on narrow: projects as `grid-template-columns: repeat(auto-fit, minmax(260px, 1fr))`; where it fits, a two-column hero or side-by-side about + skills that **stacks under ~760px** (a single media query is fine).
+  - Feels **composed and balanced** at ~1440px (aligned grid, deliberate whitespace — NOT a thin column floating in empty space); stays a single column with **no horizontal scroll** at 360px.
+  - Achieved with **inline CSS + system fonts only** — no CSS frameworks, no grid libraries, no web fonts, zero external requests.
 - **Semantic landmarks** (`header` / `main` / `section` / `footer`), accessible contrast, alt text on every image/informative SVG.
 - **Sections:** hero (name + tagline), about, skills (chips/list — only if provided), projects (cards), contact footer with links.
 - **Tasteful CSS-only animation** wrapped in a `prefers-reduced-motion` guard.
@@ -148,7 +155,7 @@ The full seed id list:
 
 **Model fallback chain:** `OPENROUTER_PORTFOLIO_MODEL` → `OPENROUTER_MODEL` → `DEFAULT_MODEL` (`deepseek/deepseek-v4-flash`, the tutor's default).
 
-**Call knobs:** `max_tokens` **16000** (a complete single-file portfolio + short prose must never truncate mid-file — a lost closing ` ``` ` fence means the client can't extract a download), `temperature` 0.6, 110s `AbortController` timeout, non-streaming (single JSON response). **No `reasoning` param** — this is code generation, not reasoning, and on reasoning-capable models those tokens count against `max_tokens` and are the exact cause of mid-file truncation. There is consequently **no reasoning-retry branch**: any non-2xx (including a plain `400`) returns `502 upstream_error`. The success response carries `truncated` (`finish_reason === "length"`) so the client can offer a retry instead of dumping a half-file. If OpenRouter reports `usage.total_tokens`, it is recorded on the viewer bucket (`recordTokens("u:<name>", …)`) and reconciled against the daily budget (`recordBudgetTokens`).
+**Call knobs:** `max_tokens` **16000** (a complete single-file portfolio + short prose must never truncate mid-file — a lost closing ` ``` ` fence means the client can't extract a download), `temperature` 0.6, **180s** `AbortController` timeout, non-streaming (single JSON response). **`reasoning: { effort: "medium" }`** — a little deliberation yields better structure/layout; `max_tokens` is sized to hold BOTH the reasoning tokens and the full HTML file (which is why it's high). On a model that rejects the `reasoning` param with a `400`, the route **retries once without it** (the reasoning-retry branch); any other non-2xx returns `502 upstream_error`. The success response carries `truncated` (`finish_reason === "length"`) so the client can offer a retry instead of dumping a half-file. NOTE: the model is env-driven (`OPENROUTER_PORTFOLIO_MODEL`) — pick a FAST one (a full portfolio is ~7k output tokens; e.g. `kimi-k2.7-code` ≈ 20-30s). Heavy reasoning models (`kimi-k3`) run ~30 tok/s and take ~90-110s+ even with reasoning trimmed, so they crowd the timeout — avoid them here. If OpenRouter reports `usage.total_tokens`, it is recorded on the viewer bucket (`recordTokens("u:<name>", …)`) and reconciled against the daily budget (`recordBudgetTokens`).
 
 ---
 
