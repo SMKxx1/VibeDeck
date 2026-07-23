@@ -22,7 +22,7 @@ export const buildHostWebsiteSeed: DeckSeed = {
   description:
     "A beginner-friendly live workshop — create and publish your first live website in ~90 minutes, no code required.",
   embedUrl: "/decks/build-host-website/index.html",
-  slideCount: 13,
+  slideCount: 14,
   slides: [
     {
       index: 0,
@@ -98,6 +98,12 @@ export const buildHostWebsiteSeed: DeckSeed = {
     },
     {
       index: 12,
+      label: `Join the AI Lodge — invitation, website link + sign-up QR`,
+      speakerNotes: `Invitation: this workshop is just the start. The AI Lodge is our ongoing series — visit the website to learn more about the lodges, and sign up with the QR or link to join the next one.`,
+      aiContext: `Closing invitation slide titled 'Join the AI Lodge' (eyebrow: 'Your invitation'). Copy: 'Today was just the start. The AI Lodge is where you keep building — hands-on sessions on AI applications, agents, automation and more.' A card links to the AI Lodge website ailodge.smubia.com ('Learn more about the lodges'). On the right, under 'Sign up here', a large QR code (also clickable) opens the sign-up form; caption: 'scan · or click to sign up'.`,
+    },
+    {
+      index: 13,
       label: `Thank you`,
       speakerNotes: `Close warm: keep building, keep creating. Point at the feedback QR and offer help with next steps.`,
       aiContext: `The closing slide (eyebrow: 'Workshop · Build & Host Your Own Website'): a large 'Thank you!' with the line 'Keep building. Keep creating.' A pill reads 'Questions? We're here to help you on your next steps.' On the right is a large Feedback QR code labelled 'Feedback' / 'Scan to share' for leaving feedback.`,

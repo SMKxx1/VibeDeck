@@ -16,6 +16,6 @@ export const buildHostWebsite: Deck = {
   description:
     "A beginner-friendly live workshop — create and publish your first live website in ~90 minutes, no code required.",
   embedUrl: "/decks/build-host-website/index.html",
-  slideCount: 13,
+  slideCount: 14,
   slides: [],
 };
