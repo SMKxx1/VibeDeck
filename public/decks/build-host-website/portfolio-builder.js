@@ -278,12 +278,14 @@
   }
 
   // ── Safe minimal markdown → DOM (no innerHTML, ever) ──────────────────────
-  // Inline pass over one line/paragraph: **bold** → <strong>, `code` → <code>.
-  // A single regex walk emits text NODES for the gaps and element nodes (whose
-  // .textContent is the captured text) for the matches, so no markup from the
-  // model is ever parsed as HTML.
+  // Inline pass over one line/paragraph: **bold** → <strong>, *italic* → <em>,
+  // `code` → <code>. A single regex walk emits text NODES for the gaps and
+  // element nodes (whose .textContent is the captured text) for the matches, so
+  // no markup from the model is ever parsed as HTML. The bold alternative is
+  // listed BEFORE the italic one so `**x**` is consumed as bold, never as two
+  // stray single-asterisk emphases.
   function appendInline(target, text) {
-    var re = /(\*\*([^*]+)\*\*|`([^`]+)`)/g;
+    var re = /(\*\*([^*]+)\*\*|\*([^*\n]+)\*|`([^`]+)`)/g;
     var last = 0;
     var m;
     while ((m = re.exec(text)) !== null) {
@@ -295,12 +297,16 @@
         strong.style.cssText = "font-weight:600;";
         strong.textContent = m[2];
         target.appendChild(strong);
+      } else if (m[3] != null) {
+        var em = document.createElement("em");
+        em.textContent = m[3];
+        target.appendChild(em);
       } else {
         var code = document.createElement("code");
         code.style.cssText =
           "font-family:" + MONO + ";font-size:0.92em;background:rgba(38,36,42,0.07);" +
           "color:" + INK + ";padding:1px 5px;border-radius:5px;";
-        code.textContent = m[3];
+        code.textContent = m[4];
         target.appendChild(code);
       }
       last = re.lastIndex;
@@ -346,9 +352,32 @@
         appendInline(hDiv, hMatch[2].replace(/\s*#+\s*$/, ""));
         el.appendChild(hDiv);
         i++; // a heading is a one-line block
+      } else if (/^\s*\d+[.)]\s+/.test(lines[i])) {
+        // Ordered list — mirrors the bullet branch but as an <ol>, so numbered
+        // items each sit on their own line (with the browser's number markers)
+        // instead of collapsing into a single run-on paragraph. Without this,
+        // "1. …\n2. …\n3. …" falls into the paragraph branch below, whose joined
+        // newlines fold the whole list onto one line (the assistant bubble has
+        // no white-space:pre-wrap).
+        var ol = document.createElement("ol");
+        ol.style.cssText =
+          "margin:" + (firstBlock ? "0" : "8px") + " 0 0;padding-left:22px;" +
+          "display:flex;flex-direction:column;gap:6px;";
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+          var oli = document.createElement("li");
+          appendInline(oli, lines[i].replace(/^\s*\d+[.)]\s+/, ""));
+          ol.appendChild(oli);
+          i++;
+        }
+        el.appendChild(ol);
       } else {
         var para = [];
-        while (i < lines.length && lines[i].trim() && !/^\s*[-*]\s+/.test(lines[i])) {
+        while (
+          i < lines.length &&
+          lines[i].trim() &&
+          !/^\s*[-*]\s+/.test(lines[i]) &&
+          !/^\s*\d+[.)]\s+/.test(lines[i])
+        ) {
           para.push(lines[i]);
           i++;
         }
@@ -493,11 +522,12 @@
     var building = userMsgCount() >= 4 || /\bbuild\b/i.test(lastUserText);
     showTyping(building ? "Building your site — this can take a minute…" : "Thinking…");
 
-    // Generation can take ~90s; never abort sooner than 120s.
+    // Generation can take ~90-110s; wait longer than the route's 180s server
+    // timeout so its own response/error arrives before this client aborts.
     var ctrl = new AbortController();
     var timer = setTimeout(function () {
       ctrl.abort();
-    }, 120000);
+    }, 190000);
 
     callApi(ctrl.signal)
       .then(function (res) {
