@@ -276,20 +276,23 @@ export async function POST(req: Request) {
     model,
     messages: [{ role: "system", content: system }, ...messages],
     temperature: 0.6,
-    // A complete single-file portfolio plus a short intro and next-steps must
-    // NEVER truncate mid-file (a lost closing ``` fence means the client can't
-    // extract a downloadable file). Sized well above a ~500-line HTML doc. No
-    // `reasoning` param: this is code generation, not reasoning, and on
-    // reasoning-capable models those tokens count against max_tokens and would
-    // eat into the completion budget — the exact cause of mid-file truncation.
+    // The portfolio model (Kimi K3) is a reasoning model, and per product
+    // decision we run it at medium reasoning effort — enough deliberation to
+    // produce a clean, complete single-file site without the latency/cost of
+    // high. max_tokens stays high (16000): a complete single-file portfolio plus
+    // a short intro and next-steps must NEVER truncate mid-file (a lost closing
+    // ``` fence means the client can't extract a downloadable file), and the
+    // budget is sized to hold BOTH the reasoning tokens and the full HTML file.
     max_tokens: 16000,
+    reasoning: { effort: "medium" },
     provider: { sort: "throughput", ignore: ["deepinfra"] },
   };
 
-  // Bound the upstream call at 110s — generating a full file is slower than a
-  // chat turn, but a stalled request is still worse than a clean timeout.
+  // Bound the upstream call at 180s — a reasoning model generating a full file
+  // (~90-110s typical) is slower than a chat turn, but a stalled request is
+  // still worse than a clean timeout.
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 110_000);
+  const timeout = setTimeout(() => controller.abort(), 180_000);
 
   const call = (p: Record<string, unknown>) =>
     fetch(OPENROUTER_URL, {
@@ -305,10 +308,20 @@ export async function POST(req: Request) {
     });
 
   try {
-    // Single call — no reasoning-retry branch, because this endpoint sends no
-    // `reasoning` param. Any non-2xx (including a plain 400) falls through to the
-    // `!res.ok` handler below and returns the same 502 upstream_error contract.
-    const res = await call(payload);
+    // The portfolio model is a reasoning model, so we send a `reasoning` param.
+    // A future model set via OPENROUTER_PORTFOLIO_MODEL might not accept it and
+    // reject with a 400 — retry once without the field. Anything else (and any
+    // non-2xx after the retry) falls through to the `!res.ok` handler below and
+    // returns the same 502 upstream_error contract.
+    let res = await call(payload);
+
+    if (res.status === 400 && payload.reasoning) {
+      const detail = await res.text().catch(() => "");
+      if (/reasoning/i.test(detail)) {
+        delete payload.reasoning;
+        res = await call(payload);
+      }
+    }
 
     if (!res.ok) {
       clearTimeout(timeout);
