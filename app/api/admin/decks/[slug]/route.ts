@@ -5,12 +5,7 @@ import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { deleteUploadedDeck, replaceUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
-import { clearSession } from "@/lib/session";
-import { clearPinboard } from "@/lib/pinboard";
-import { clearPresence } from "@/lib/presence";
-import { clearSignals } from "@/lib/signals";
-import { clearPoll } from "@/lib/poll";
-import { clearQna } from "@/lib/qna";
+import { clearDeckLiveState } from "@/lib/live-reset";
 
 // Ownership-gated REPLACE (PUT) and DELETE for an already-uploaded deck. Gate
 // order: authenticated session (401) → CSRF (403) → OWNERSHIP (checkDeckManage:
@@ -150,18 +145,12 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ slug:
     return NextResponse.json({ error: "not_deletable" }, { status: 409 });
   }
 
-  // Best-effort: purge any live-session / pinboard Redis state keyed by this slug
-  // so a later deck that reuses the freed slug can't inherit stale position/pins.
-  // allSettled + the helpers' own swallowing mean a cleanup error NEVER fails the
-  // delete — the row is already gone, this is just hygiene.
-  await Promise.allSettled([
-    clearSession(slug),
-    clearPinboard(slug),
-    clearPresence(slug),
-    clearSignals(slug),
-    clearPoll(slug),
-    clearQna(slug),
-  ]);
+  // Best-effort: purge ALL live-room Redis state keyed by this slug (the same
+  // composite the reset-session route uses) so a later deck that reuses the freed
+  // slug can't inherit stale position / pins / poll / recap / etc. clearDeckLive
+  // State is allSettled over self-swallowing helpers, so a cleanup error NEVER
+  // fails the delete — the row is already gone, this is just hygiene.
+  await clearDeckLiveState(slug);
 
   return NextResponse.json({ slug });
 }

@@ -478,6 +478,10 @@ function DeckTile({ deck, isAdmin }: { deck: DeckCard; isAdmin: boolean }) {
       {canManage && <PublishControl slug={deck.slug} isAdmin={isAdmin} variant="inline" />}
       {canManage && <EditPill href={`/dashboard/edit/${deck.slug}`} />}
       {canManage && deck.kind === "uploaded" && <UploadedActions deck={deck} variant="inline" />}
+      {/* Live-room reset — the ONE shared control for BOTH kinds. For an uploaded
+          deck it sits right after the UploadedActions cluster (beside its Delete);
+          for a registry deck (no UploadedActions) it's a sibling of EditPill. */}
+      {canManage && <ResetSessionAction slug={deck.slug} />}
     </div>
   );
 }
@@ -1233,6 +1237,103 @@ function UploadedActions({ deck, variant = "overlay" }: { deck: DeckCard; varian
         )}
       </div>
       {error && <span style={statusLineStyle(overlay, true)}>{error}</span>}
+    </div>
+  );
+}
+
+// ---- reset live session -----------------------------------------------------
+
+// "Reset session" wipes ALL live room state for a deck slug — slide position,
+// pinboard, Q&A, presence, polls, signals, pulse, recap, activity — via
+// POST /api/admin/decks/<slug>/reset-session (owner-or-admin gated, the same authz
+// every admin deck route uses). Durable content (the deck, its slides, saved
+// recaps/reports/assets) is untouched. Rendered for EVERY manageable deck
+// (registry AND uploaded) — a SIBLING of the card's <Link> (never nested — nested
+// anchors are invalid HTML) so its click POSTs without also firing the card's
+// navigation (stopPropagation). Two-step in-place confirm mirrors UploadedActions'
+// delete so a stray click can't blow away a live room; danger-tinted because it
+// destroys live data. DISTINCT from PresenterConsole's "Reset lock" (that only
+// lowers the viewer slide ceiling — this clears the whole room).
+function ResetSessionAction({ slug }: { slug: string }) {
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Transient "Session cleared" success note; the ref holds its auto-dismiss timer
+  // so a rapid second reset (or unmount) can cancel the previous one cleanly.
+  const [cleared, setCleared] = useState(false);
+  const clearedTimer = useRef<number | undefined>(undefined);
+
+  useEffect(
+    () => () => {
+      if (clearedTimer.current !== undefined) window.clearTimeout(clearedTimer.current);
+    },
+    [],
+  );
+
+  async function reset() {
+    setError(null);
+    setBusy(true);
+    try {
+      // Same-origin POST: the session cookie + Origin ride along automatically, so
+      // the presenter gate + CSRF check pass. The route wipes the live room and
+      // returns { slug }; nothing in the grid changes, so no refresh is needed.
+      const res = await fetch(`/api/admin/decks/${slug}/reset-session`, { method: "POST" });
+      if (res.ok) {
+        setConfirming(false);
+        setCleared(true);
+        if (clearedTimer.current !== undefined) window.clearTimeout(clearedTimer.current);
+        clearedTimer.current = window.setTimeout(() => setCleared(false), 4000);
+      } else {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(adminErrorMessage(res.status, data.error));
+        setConfirming(false);
+      }
+    } catch {
+      setError("Network error — try again.");
+      setConfirming(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6, marginTop: 12 }}
+    >
+      <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        {confirming ? (
+          <>
+            <button type="button" className="lm-act-danger" onClick={reset} disabled={busy} style={actionPillStyle(true)}>
+              {busy ? "Resetting…" : "Confirm reset"}
+            </button>
+            <button type="button" className="lm-act" onClick={() => setConfirming(false)} disabled={busy} style={actionPillStyle(false)}>
+              Cancel
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="lm-act-danger"
+            onClick={() => {
+              setError(null);
+              setCleared(false);
+              setConfirming(true);
+            }}
+            title="Wipe this deck's live room — slide position, pinboard, Q&A, presence, polls"
+            style={actionPillStyle(true)}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 8a5 5 0 1 1 1.5 3.6M3 4.5v3h3" />
+            </svg>
+            Reset session
+          </button>
+        )}
+      </div>
+      {/* Transient success — a neutral status line tinted the runtime's success
+          green (same colour noticeStyle("ok") uses). Auto-clears after 4s. */}
+      {cleared && !error && <span style={{ ...statusLineStyle(false, false), color: "#2E8B5B" }}>Session cleared</span>}
+      {error && <span style={statusLineStyle(false, true)}>{error}</span>}
     </div>
   );
 }
