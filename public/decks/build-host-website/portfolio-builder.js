@@ -277,6 +277,92 @@
     if (els.overlay) els.overlay.style.display = "none";
   }
 
+  // ── Safe minimal markdown → DOM (no innerHTML, ever) ──────────────────────
+  // Inline pass over one line/paragraph: **bold** → <strong>, `code` → <code>.
+  // A single regex walk emits text NODES for the gaps and element nodes (whose
+  // .textContent is the captured text) for the matches, so no markup from the
+  // model is ever parsed as HTML.
+  function appendInline(target, text) {
+    var re = /(\*\*([^*]+)\*\*|`([^`]+)`)/g;
+    var last = 0;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) {
+        target.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      if (m[2] != null) {
+        var strong = document.createElement("strong");
+        strong.style.cssText = "font-weight:600;";
+        strong.textContent = m[2];
+        target.appendChild(strong);
+      } else {
+        var code = document.createElement("code");
+        code.style.cssText =
+          "font-family:" + MONO + ";font-size:0.92em;background:rgba(38,36,42,0.07);" +
+          "color:" + INK + ";padding:1px 5px;border-radius:5px;";
+        code.textContent = m[3];
+        target.appendChild(code);
+      }
+      last = re.lastIndex;
+    }
+    if (last < text.length) target.appendChild(document.createTextNode(text.slice(last)));
+  }
+
+  // Block pass: blank lines are SKIPPED (this collapses stray blank runs so the
+  // bubble has no big vertical void); consecutive "- "/"* " lines become one
+  // <ul> of <li>; everything else groups into paragraph <div>s. Successive
+  // blocks get a small top margin so spacing reads as intentional.
+  function renderMarkdownInto(el, text) {
+    var lines = String(text).split(/\r?\n/);
+    var i = 0;
+    var firstBlock = true;
+    while (i < lines.length) {
+      if (!lines[i].trim()) {
+        i++; // skip blank line
+        continue;
+      }
+      if (/^\s*[-*]\s+/.test(lines[i])) {
+        var ul = document.createElement("ul");
+        ul.style.cssText =
+          "margin:" + (firstBlock ? "0" : "8px") + " 0 0;padding-left:20px;" +
+          "display:flex;flex-direction:column;gap:6px;";
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          var li = document.createElement("li");
+          appendInline(li, lines[i].replace(/^\s*[-*]\s+/, ""));
+          ul.appendChild(li);
+          i++;
+        }
+        el.appendChild(ul);
+      } else if (/^\s{0,3}(#{1,6})\s+(.*\S)\s*#*\s*$/.test(lines[i])) {
+        // A markdown heading (e.g. "### Next steps:"): render as a compact bold
+        // BLOCK, never literal "###" text. The heading text runs through the same
+        // inline pass (so **bold**/`code` inside a heading still render) and still
+        // reaches the DOM via textContent/createTextNode — never innerHTML. Strip
+        // the leading #'s (group 1) and any trailing #'s. Consumes just this line.
+        var hMatch = lines[i].match(/^\s{0,3}(#{1,6})\s+(.*\S)\s*#*\s*$/);
+        var hDiv = document.createElement("div");
+        hDiv.style.cssText =
+          "font-weight:600;font-size:1.05em;margin:" + (firstBlock ? "0" : "12px") + " 0 2px;";
+        appendInline(hDiv, hMatch[2].replace(/\s*#+\s*$/, ""));
+        el.appendChild(hDiv);
+        i++; // a heading is a one-line block
+      } else {
+        var para = [];
+        while (i < lines.length && lines[i].trim() && !/^\s*[-*]\s+/.test(lines[i])) {
+          para.push(lines[i]);
+          i++;
+        }
+        var div = document.createElement("div");
+        if (!firstBlock) div.style.cssText = "margin-top:8px;";
+        appendInline(div, para.join("\n"));
+        el.appendChild(div);
+      }
+      firstBlock = false;
+    }
+    // Fallback: an all-blank string still gets its literal text.
+    if (!el.firstChild) el.textContent = String(text);
+  }
+
   // ── Bubbles ───────────────────────────────────────────────────────────────
   function addBubble(role, text) {
     var b = document.createElement("div");
@@ -287,17 +373,23 @@
       b.style.cssText =
         base + "align-self:flex-end;background:rgba(191,224,72,0.28);color:" +
         INK + ";border-radius:16px 16px 4px 16px;";
+      b.textContent = text; // literal — never innerHTML
     } else if (role === "error") {
       b.style.cssText =
         base + "align-self:flex-start;background:rgba(196,64,52,0.10);" +
         "color:#93392F;border:1px solid rgba(196,64,52,0.28);" +
         "border-radius:16px 16px 16px 4px;";
+      b.textContent = text; // literal — never innerHTML
     } else {
+      // Assistant: block structure controls layout, so drop the pre-wrap
+      // reliance (keep overflow-wrap:anywhere for long tokens) and render the
+      // safe markdown subset — still all textContent / createTextNode inside.
       b.style.cssText =
-        base + "align-self:flex-start;background:#F4F2EC;color:" + INK +
-        ";border-radius:16px 16px 16px 4px;";
+        "max-width:78%;padding:13px 17px;font-size:18px;line-height:1.5;" +
+        "overflow-wrap:anywhere;align-self:flex-start;background:#F4F2EC;color:" +
+        INK + ";border-radius:16px 16px 16px 4px;";
+      renderMarkdownInto(b, text);
     }
-    b.textContent = text; // never innerHTML
     els.log.appendChild(b);
     scrollLog();
     return b;
@@ -594,7 +686,12 @@
     while ((m = re.exec(text)) !== null) last = m;
     if (!last) return null;
     var code = last[1].replace(/\s+$/, "");
-    var prose = (text.slice(0, last.index) + text.slice(last.index + last[0].length)).trim();
+    // Trim each side of the removed fence and drop empties before joining, so
+    // the interior blank run around the fence can't survive as a gap.
+    var prose = [text.slice(0, last.index), text.slice(last.index + last[0].length)]
+      .map(function (s) { return s.trim(); })
+      .filter(Boolean)
+      .join("\n\n");
     return { code: code, prose: prose };
   }
 
