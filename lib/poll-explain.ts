@@ -19,15 +19,11 @@ import { getSession } from "./session";
 import {
   checkRateLimit,
   checkTokenBudget,
-  recordTokens,
-  recordBudgetTokens,
   getPollExplainCache,
   setPollExplainCache,
 } from "./kv";
 import { setPollExplanation, type Poll } from "./poll";
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+import { callModel, DEFAULT_MODEL } from "./openrouter";
 
 // Per-instance in-flight guard: a double-reveal (or an impatient re-tap) on THIS
 // instance must not fire two upstream calls while the first is still running. The
@@ -117,55 +113,12 @@ export async function generatePollExplanation(slug: string, poll: Poll): Promise
       reasoning: { effort: "low" },
     };
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45_000);
-    const call = (p: Record<string, unknown>) =>
-      fetch(OPENROUTER_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-          "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-        },
-        body: JSON.stringify(p),
-        signal: controller.signal,
-      });
-
-    try {
-      let res = await call(payload);
-      // Some hybrid models reject the reasoning param with a 400 — retry once
-      // without it rather than dropping the note (same as /api/ask).
-      if (res.status === 400 && payload.reasoning) {
-        const detail = await res.text().catch(() => "");
-        if (/reasoning/i.test(detail)) {
-          delete payload.reasoning;
-          res = await call(payload);
-        } else {
-          console.error(`[poll-explain] OpenRouter 400:`, detail.slice(0, 300));
-          return;
-        }
-      }
-      if (!res.ok) {
-        // Status + short reason only — no prompt or answer (privacy rule).
-        const detail = await res.text().catch(() => "");
-        console.error(`[poll-explain] OpenRouter ${res.status}:`, detail.slice(0, 300));
-        return;
-      }
-      const data = (await res.json()) as {
-        choices?: { message?: { content?: string } }[];
-        usage?: { total_tokens?: number };
-      };
-      const tokens = Number(data.usage?.total_tokens ?? 0);
-      await recordTokens("pollexplain", tokens); // PRIVACY: only { name, timestamp, count }
-      await recordBudgetTokens(tokens);
-      const answer = (data.choices?.[0]?.message?.content ?? "").trim();
-      if (!answer) return;
-      await setPollExplainCache(cacheKey, answer);
-      await setPollExplanation(slug, poll.id, answer);
-    } finally {
-      clearTimeout(timeout);
-    }
+    const result = await callModel({ tag: "poll-explain", payload, tokenLabel: "pollexplain" });
+    if (!result.ok) return; // all gates fail silently — no note beats a broken reveal
+    const answer = result.content.trim();
+    if (!answer) return;
+    await setPollExplainCache(cacheKey, answer);
+    await setPollExplanation(slug, poll.id, answer);
   } catch {
     /* best-effort — a failed generation just means no note */
   } finally {

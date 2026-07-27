@@ -7,7 +7,8 @@ import { getSlideContextText } from "@/lib/slides-store";
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { extractSlideTexts } from "@/lib/deck-validator";
 import { slideToText } from "@/lib/deckUtils";
-import { checkRateLimit, checkTokenBudget, recordTokens, recordBudgetTokens } from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
+import { callModel, parseFencedJson, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // AI-drafted knowledge-check (#4). One click turns the CURRENT slide into a
 // grounded multiple-choice question the presenter REVIEWS, then pushes as a live
@@ -20,7 +21,6 @@ import { checkRateLimit, checkTokenBudget, recordTokens, recordBudgetTokens } fr
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_QUESTION = 400;
 const MAX_OPTION = 200;
 
@@ -37,37 +37,28 @@ interface Draft {
 }
 
 function parseDraft(raw: string): Draft | null {
-  let t = raw.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start === -1 || end <= start) return null;
-  try {
-    const o = JSON.parse(t.slice(start, end + 1)) as {
-      question?: unknown;
-      options?: unknown;
-      correctIndex?: unknown;
-      explanation?: unknown;
-    };
-    const question = typeof o.question === "string" ? o.question.trim().slice(0, MAX_QUESTION) : "";
-    const options = Array.isArray(o.options)
-      ? o.options
-          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-          .map((x) => x.trim().slice(0, MAX_OPTION))
-          .slice(0, 6)
-      : [];
-    const correctIndex =
-      typeof o.correctIndex === "number" && Number.isInteger(o.correctIndex) ? o.correctIndex : -1;
-    const explanation =
-      typeof o.explanation === "string" ? o.explanation.trim().slice(0, 600) : "";
-    if (!question || options.length < 2 || correctIndex < 0 || correctIndex >= options.length) {
-      return null;
-    }
-    return { question, options, correctIndex, explanation };
-  } catch {
+  const o = parseFencedJson(raw) as {
+    question?: unknown;
+    options?: unknown;
+    correctIndex?: unknown;
+    explanation?: unknown;
+  } | null;
+  if (!o) return null;
+  const question = typeof o.question === "string" ? o.question.trim().slice(0, MAX_QUESTION) : "";
+  const options = Array.isArray(o.options)
+    ? o.options
+        .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+        .map((x) => x.trim().slice(0, MAX_OPTION))
+        .slice(0, 6)
+    : [];
+  const correctIndex =
+    typeof o.correctIndex === "number" && Number.isInteger(o.correctIndex) ? o.correctIndex : -1;
+  const explanation =
+    typeof o.explanation === "string" ? o.explanation.trim().slice(0, 600) : "";
+  if (!question || options.length < 2 || correctIndex < 0 || correctIndex >= options.length) {
     return null;
   }
+  return { question, options, correctIndex, explanation };
 }
 
 export async function POST(req: Request) {
@@ -119,7 +110,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "no_content" }, { status: 422 });
   }
 
-  const model = process.env.OPENROUTER_MODEL || "deepseek/deepseek-v4-flash";
+  const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
   const system = [
     `You write ONE multiple-choice knowledge-check question about a single slide of a talk titled "${deck.title}".`,
     `Return STRICT JSON only: {"question": string, "options": [string, string, string, string], "correctIndex": number, "explanation": string}. No markdown, no fences, no commentary.`,
@@ -143,49 +134,12 @@ export async function POST(req: Request) {
     reasoning: { effort: "low" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("quizdraft", tokens);
-    await recordBudgetTokens(tokens);
-    const draft = parseDraft(data.choices?.[0]?.message?.content ?? "");
-    if (!draft) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    return NextResponse.json(draft);
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({ tag: "quizdraft", payload, tokenLabel: "quizdraft" });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+  const draft = parseDraft(result.content);
+  if (!draft) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  return NextResponse.json(draft);
 }

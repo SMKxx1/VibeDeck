@@ -2,13 +2,8 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { getDeck } from "@/lib/decks";
 import { slideToText } from "@/lib/deckUtils";
-import {
-  recordTokens,
-  checkTokenBudget,
-  recordBudgetTokens,
-  getCatchupCache,
-  setCatchupCache,
-} from "@/lib/kv";
+import { checkTokenBudget, getCatchupCache, setCatchupCache } from "@/lib/kv";
+import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable } from "@/lib/publish-store";
 import { buildHostWebsiteContext, contextForSlide } from "@/lib/decks/build-host-website-context";
@@ -29,9 +24,6 @@ import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/
 // same slide shares one entry, so the 2nd..Nth tap is instant and free.
 
 export const runtime = "nodejs";
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 // Ground at most this many missed slides. A viewer 100 slides behind gets the
 // most RECENT stretch (what the room is discussing now) rather than a prompt
@@ -218,65 +210,14 @@ export async function POST(req: Request) {
     reasoning: { effort: "medium" },
   };
 
-  // Bound the upstream call at 45s (a stalled answer is worse than a clean retry).
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    // Some hybrid models reject the reasoning param with a 400 — retry once
-    // without it rather than failing the whole request (same as /api/ask).
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        console.error("[catchup] OpenRouter rejected the request", {
-          status: res.status,
-          requestId: res.headers.get("x-request-id") ?? undefined,
-        });
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
-      console.error("[catchup] OpenRouter request failed", {
-        status: res.status,
-        requestId: res.headers.get("x-request-id") ?? undefined,
-      });
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens(`u:${name}`, tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens);
-    const answer = (data.choices?.[0]?.message?.content ?? "").trim();
-    if (!answer) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    // Room-wide cache: everyone stuck at this slide reuses the answer for free.
-    await setCatchupCache(cacheKey, answer);
-    return NextResponse.json({ recap: answer, from, to, tokens });
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({ tag: "catchup", payload, tokenLabel: `u:${name}` });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+  const answer = result.content.trim();
+  if (!answer) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  // Room-wide cache: everyone stuck at this slide reuses the answer for free.
+  await setCatchupCache(cacheKey, answer);
+  return NextResponse.json({ recap: answer, from, to, tokens: result.tokens });
 }

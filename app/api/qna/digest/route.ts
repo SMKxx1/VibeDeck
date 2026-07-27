@@ -3,7 +3,8 @@ import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getQuestions } from "@/lib/qna";
-import { checkRateLimit, checkTokenBudget, recordTokens, recordBudgetTokens } from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
+import { callModel, parseFencedJson, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // AI confusion digest (#5). PRESENTER-ONLY: clusters the open questions into the
 // "top few confusions" so a presenter can see what the room is stuck on at a
@@ -13,29 +14,17 @@ import { checkRateLimit, checkTokenBudget, recordTokens, recordBudgetTokens } fr
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-
 function empty(themes: string[] = []) {
   return NextResponse.json({ themes });
 }
 
 function parseThemes(raw: string): string[] {
-  let t = raw.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start === -1 || end <= start) return [];
-  try {
-    const o = JSON.parse(t.slice(start, end + 1)) as { themes?: unknown };
-    if (!Array.isArray(o.themes)) return [];
-    return o.themes
-      .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-      .map((x) => x.trim().slice(0, 160))
-      .slice(0, 3);
-  } catch {
-    return [];
-  }
+  const o = parseFencedJson(raw) as { themes?: unknown } | null;
+  if (!o || !Array.isArray(o.themes)) return [];
+  return o.themes
+    .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+    .map((x) => x.trim().slice(0, 160))
+    .slice(0, 3);
 }
 
 export async function POST(req: Request) {
@@ -78,7 +67,7 @@ export async function POST(req: Request) {
   ].join("\n");
 
   const payload: Record<string, unknown> = {
-    model: process.env.OPENROUTER_MODEL || "deepseek/deepseek-v4-flash",
+    model: process.env.OPENROUTER_MODEL || DEFAULT_MODEL,
     messages: [
       { role: "system", content: system },
       { role: "user", content: `QUESTIONS (data):\n${list}` },
@@ -89,44 +78,12 @@ export async function POST(req: Request) {
     reasoning: { effort: "low" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        return empty();
-      }
-    }
-    if (!res.ok) return empty();
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("qnadigest", tokens);
-    await recordBudgetTokens(tokens);
-    return empty(parseThemes(data.choices?.[0]?.message?.content ?? ""));
-  } catch {
-    return empty();
-  } finally {
-    clearTimeout(timeout);
-  }
+  const result = await callModel({
+    tag: "qnadigest",
+    payload,
+    tokenLabel: "qnadigest",
+    timeoutMs: 25_000,
+  });
+  if (!result.ok) return empty(); // silently degrade — an aid, not a critical path
+  return empty(parseThemes(result.content));
 }

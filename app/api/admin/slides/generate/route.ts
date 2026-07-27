@@ -5,7 +5,8 @@ import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getUploadedDeck, getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { extractSlideTexts } from "@/lib/deck-validator";
-import { checkRateLimit, recordTokens, checkTokenBudget, recordBudgetTokens } from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
+import { callModel, parseFencedJson, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // One-Click AI Grounding (feature #8). Drafts a slide's AI-tutor context +
 // speaker notes from the slide's own content, using the PLATFORM OpenRouter key
@@ -22,30 +23,12 @@ import { checkRateLimit, recordTokens, checkTokenBudget, recordBudgetTokens } fr
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_AI_CONTEXT = 8000; // mirrors deck-validator / the notes editor field cap
 const MAX_SPEAKER_NOTES = 8000;
 
 interface Body {
   slug?: unknown;
   index?: unknown;
-}
-
-// Pull a single JSON object out of a model response that may be fenced or padded
-// with prose despite the instruction. Returns null when nothing parseable.
-function parseJsonObject(s: string): Record<string, unknown> | null {
-  let t = s.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start === -1 || end <= start) return null;
-  try {
-    const o = JSON.parse(t.slice(start, end + 1));
-    return o && typeof o === "object" ? (o as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
 }
 
 export async function POST(req: Request) {
@@ -108,7 +91,7 @@ export async function POST(req: Request) {
     .join("\n")
     .slice(0, 2000);
 
-  const model = process.env.OPENROUTER_MODEL || "deepseek/deepseek-v4-flash";
+  const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
   const system = [
     `You write concise grounding metadata for ONE slide of a presentation titled "${deck.title}", used by an embedded AI tutor and by the presenter.`,
     `Return STRICT JSON only — an object {"aiContext": string, "speakerNotes": string}. No markdown, no code fences, no commentary before or after.`,
@@ -138,61 +121,18 @@ export async function POST(req: Request) {
     reasoning: { effort: "low" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    // Same fallback as /api/ask: some hybrid models reject reasoning:{} with a 400.
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        console.error(`[grounding] OpenRouter 400`);
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) {
-      console.error(`[grounding] OpenRouter ${res.status}`);
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const raw = (data.choices?.[0]?.message?.content ?? "").trim();
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens(bucket, tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens); // global daily cap
-
-    const parsed = parseJsonObject(raw);
-    if (!parsed) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    const aiContext = String(parsed.aiContext ?? "").slice(0, MAX_AI_CONTEXT);
-    const speakerNotes = String(parsed.speakerNotes ?? "").slice(0, MAX_SPEAKER_NOTES);
-    if (!aiContext && !speakerNotes) {
-      return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    }
-    return NextResponse.json({ aiContext, speakerNotes });
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({ tag: "grounding", payload, tokenLabel: bucket });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+
+  const parsed = parseFencedJson(result.content);
+  if (!parsed) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  const aiContext = String(parsed.aiContext ?? "").slice(0, MAX_AI_CONTEXT);
+  const speakerNotes = String(parsed.speakerNotes ?? "").slice(0, MAX_SPEAKER_NOTES);
+  if (!aiContext && !speakerNotes) {
+    return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  }
+  return NextResponse.json({ aiContext, speakerNotes });
 }

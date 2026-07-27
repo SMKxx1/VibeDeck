@@ -10,7 +10,8 @@ import { contextForSlide } from "@/lib/decks/build-host-website-context";
 import { getSlideContextText } from "@/lib/slides-store";
 import { getPulse, clearPulse, type PulseSlide } from "@/lib/pulse";
 import { saveReport, listReports } from "@/lib/session-reports";
-import { checkRateLimit, checkTokenBudget, recordTokens, recordBudgetTokens } from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
+import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // Insight Engine — PRESENTER ONLY.
 //   GET  ?slug= — the live confusion-pulse aggregates (lib/pulse.ts) the console
@@ -28,8 +29,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 // The debrief grounds the model on the WORST slides only: enough context for
 // concrete rework suggestions without blowing the prompt up with a whole deck.
@@ -176,76 +175,32 @@ export async function POST(req: Request) {
     reasoning: { effort: "medium" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    // Some hybrid models reject the reasoning param with a 400 — retry once
-    // without it rather than failing the whole request (same as /api/ask).
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        console.error(`[pulse] OpenRouter 400:`, detail.slice(0, 300));
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      console.error(`[pulse] OpenRouter ${res.status}:`, detail.slice(0, 300));
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("debrief", tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens);
-    const debrief = (data.choices?.[0]?.message?.content ?? "").trim();
-    if (!debrief) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-
-    // Snapshot AFTER a successful generation (on any failure above, nothing is
-    // persisted and the live counters are untouched, so the presenter can simply
-    // retry). Clear the counters only once the snapshot is safely in Postgres —
-    // that's what makes repeat runs of the same deck comparable.
-    const report = {
-      id: randomBytes(9).toString("base64url"),
-      deckSlug: slug,
-      startedAt: pulse.startedAt,
-      aggregates: pulse.slides,
-      debrief,
-    };
-    const saved = await saveReport(report);
-    if (saved.ok) await clearPulse(slug);
-
-    // Prior runs of this deck ride back too, so the console can compare.
-    const reports = await listReports(slug);
-    return NextResponse.json(
-      { debrief, report, persisted: saved.ok, reports },
-      { headers: NO_STORE },
-    );
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({ tag: "pulse", payload, tokenLabel: "debrief" });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+  const debrief = result.content.trim();
+  if (!debrief) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+
+  // Snapshot AFTER a successful generation (on any failure above, nothing is
+  // persisted and the live counters are untouched, so the presenter can simply
+  // retry). Clear the counters only once the snapshot is safely in Postgres —
+  // that's what makes repeat runs of the same deck comparable.
+  const report = {
+    id: randomBytes(9).toString("base64url"),
+    deckSlug: slug,
+    startedAt: pulse.startedAt,
+    aggregates: pulse.slides,
+    debrief,
+  };
+  const saved = await saveReport(report);
+  if (saved.ok) await clearPulse(slug);
+
+  // Prior runs of this deck ride back too, so the console can compare.
+  const reports = await listReports(slug);
+  return NextResponse.json(
+    { debrief, report, persisted: saved.ok, reports },
+    { headers: NO_STORE },
+  );
 }

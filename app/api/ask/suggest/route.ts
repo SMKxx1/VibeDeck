@@ -7,16 +7,11 @@ import { getSlideContextText } from "@/lib/slides-store";
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { extractSlideTexts } from "@/lib/deck-validator";
 import { slideToText } from "@/lib/deckUtils";
-import {
-  checkTokenBudget,
-  recordTokens,
-  recordBudgetTokens,
-  getSuggestCache,
-  setSuggestCache,
-} from "@/lib/kv";
+import { checkTokenBudget, getSuggestCache, setSuggestCache } from "@/lib/kv";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 import { AI_ACCESS_COOKIE, verifyAiAccessToken } from "@/lib/ai-access";
+import { callModel, parseFencedJson, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // Suggested questions (#9). Returns 2-3 short questions a learner might ask about
 // the CURRENT slide, to lower the barrier to the blank chat box. Grounded on the
@@ -27,7 +22,6 @@ import { AI_ACCESS_COOKIE, verifyAiAccessToken } from "@/lib/ai-access";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_Q = 3;
 const MAX_Q_LEN = 120;
 
@@ -41,22 +35,12 @@ function none() {
 }
 
 function parseQuestions(raw: string): string[] {
-  let t = raw.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start === -1 || end <= start) return [];
-  try {
-    const o = JSON.parse(t.slice(start, end + 1)) as { questions?: unknown };
-    if (!Array.isArray(o.questions)) return [];
-    return o.questions
-      .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
-      .map((q) => q.trim().slice(0, MAX_Q_LEN))
-      .slice(0, MAX_Q);
-  } catch {
-    return [];
-  }
+  const o = parseFencedJson(raw) as { questions?: unknown } | null;
+  if (!o || !Array.isArray(o.questions)) return [];
+  return o.questions
+    .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+    .map((q) => q.trim().slice(0, MAX_Q_LEN))
+    .slice(0, MAX_Q);
 }
 
 export async function POST(req: Request) {
@@ -116,7 +100,7 @@ export async function POST(req: Request) {
   const budget = await checkTokenBudget();
   if (!budget.allowed) return none();
 
-  const model = process.env.OPENROUTER_MODEL || "deepseek/deepseek-v4-flash";
+  const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
   const system = [
     `You suggest short follow-up questions a curious beginner might ask about one presentation slide.`,
     `Return STRICT JSON only: {"questions": ["...", "...", "..."]}. No markdown, no commentary.`,
@@ -143,46 +127,14 @@ export async function POST(req: Request) {
     reasoning: { effort: "low" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        return none();
-      }
-    }
-    if (!res.ok) return none();
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const questions = parseQuestions(data.choices?.[0]?.message?.content ?? "");
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("suggest", tokens);
-    await recordBudgetTokens(tokens);
-    if (questions.length) await setSuggestCache(cacheKey, questions);
-    return NextResponse.json({ questions });
-  } catch {
-    return none();
-  } finally {
-    clearTimeout(timeout);
-  }
+  const result = await callModel({
+    tag: "suggest",
+    payload,
+    tokenLabel: "suggest",
+    timeoutMs: 20_000,
+  });
+  if (!result.ok) return none(); // silently degrade — suggestions are non-essential
+  const questions = parseQuestions(result.content);
+  if (questions.length) await setSuggestCache(cacheKey, questions);
+  return NextResponse.json({ questions });
 }

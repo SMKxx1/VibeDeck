@@ -5,7 +5,8 @@ import { deckToText } from "@/lib/deckUtils";
 import { AUTH_COOKIE, getSession, type Session } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkDeckManage } from "@/lib/deck-authz";
-import { checkRateLimit, recordTokens, checkTokenBudget, recordBudgetTokens } from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
+import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { fullContextText } from "@/lib/decks/build-host-website-context";
 import { getFullContextText, getSlideNotes } from "@/lib/slides-store";
 import { getActivePoll } from "@/lib/poll";
@@ -38,9 +39,6 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 interface Body {
   slug?: unknown;
@@ -205,61 +203,19 @@ async function draft(session: Session, slug: string) {
     reasoning: { effort: "medium" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    // Some hybrid models reject the reasoning param with a 400 — retry once
-    // without it rather than failing the whole request (same as /api/ask).
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        console.error(`[study-guide] OpenRouter 400:`, detail.slice(0, 300));
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      console.error(`[study-guide] OpenRouter ${res.status}:`, detail.slice(0, 300));
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("studyguide", tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens);
-    const markdown = stripOuterFence(data.choices?.[0]?.message?.content ?? "").slice(
-      0,
-      MAX_GUIDE_MARKDOWN,
-    );
-    if (!markdown) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    return NextResponse.json({ markdown });
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({
+    tag: "study-guide",
+    payload,
+    tokenLabel: "studyguide",
+    timeoutMs: 60_000,
+  });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+  const markdown = stripOuterFence(result.content).slice(0, MAX_GUIDE_MARKDOWN);
+  if (!markdown) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  return NextResponse.json({ markdown });
 }
 
 // ---- publish: freeze the curated markdown → { token, url } -------------------

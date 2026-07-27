@@ -4,14 +4,8 @@ import { getDeck } from "@/lib/decks";
 import { deckToText, slideToText } from "@/lib/deckUtils";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
-import {
-  checkRateLimit,
-  recordTokens,
-  checkTokenBudget,
-  recordBudgetTokens,
-  getExplainCache,
-  setExplainCache,
-} from "@/lib/kv";
+import { checkRateLimit, checkTokenBudget, getExplainCache, setExplainCache } from "@/lib/kv";
+import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { EXPLAIN_PROMPTS, type ExplainMode, isExplainMode } from "@/lib/explain-prompts";
 import {
   buildHostWebsiteContext,
@@ -36,9 +30,6 @@ import { bumpPulse } from "@/lib/pulse";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 interface Body {
   slug?: unknown;
@@ -173,61 +164,17 @@ export async function POST(req: Request) {
     reasoning: { effort: "medium" },
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    let res = await call(payload);
-    // Some hybrid models reject the reasoning param with a 400 — retry once
-    // without it rather than failing the whole request (same as /api/ask).
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      } else {
-        console.error(`[recap] OpenRouter 400:`, detail.slice(0, 300));
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
-    }
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      console.error(`[recap] OpenRouter ${res.status}:`, detail.slice(0, 300));
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-      usage?: { total_tokens?: number };
-    };
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens("recap", tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens);
-    const answer = (data.choices?.[0]?.message?.content ?? "").trim();
-    if (!answer) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
-    // Feed the room cache so viewer reframe chips reuse this answer for free.
-    await setExplainCache(explainKey, answer);
-    const recap = await setRecap(slug, { text: answer, slideIndex });
-    return NextResponse.json({ recap });
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
-  } finally {
-    clearTimeout(timeout);
+  const result = await callModel({ tag: "recap", payload, tokenLabel: "recap" });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+  const answer = result.content.trim();
+  if (!answer) return NextResponse.json({ error: "bad_generation" }, { status: 502 });
+  // Feed the room cache so viewer reframe chips reuse this answer for free.
+  await setExplainCache(explainKey, answer);
+  const recap = await setRecap(slug, { text: answer, slideIndex });
+  return NextResponse.json({ recap });
 }
 
 export async function DELETE(req: Request) {

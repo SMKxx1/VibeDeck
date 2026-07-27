@@ -22,6 +22,7 @@ import {
 import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
 import { bumpPulse } from "@/lib/pulse";
 import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/lib/ai-access";
+import { openRouterFetch, callWithReasoningRetry, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // The chat's serverless function (slide-system-rules.md §9). The browser never
 // sees the OpenRouter key. We ground the model in the CURRENT slide + the whole
@@ -30,8 +31,6 @@ import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/
 
 export const runtime = "nodejs";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const MAX_CURRENT_CONTEXT = 12_000;
 const MAX_FULL_CONTEXT = 60_000;
 
@@ -306,39 +305,20 @@ export async function POST(req: Request) {
   const timeout = setTimeout(() => ac.abort(), 45_000);
 
   const callOpenRouter = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Class Presentation App",
-      },
-      body: JSON.stringify(p),
-      signal: ac.signal,
-    });
+    openRouterFetch(p, { apiKey, signal: ac.signal });
 
   try {
-    let orRes = await callOpenRouter(payload);
-
-    // Not every model lets you turn reasoning off — some hybrids make it
-    // mandatory and reject `reasoning:{enabled:false}` with a 400. Rather than
-    // fail the whole request, retry once without the reasoning field. This MUST
-    // happen before we start streaming (an error is a normal JSON body, not a
-    // stream), which is exactly why the streaming path can't be a raw passthrough.
-    if (orRes.status === 400 && payload.reasoning) {
-      const detail = await orRes.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        orRes = await callOpenRouter(payload);
-      } else {
-        clearTimeout(timeout);
-        console.error("[ask] OpenRouter rejected the request", {
-          status: orRes.status,
-          requestId: orRes.headers.get("x-request-id") ?? undefined,
-        });
-        return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-      }
+    // The reasoning-400 retry MUST happen before we start streaming (an error is
+    // a normal JSON body, not a stream), which is exactly why the streaming path
+    // can't be a raw passthrough.
+    const { res: orRes, badRequestDetail } = await callWithReasoningRetry(payload, callOpenRouter);
+    if (badRequestDetail !== null) {
+      clearTimeout(timeout);
+      console.error("[ask] OpenRouter rejected the request", {
+        status: orRes.status,
+        requestId: orRes.headers.get("x-request-id") ?? undefined,
+      });
+      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
     }
 
     if (!orRes.ok) {

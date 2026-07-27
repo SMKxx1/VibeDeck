@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { recordTokens, checkTokenBudget, recordBudgetTokens } from "@/lib/kv";
+import { checkTokenBudget } from "@/lib/kv";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkPublicRateLimit } from "@/lib/request-security";
 import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/lib/ai-access";
+import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 
 // AI Portfolio Builder. The "Build & Host Your Own Website" workshop deck has a
 // hands-on slide where each attendee builds their first personal portfolio. The
@@ -17,11 +18,6 @@ import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-// The tutor's default (see /api/ask). This endpoint can be pointed at a stronger
-// code-gen model via OPENROUTER_PORTFOLIO_MODEL below without touching the tutor.
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 // Transcript ceilings (the deck-side UI enforces its own, but this is the trust
 // boundary): the whole running conversation is untrusted viewer input.
@@ -298,83 +294,29 @@ export async function POST(req: Request) {
     provider: { sort: "throughput", ignore: ["deepinfra"] },
   };
 
-  // Bound the upstream call at 180s — a reasoning model generating a full file
-  // (~90-110s typical) is slower than a chat turn, but a stalled request is
-  // still worse than a clean timeout.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 180_000);
-
-  const call = (p: Record<string, unknown>) =>
-    fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "",
-        "X-Title": process.env.OPENROUTER_SITE_NAME ?? "VibeDeck",
-      },
-      body: JSON.stringify(p),
-      signal: controller.signal,
-    });
-
-  try {
-    // The portfolio model is a reasoning model, so we send a `reasoning` param.
-    // A future model set via OPENROUTER_PORTFOLIO_MODEL might not accept it and
-    // reject with a 400 — retry once without the field. Anything else (and any
-    // non-2xx after the retry) falls through to the `!res.ok` handler below and
-    // returns the same 502 upstream_error contract.
-    let res = await call(payload);
-
-    if (res.status === 400 && payload.reasoning) {
-      const detail = await res.text().catch(() => "");
-      if (/reasoning/i.test(detail)) {
-        delete payload.reasoning;
-        res = await call(payload);
-      }
-    }
-
-    if (!res.ok) {
-      clearTimeout(timeout);
-      // Log the upstream status + request id only — never a body, prompt, or
-      // answer (slide-system-rules.md §9).
-      await res.body?.cancel().catch(() => {});
-      console.error("[portfolio] OpenRouter request failed", {
-        status: res.status,
-        requestId: res.headers.get("x-request-id") ?? undefined,
-      });
-      return NextResponse.json({ error: "upstream_error" }, { status: 502 });
-    }
-
-    const data = (await res.json()) as {
-      choices?: { message?: { content?: string }; finish_reason?: string }[];
-      usage?: { total_tokens?: number };
-    };
-
-    // Surface whether the model ran out of completion budget. finish_reason
-    // "length" means the file was cut off mid-generation (a lost closing ```
-    // fence), so the client should offer a retry instead of dumping a half-file.
-    const finishReason = data.choices?.[0]?.finish_reason;
-    const truncated = finishReason === "length";
-
-    // Token accounting, mirroring /api/ask: record against the viewer bucket and
-    // reconcile the daily reservation. A missing usage total leaves the
-    // conservative reservation charged (recordBudgetTokens never refunds) — the
-    // intended safe failure mode for the budget cap.
-    const tokens = Number(data.usage?.total_tokens ?? 0);
-    await recordTokens(`u:${name}`, tokens); // PRIVACY: only { name, timestamp, count }
-    await recordBudgetTokens(tokens);
-
-    const reply =
-      data.choices?.[0]?.message?.content?.trim() ||
-      'Sorry — I hit a snag putting that together. Could you say that again, or type "just build it" and I\'ll generate your site with what we have?';
-
-    clearTimeout(timeout);
-    return NextResponse.json({ reply, styleSeed: seed.id, truncated });
-  } catch (err) {
-    clearTimeout(timeout);
-    if (err instanceof Error && err.name === "AbortError") {
-      return NextResponse.json({ error: "timeout" }, { status: 504 });
-    }
-    return NextResponse.json({ error: "request_failed" }, { status: 500 });
+  // 180s bound — a reasoning model generating a full file (~90-110s typical) is
+  // slower than a chat turn, but a stalled request is still worse than a clean
+  // timeout. callModel also handles the reasoning-400 retry: a future model set
+  // via OPENROUTER_PORTFOLIO_MODEL might reject the reasoning param.
+  const result = await callModel({
+    tag: "portfolio",
+    payload,
+    tokenLabel: `u:${name}`,
+    timeoutMs: 180_000,
+  });
+  if (!result.ok) {
+    const status = result.error === "upstream_error" ? 502 : result.error === "timeout" ? 504 : 500;
+    return NextResponse.json({ error: result.error }, { status });
   }
+
+  // Surface whether the model ran out of completion budget. finish_reason
+  // "length" means the file was cut off mid-generation (a lost closing ```
+  // fence), so the client should offer a retry instead of dumping a half-file.
+  const truncated = result.finishReason === "length";
+
+  const reply =
+    result.content.trim() ||
+    'Sorry — I hit a snag putting that together. Could you say that again, or type "just build it" and I\'ll generate your site with what we have?';
+
+  return NextResponse.json({ reply, styleSeed: seed.id, truncated });
 }
