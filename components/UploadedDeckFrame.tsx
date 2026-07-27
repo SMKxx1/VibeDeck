@@ -55,21 +55,43 @@ import { LiveChat } from "./LiveChat";
 import { useFullscreen } from "@/lib/useFullscreen";
 import { PulseHeatStrip, InsightPanel, type PulseSlideDto } from "@/components/InsightPulse";
 
-// Reuse the workshop's stored viewer name so a returning visitor keeps their name
-// across decks. Where a name is REQUIRED (vote / ask / presence heartbeat) we gate
-// exactly like LiveDeck — but watching itself never requires a name.
-const NAME_KEY = "presentation:name";
-
-// Viewer session cadence (mirrors LiveDeck): snappy while a presenter is live,
-// lazy when idle, near-dormant when the tab is hidden.
-const POLL_MS = Number(process.env.NEXT_PUBLIC_SESSION_POLL_MS) || 2000;
-const IDLE_POLL_MS = 10_000; // viewer, no presenter live
-const HIDDEN_POLL_MS = 60_000; // tab in the background
-const PRESENTER_POLL_MS = 5_000; // presenter: session read is a display-only fallback
-
-// Viewer Q&A panel poll — runs only while the panel is open (mirrors LiveDeck).
-const QNA_POLL_MS = 5_000;
-const QNA_HIDDEN_MS = 30_000;
+// Shared live-room primitives — types, poll cadence constants and the viewer
+// cards/chrome — from components/live, the single implementation shared with
+// LiveDeck. Name gating matches LiveDeck: a name is REQUIRED where an action is
+// attributed (vote / ask / presence heartbeat), but watching never needs one,
+// and the stored name is reused across decks so a returning visitor keeps it.
+import {
+  HIDDEN_POLL_MS,
+  IDLE_POLL_MS,
+  NAME_KEY,
+  POLL_MS,
+  PRESENTER_POLL_MS,
+  QNA_HIDDEN_MS,
+  QNA_POLL_MS,
+  type Activity,
+  type CatchUp,
+  type QnaQuestion,
+  type Recap,
+  type SessionState,
+  type SignalKind,
+  type ViewerPoll,
+  type ViewerRole,
+} from "./live/types";
+import { ChatButton, FollowToggle, FullscreenButton, QnaButton, glassChip, pill } from "./live/chrome";
+import { useNow } from "./live/useNow";
+import { ReactionBar } from "./live/ReactionBar";
+import {
+  PollCard,
+  pollBadge,
+  pollResultBar,
+  pollResultRow,
+  pollResultText,
+  pollTag,
+} from "./live/PollCard";
+import { QnaPanel, qnaCloseBtn, qnaErrorText } from "./live/QnaPanel";
+import { ActivityCard } from "./live/ActivityCard";
+import { RecapCard } from "./live/RecapCard";
+import { CatchUpCard, centerCardStack } from "./live/CatchUpCard";
 
 // Presenter live-room tick (roster + reactions + poll + Q&A on ONE ~4s timer, with
 // hidden-tab backoff — mirrors PresenterConsole).
@@ -81,17 +103,6 @@ const PRESENCE_HIDDEN_MS = 30_000;
 // meter decays fast, so it inherently reflects the slide being shown right now.
 const LOST_THRESHOLD = 3;
 
-type Role = "presenter" | "viewer";
-
-// Viewer→presenter backchannel reaction kinds (#2). "lost" is its own button; the
-// rest ride in a compact icon row.
-type SignalKind = "up" | "party" | "slow" | "hand" | "lost";
-const REACTIONS: { kind: SignalKind; emoji: string; label: string }[] = [
-  { kind: "up", emoji: "👍", label: "Nice" },
-  { kind: "party", emoji: "🎉", label: "Celebrate" },
-  { kind: "slow", emoji: "🐢", label: "Slow down" },
-  { kind: "hand", emoji: "🙋", label: "Raise hand" },
-];
 // Only these float over the presenter's slide; slow/lost drive the help meter.
 const ANIMATE_KINDS = new Set<SignalKind>(["up", "party", "hand"]);
 const REACTION_EMOJI: Record<string, string> = { up: "👍", party: "🎉", hand: "🙋" };
@@ -104,7 +115,7 @@ const FLOAT_KEYFRAMES =
 // a pin, name, token, or poll/Q&A payload to the deck. See header comment §2.
 type DeckControlMessage =
   | { type: "deck:goto"; index: number }
-  | { type: "deck:role"; role: Role; max?: number; locked?: boolean }
+  | { type: "deck:role"; role: ViewerRole; max?: number; locked?: boolean }
   | { type: "deck:advance"; dir: number }
   | { type: "deck:report" };
 
@@ -114,75 +125,13 @@ interface DeckState {
   total: number;
   label: string;
 }
-interface SessionState {
-  index: number;
-  max: number;
-  // A presenter is actively presenting. When false, viewers browse freely.
-  live: boolean;
-  // Co-host mode (presenter only): false when ANOTHER presenter holds the clicker
-  // (slide control). Absent/true — including an unclaimed session — means drive.
-  isDriver?: boolean;
-}
 
-// Viewer-safe poll projection, delivered on the SAME /api/session read (#3).
-// `explanation` is the room-shared AI "why that answer" note, attached shortly
-// AFTER reveal (it lands on a later session tick and the card re-renders).
-interface ViewerPoll {
-  id: string;
-  // "branch" = a branch-point vote (choose-your-own-path): options are paths and
-  // takenIndex is the routed-path breadcrumb once the presenter routes the room.
-  kind?: "poll" | "branch";
-  question: string;
-  options: string[];
-  revealed: boolean;
-  correctIndex: number | null;
-  tally: number[] | null;
-  total: number | null;
-  explanation: string | null;
-  takenIndex?: number | null;
-  at: number;
-}
-// A presenter-broadcast recap of a slide (comprehension checkpoint), delivered on
-// the same session read. Dismiss is local per viewer; a new id shows again.
-interface Recap {
-  id: string;
-  text: string;
-  slideIndex: number;
-  at: number;
-}
 // A presenter-broadcast Turn & Talk activity: a discussion/exercise prompt + a
 // synchronized countdown, delivered on the same session read. Everyone counts
 // down CLIENT-SIDE from `endsAt` (no per-second server traffic); "Regroup"
 // clears it everywhere at once. Rendered ONLY in parent app-chrome — never
 // posted into the sandboxed deck frame.
 type ActivityFollowUp = "poll" | "pinboard";
-interface Activity {
-  id: string;
-  prompt: string;
-  endsAt: number; // epoch ms
-  followUp: ActivityFollowUp | null;
-  at: number;
-}
-// This viewer's personal "catch me up" recap: an on-demand AI summary of the
-// slides between THEIR slide and the live slide. Local to the tab — never
-// broadcast — so it lives here, not on the session poll.
-interface CatchUp {
-  from: number; // the viewer's slide (0-based) when they asked
-  to: number; // the live slide at that moment
-  text: string | null; // null until loaded
-  error: string | null;
-  loading: boolean;
-}
-// A question in the upvotable Q&A queue (#5).
-interface QnaQuestion {
-  id: string;
-  name: string;
-  text: string;
-  votes: number;
-  answered: boolean;
-  dismissed: boolean;
-  at: number;
-}
 // A branch-point path (lib/types.ts SlideBranch) — 0-based inclusive range.
 interface SlideBranch {
   label: string;
@@ -219,7 +168,7 @@ interface Signal {
 // `role` defaults to "viewer" so the two untouched callers (the public home page
 // and the embed-deck presenter console) keep the viewer experience; the deck page
 // (/d/[slug]) passes role="presenter" when the request carries the presenter cookie.
-export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck; role?: Role }) {
+export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck; role?: ViewerRole }) {
   const slug = meta.slug;
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -1523,178 +1472,6 @@ export function UploadedDeckFrame({ deck: meta, role = "viewer" }: { deck: Deck;
   );
 }
 
-// ---- shared chip / button primitives (light palette) ------------------------
-
-function glassChip(): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    height: 34,
-    padding: "0 13px",
-    borderRadius: 12,
-    fontFamily: '"Outfit", system-ui, sans-serif',
-    fontSize: 12.5,
-    fontWeight: 500,
-    color: "#2C2A31",
-    background: "rgba(255,255,255,0.62)",
-    border: "1px solid rgba(255,255,255,0.85)",
-    backdropFilter: "blur(14px)",
-    WebkitBackdropFilter: "blur(14px)",
-    boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
-    whiteSpace: "nowrap",
-  };
-}
-
-function pill(bg: string, fg: string): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    height: 34,
-    padding: "0 14px",
-    borderRadius: 12,
-    border: "none",
-    cursor: "pointer",
-    fontFamily: '"Outfit", system-ui, sans-serif',
-    fontSize: 12.5,
-    fontWeight: 500,
-    color: fg,
-    background: bg,
-    whiteSpace: "nowrap",
-    boxShadow: "0 6px 18px -12px rgba(60,55,45,0.4)",
-  };
-}
-
-function FullscreenButton({ active, onClick }: { active: boolean; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={active}
-      aria-label={active ? "Exit fullscreen" : "Enter fullscreen"}
-      title={active ? "Exit fullscreen" : "Fullscreen"}
-      style={{ ...glassChip(), width: 34, padding: 0, justifyContent: "center", cursor: "pointer", fontSize: 15, lineHeight: 1 }}
-    >
-      {active ? "✕" : "⛶"}
-    </button>
-  );
-}
-
-function ChatButton({ open, onClick }: { open: boolean; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={open}
-      title="Ask about this slide"
-      style={{ ...pill(open ? "#2C2A31" : "rgba(255,255,255,0.62)", open ? "#F4F2EC" : "#2C2A31"), border: open ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 7 }}
-    >
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-      </svg>
-      Ask
-    </button>
-  );
-}
-
-function QnaButton({ open, count, onClick }: { open: boolean; count: number; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      aria-pressed={open}
-      title="See the room's questions, upvote, or ask your own"
-      style={{ ...pill(open ? "#2C2A31" : "rgba(255,255,255,0.62)", open ? "#F4F2EC" : "#2C2A31"), border: open ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 6 }}
-    >
-      <span aria-hidden style={{ fontSize: 13, lineHeight: 1 }}>❓</span>
-      Questions{count > 0 ? ` (${count})` : ""}
-    </button>
-  );
-}
-
-function FollowToggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      onClick={() => onChange(!on)}
-      title={on ? "Following the presenter — click to explore on your own" : "Explore mode — click to follow the presenter"}
-      style={{ ...pill(on ? "#2C2A31" : "rgba(255,255,255,0.62)", on ? "#F4F2EC" : "#2C2A31"), border: on ? "none" : "1px solid rgba(255,255,255,0.85)", gap: 8 }}
-    >
-      <span style={{ width: 26, height: 15, borderRadius: 999, background: on ? "#BFE048" : "rgba(60,55,45,0.25)", position: "relative", transition: "background .16s", flex: "0 0 auto" }}>
-        <span style={{ position: "absolute", top: 2, left: on ? 13 : 2, width: 11, height: 11, borderRadius: "50%", background: "#fff", transition: "left .16s", boxShadow: "0 1px 3px rgba(0,0,0,.28)" }} />
-      </span>
-      Auto-follow
-    </button>
-  );
-}
-
-// A compact reaction row (#2). Each tap fires one signal, pulses, and starts a ~3s
-// local cooldown (the server also rate-limits). "I'm lost" is styled to stand out.
-function ReactionBar({ onSend }: { onSend: (kind: SignalKind) => void }) {
-  const [cooling, setCooling] = useState<Record<string, boolean>>({});
-  const [pulse, setPulse] = useState<SignalKind | null>(null);
-  const timers = useRef<number[]>([]);
-  useEffect(() => () => timers.current.forEach((t) => window.clearTimeout(t)), []);
-
-  const tap = (kind: SignalKind) => {
-    if (cooling[kind]) return;
-    onSend(kind);
-    setPulse(kind);
-    setCooling((c) => ({ ...c, [kind]: true }));
-    timers.current.push(
-      window.setTimeout(() => setPulse((p) => (p === kind ? null : p)), 420),
-      window.setTimeout(() => setCooling((c) => ({ ...c, [kind]: false })), 3000),
-    );
-  };
-
-  return (
-    <div style={{ ...glassChip(), gap: 3, padding: "0 6px" }} role="group" aria-label="Send a reaction to the presenter">
-      {REACTIONS.map((r) => (
-        <button key={r.kind} onClick={() => tap(r.kind)} disabled={!!cooling[r.kind]} title={r.label} aria-label={r.label} style={reactionBtn(pulse === r.kind, !!cooling[r.kind])}>
-          {r.emoji}
-        </button>
-      ))}
-      <button onClick={() => tap("lost")} disabled={!!cooling.lost} title="I'm lost — let the presenter know" aria-label="I'm lost" style={lostBtn(pulse === "lost", !!cooling.lost)}>
-        😕 I&rsquo;m lost
-      </button>
-    </div>
-  );
-}
-
-function reactionBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
-  return {
-    width: 30,
-    height: 30,
-    borderRadius: 9,
-    border: "none",
-    background: pulsing ? "rgba(191,224,72,0.55)" : "transparent",
-    cursor: disabled ? "default" : "pointer",
-    fontSize: 16,
-    lineHeight: 1,
-    padding: 0,
-    opacity: disabled && !pulsing ? 0.4 : 1,
-    transform: pulsing ? "scale(1.28)" : "scale(1)",
-    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
-  };
-}
-
-function lostBtn(pulsing: boolean, disabled: boolean): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 5,
-    height: 26,
-    padding: "0 10px",
-    borderRadius: 8,
-    border: "1px solid rgba(210,120,40,0.5)",
-    background: pulsing ? "#E07B39" : "rgba(224,123,57,0.16)",
-    color: pulsing ? "#fff" : "#9A4B12",
-    fontFamily: '"Outfit", system-ui, sans-serif',
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: disabled ? "default" : "pointer",
-    opacity: disabled && !pulsing ? 0.55 : 1,
-    transform: pulsing ? "scale(1.06)" : "scale(1)",
-    transition: "transform .18s ease, background .18s ease, opacity .18s ease",
-    whiteSpace: "nowrap",
-  };
-}
-
 // The name gate (#1/#3/#5): only shown when a name-required action needs one.
 function NameGate({ onSubmit }: { onSubmit: (name: string) => void }) {
   const [value, setValue] = useState("");
@@ -1754,453 +1531,6 @@ function NameGate({ onSubmit }: { onSubmit: (name: string) => void }) {
     </div>
   );
 }
-
-// ---- viewer poll card (#3) — ported verbatim from LiveDeck --------------------
-
-function PollCard({
-  poll,
-  hasName,
-  myOptionIndex,
-  reduceMotion,
-  onVote,
-  onNeedName,
-}: {
-  poll: ViewerPoll;
-  hasName: boolean;
-  myOptionIndex: number | null;
-  reduceMotion: boolean;
-  onVote: (optionIndex: number) => void;
-  onNeedName: () => void;
-}) {
-  const revealed = poll.revealed;
-  const tally = poll.tally ?? [];
-  const total = poll.total ?? 0;
-  const max = Math.max(1, ...(tally.length ? tally : [0]));
-  // Branch vote (branch points): distinct badge/copy, the routed path is
-  // highlighted instead of a "correct" answer, and a breadcrumb shows once the
-  // presenter routes the room.
-  const isBranch = poll.kind === "branch";
-  const taken = isBranch && typeof poll.takenIndex === "number" ? poll.takenIndex : null;
-
-  return (
-    <div style={pollCardWrap} role="group" aria-label={isBranch ? "Branch vote" : "Live poll"}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>
-          {isBranch ? (revealed ? "⑂ Path chosen" : "⑂ Choose our path") : revealed ? "Results" : "Live poll"}
-        </span>
-        {revealed ? (
-          <span style={pollNote}>
-            {total} vote{total === 1 ? "" : "s"}
-          </span>
-        ) : (
-          myOptionIndex != null && <span style={pollNote}>Voted · waiting for results</span>
-        )}
-      </div>
-
-      <div style={{ fontSize: 15, fontWeight: 500, color: "#262229", lineHeight: 1.4 }}>{poll.question}</div>
-
-      {!revealed ? (
-        !hasName ? (
-          <button onClick={onNeedName} style={pollNameBtn}>
-            Enter a name to vote
-          </button>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {poll.options.map((opt, i) => {
-              const mine = myOptionIndex === i;
-              return (
-                <button key={i} onClick={() => onVote(i)} aria-pressed={mine} style={pollOptionBtn(mine)}>
-                  <span style={pollDot(mine)} aria-hidden />
-                  <span style={{ flex: 1, minWidth: 0 }}>{opt}</span>
-                </button>
-              );
-            })}
-          </div>
-        )
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {poll.options.map((opt, i) => {
-            const count = tally[i] ?? 0;
-            const correct = isBranch ? taken === i : poll.correctIndex === i;
-            const mine = myOptionIndex === i;
-            const pct = Math.round((count / max) * 100);
-            return (
-              <div key={i} style={pollResultRow}>
-                <div style={{ ...pollResultBar(correct, mine), width: `${pct}%`, transition: reduceMotion ? "none" : "width .45s ease" }} aria-hidden />
-                <div style={pollResultText}>
-                  <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opt}</span>
-                    {correct && <span style={pollTag("#3F7A12")}>{isBranch ? "⑂ taking this path" : "✓ correct"}</span>}
-                    {mine && <span style={pollTag("#6E6A62")}>your pick</span>}
-                  </span>
-                  <span style={{ fontWeight: 600, color: "#3A372F", flex: "0 0 auto" }}>{count}</span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Branch breadcrumb — shows once the presenter routes the room. */}
-      {isBranch && revealed && taken !== null && (
-        <div style={pollWhy}>
-          <span style={pollWhyLabel}>Path</span>⑂ {poll.options[taken]}
-        </div>
-      )}
-
-      {/* "Why that answer" — the room-shared AI note attached after reveal. It
-          arrives a session tick or two behind the tally, so it simply pops in. */}
-      {revealed && poll.explanation && (
-        <div style={pollWhy}>
-          <span style={pollWhyLabel}>Why</span>
-          {poll.explanation}
-        </div>
-      )}
-    </div>
-  );
-}
-
-const pollCardWrap: React.CSSProperties = {
-  position: "absolute",
-  left: 16,
-  bottom: 16,
-  zIndex: 38,
-  width: "min(400px, calc(100% - 32px))",
-  maxHeight: "min(70vh, 520px)",
-  overflowY: "auto",
-  display: "flex",
-  flexDirection: "column",
-  gap: 12,
-  padding: "16px 18px",
-  borderRadius: 18,
-  background: "rgba(255,255,255,0.78)",
-  border: "1px solid rgba(255,255,255,0.85)",
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)",
-  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
-  fontFamily: '"Outfit", system-ui, sans-serif',
-};
-
-const pollBadge: React.CSSProperties = {
-  display: "inline-flex",
-  alignItems: "center",
-  fontSize: 10.5,
-  fontWeight: 700,
-  letterSpacing: "0.14em",
-  textTransform: "uppercase",
-  color: "#4B5A16",
-  background: "rgba(191,224,72,0.42)",
-  padding: "3px 9px",
-  borderRadius: 999,
-};
-
-const pollNote: React.CSSProperties = { fontSize: 11.5, fontWeight: 500, color: "#6E6A62", whiteSpace: "nowrap" };
-
-// The post-reveal "why that answer" note — green-tinted to pair with the ✓ tag.
-const pollWhy: React.CSSProperties = {
-  fontSize: 12.5,
-  color: "#4A463E",
-  lineHeight: 1.5,
-  padding: "9px 11px",
-  borderRadius: 11,
-  background: "rgba(191,224,72,0.16)",
-  border: "1px solid rgba(191,224,72,0.45)",
-};
-
-const pollWhyLabel: React.CSSProperties = {
-  display: "block",
-  fontSize: 10,
-  fontWeight: 700,
-  letterSpacing: "0.14em",
-  textTransform: "uppercase",
-  color: "#4B5A16",
-  marginBottom: 3,
-};
-
-const pollNameBtn: React.CSSProperties = {
-  height: 40,
-  borderRadius: 11,
-  border: "none",
-  cursor: "pointer",
-  background: "#2C2A31",
-  color: "#F4F2EC",
-  fontFamily: "inherit",
-  fontSize: 13.5,
-  fontWeight: 500,
-};
-
-function pollOptionBtn(mine: boolean): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 10,
-    width: "100%",
-    textAlign: "left",
-    padding: "11px 13px",
-    borderRadius: 11,
-    cursor: "pointer",
-    fontFamily: "inherit",
-    fontSize: 13.5,
-    fontWeight: 500,
-    color: mine ? "#F4F2EC" : "#2C2A31",
-    background: mine ? "#2C2A31" : "rgba(255,255,255,0.62)",
-    border: mine ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.16)",
-    transition: "background .15s ease, color .15s ease",
-  };
-}
-
-function pollDot(mine: boolean): React.CSSProperties {
-  return {
-    width: 15,
-    height: 15,
-    borderRadius: "50%",
-    flex: "0 0 auto",
-    boxSizing: "border-box",
-    border: mine ? "4px solid #BFE048" : "2px solid rgba(60,55,45,0.35)",
-    background: mine ? "#2C2A31" : "transparent",
-  };
-}
-
-const pollResultRow: React.CSSProperties = {
-  position: "relative",
-  borderRadius: 11,
-  overflow: "hidden",
-  background: "rgba(60,55,45,0.07)",
-  padding: "10px 12px",
-};
-
-function pollResultBar(correct: boolean, mine: boolean): React.CSSProperties {
-  return {
-    position: "absolute",
-    left: 0,
-    top: 0,
-    bottom: 0,
-    borderRadius: 11,
-    background: correct ? "rgba(120,176,54,0.34)" : mine ? "rgba(44,42,49,0.16)" : "rgba(120,116,108,0.16)",
-  };
-}
-
-const pollResultText: React.CSSProperties = {
-  position: "relative",
-  display: "flex",
-  alignItems: "center",
-  gap: 8,
-  fontSize: 13,
-  fontWeight: 500,
-  color: "#2C2A31",
-};
-
-function pollTag(color: string): React.CSSProperties {
-  return { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color, whiteSpace: "nowrap", flex: "0 0 auto" };
-}
-
-// ---- viewer Q&A queue panel (#5) — ported verbatim from LiveDeck --------------
-
-function QnaPanel({
-  questions,
-  hasName,
-  myVotes,
-  onUpvote,
-  onAsk,
-  onNeedName,
-  onClose,
-}: {
-  questions: QnaQuestion[];
-  hasName: boolean;
-  myVotes: Record<string, boolean>;
-  onUpvote: (qid: string) => void;
-  onAsk: (text: string) => Promise<string | null>;
-  onNeedName: () => void;
-  onClose: () => void;
-}) {
-  const [text, setText] = useState("");
-  const [asking, setAsking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const submit = async () => {
-    const t = text.trim();
-    if (!t || asking) return;
-    setAsking(true);
-    setError(null);
-    const err = await onAsk(t);
-    setAsking(false);
-    if (err) setError(err);
-    else setText("");
-  };
-
-  return (
-    <div style={qnaCardWrap} role="group" aria-label="Question queue">
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>Questions</span>
-        <button onClick={onClose} title="Hide questions" aria-label="Hide questions" style={qnaCloseBtn}>
-          ✕
-        </button>
-      </div>
-
-      <div style={qnaList}>
-        {questions.length === 0 ? (
-          <div style={qnaEmpty}>No questions yet — be the first to ask.</div>
-        ) : (
-          questions.map((q) => {
-            const voted = !!myVotes[q.id];
-            return (
-              <div key={q.id} style={qnaItem}>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 13.5, color: "#2C2A31", lineHeight: 1.4 }}>{q.text}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: "#6E6A62", minWidth: 0 }}>
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 150 }}>{q.name}</span>
-                    {q.answered && <span style={qnaAnsweredTag}>✓ answered</span>}
-                  </div>
-                </div>
-                <button onClick={() => (hasName ? onUpvote(q.id) : onNeedName())} disabled={voted} aria-pressed={voted} title={voted ? "You upvoted this" : "Upvote this question"} style={qnaVoteBtn(voted)}>
-                  👍 {q.votes}
-                </button>
-              </div>
-            );
-          })
-        )}
-      </div>
-
-      {hasName ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {error && <div style={qnaErrorText}>{error}</div>}
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void submit();
-                }
-              }}
-              placeholder="Ask a question…"
-              maxLength={280}
-              style={qnaInput}
-            />
-            <button onClick={() => void submit()} disabled={!text.trim() || asking} style={qnaAskBtn(!!text.trim() && !asking)}>
-              {asking ? "…" : "Ask"}
-            </button>
-          </div>
-        </div>
-      ) : (
-        <button onClick={onNeedName} style={pollNameBtn}>
-          Enter a name to ask
-        </button>
-      )}
-    </div>
-  );
-}
-
-const qnaCardWrap: React.CSSProperties = {
-  position: "absolute",
-  right: 16,
-  top: 60,
-  bottom: 16,
-  zIndex: 38,
-  width: "min(360px, calc(100% - 32px))",
-  display: "flex",
-  flexDirection: "column",
-  gap: 12,
-  padding: 16,
-  borderRadius: 18,
-  background: "rgba(255,255,255,0.82)",
-  border: "1px solid rgba(255,255,255,0.85)",
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)",
-  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
-  fontFamily: '"Outfit", system-ui, sans-serif',
-};
-
-const qnaList: React.CSSProperties = { flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 };
-
-const qnaItem: React.CSSProperties = {
-  display: "flex",
-  alignItems: "flex-start",
-  gap: 10,
-  padding: "10px 11px",
-  borderRadius: 12,
-  background: "rgba(255,255,255,0.6)",
-  border: "1px solid rgba(60,55,45,0.1)",
-};
-
-const qnaEmpty: React.CSSProperties = { fontSize: 12.5, color: "#6E6A62", padding: "10px 2px" };
-
-const qnaAnsweredTag: React.CSSProperties = {
-  fontSize: 9.5,
-  fontWeight: 700,
-  letterSpacing: "0.05em",
-  textTransform: "uppercase",
-  color: "#3F7A12",
-  whiteSpace: "nowrap",
-  flex: "0 0 auto",
-};
-
-function qnaVoteBtn(voted: boolean): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 5,
-    flex: "0 0 auto",
-    height: 30,
-    padding: "0 11px",
-    borderRadius: 999,
-    cursor: voted ? "default" : "pointer",
-    fontFamily: "inherit",
-    fontSize: 12.5,
-    fontWeight: 600,
-    color: voted ? "#F4F2EC" : "#2C2A31",
-    background: voted ? "#2C2A31" : "rgba(255,255,255,0.7)",
-    border: voted ? "1px solid #2C2A31" : "1px solid rgba(60,55,45,0.18)",
-    transition: "background .15s ease, color .15s ease",
-  };
-}
-
-const qnaInput: React.CSSProperties = {
-  flex: 1,
-  minWidth: 0,
-  height: 40,
-  padding: "0 13px",
-  borderRadius: 11,
-  border: "1px solid rgba(60,55,45,0.18)",
-  background: "rgba(255,255,255,0.85)",
-  fontFamily: "inherit",
-  fontSize: 13.5,
-  color: "#2C2A31",
-  outline: "none",
-};
-
-function qnaAskBtn(enabled: boolean): React.CSSProperties {
-  return {
-    flex: "0 0 auto",
-    height: 40,
-    padding: "0 16px",
-    borderRadius: 11,
-    border: "none",
-    cursor: enabled ? "pointer" : "default",
-    background: enabled ? "#2C2A31" : "#B7B2A8",
-    color: "#F4F2EC",
-    fontFamily: "inherit",
-    fontSize: 13.5,
-    fontWeight: 500,
-  };
-}
-
-const qnaErrorText: React.CSSProperties = { fontSize: 12, color: "#B5331F", fontWeight: 500 };
-
-const qnaCloseBtn: React.CSSProperties = {
-  width: 28,
-  height: 28,
-  flex: "0 0 auto",
-  borderRadius: 8,
-  border: "1px solid rgba(60,55,45,0.16)",
-  background: "rgba(255,255,255,0.6)",
-  color: "#6E6A62",
-  cursor: "pointer",
-  fontSize: 13,
-  lineHeight: 1,
-  padding: 0,
-};
 
 // ---- presenter presence roster (#1) — light adaptation of PresenterConsole ----
 
@@ -2421,72 +1751,6 @@ function mapRecapError(code?: string): string {
   }
 }
 
-// The viewer's recap card (comprehension checkpoint): the presenter pushed a short
-// AI recap of the slide because part of the room felt lost. Purely informational —
-// one dismiss button, no inputs. Dismissal is local to this viewer. Rendered in
-// PARENT app-chrome only; nothing is ever posted into the sandboxed deck frame.
-function RecapCard({ recap, onDismiss }: { recap: Recap; onDismiss: () => void }) {
-  return (
-    <div style={recapCardWrap} role="status" aria-label="Recap from the presenter">
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>Recap · slide {recap.slideIndex + 1}</span>
-        <button onClick={onDismiss} title="Dismiss" aria-label="Dismiss recap" style={recapDismissBtn}>
-          ✕
-        </button>
-      </div>
-      <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "#262229", whiteSpace: "pre-wrap" }}>{recap.text}</div>
-    </div>
-  );
-}
-
-// Positioned by centerCardStack (shared with the catch-up card) — the card
-// itself only styles the glass panel.
-const recapCardWrap: React.CSSProperties = {
-  width: "100%",
-  maxHeight: "min(50vh, 380px)",
-  overflowY: "auto",
-  display: "flex",
-  flexDirection: "column",
-  gap: 10,
-  padding: "14px 16px",
-  borderRadius: 18,
-  background: "rgba(255,255,255,0.82)",
-  border: "1px solid rgba(255,255,255,0.9)",
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)",
-  boxShadow: "0 22px 55px -28px rgba(60,55,45,0.6)",
-  fontFamily: '"Outfit", system-ui, sans-serif',
-};
-
-// The shared bottom-center column for the recap + catch-up cards: clears the
-// poll card (bottom-left) and the Q&A panel (right), and stacks the two cards
-// on the rare occasion both are open.
-const centerCardStack: React.CSSProperties = {
-  position: "absolute",
-  left: "50%",
-  bottom: 16,
-  transform: "translateX(-50%)",
-  zIndex: 39,
-  width: "min(460px, calc(100% - 32px))",
-  display: "flex",
-  flexDirection: "column",
-  gap: 10,
-};
-
-const recapDismissBtn: React.CSSProperties = {
-  width: 26,
-  height: 26,
-  flex: "0 0 auto",
-  borderRadius: 8,
-  border: "1px solid rgba(60,55,45,0.16)",
-  background: "rgba(255,255,255,0.62)",
-  color: "#2C2A31",
-  cursor: "pointer",
-  fontSize: 13,
-  lineHeight: 1,
-  padding: 0,
-};
-
 // Map an /api/catchup error code to a friendly line for the card body.
 function mapCatchUpError(code?: string): string {
   switch (code) {
@@ -2504,125 +1768,6 @@ function mapCatchUpError(code?: string): string {
       return "Couldn't catch you up — try again.";
   }
 }
-
-// This viewer's personal catch-up card: an on-demand AI recap of the slides
-// between where they are and the live slide. Local to this tab (nothing is
-// broadcast); dismissing aborts any in-flight fetch and clears local state.
-// Rendered in PARENT app-chrome only — never posted into the sandboxed frame.
-function CatchUpCard({ catchUp, onDismiss }: { catchUp: CatchUp; onDismiss: () => void }) {
-  // The recap covers the slides AFTER the viewer's own (they can see theirs).
-  const lo = catchUp.from + 2; // first missed slide, 1-based
-  const hi = catchUp.to + 1; // the live slide, 1-based
-  const range = lo >= hi ? `slide ${hi}` : `slides ${lo}–${hi}`;
-  return (
-    <div style={recapCardWrap} role="status" aria-label="Catch-up recap">
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>Catch-up · {range}</span>
-        <button onClick={onDismiss} title="Dismiss" aria-label="Dismiss catch-up" style={recapDismissBtn}>
-          ✕
-        </button>
-      </div>
-      {catchUp.loading ? (
-        <div style={{ fontSize: 13, color: "#8A857C", fontStyle: "italic" }}>Summarizing what you missed…</div>
-      ) : catchUp.error ? (
-        <div style={{ fontSize: 12.5, color: "#B5331F", fontWeight: 500 }}>{catchUp.error}</div>
-      ) : (
-        <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "#262229", whiteSpace: "pre-wrap" }}>{catchUp.text}</div>
-      )}
-    </div>
-  );
-}
-
-// Re-render every `stepMs` so a client-side countdown ticks. Returns "now".
-function useNow(stepMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), stepMs);
-    return () => window.clearInterval(id);
-  }, [stepMs]);
-  return now;
-}
-
-// The viewer's Turn & Talk card: the presenter broadcast a discussion/exercise
-// prompt with a synchronized countdown. The MM:SS timer renders client-side from
-// `endsAt` (everyone counts down to the same wall-clock instant); when it hits 0
-// it lingers briefly as "time's up", and the presenter's Regroup clears it
-// everywhere via the session poll. Hiding is local; a new activity id re-shows.
-// Rendered in PARENT app-chrome only — never posted into the sandboxed frame.
-function ActivityCard({ activity, onHide }: { activity: Activity; onHide: () => void }) {
-  const now = useNow(500);
-  const remaining = activity.endsAt - now;
-  // Past the brief "time's up" linger the card is over — the next session tick
-  // stops delivering the activity anyway (the server filters ended ones).
-  if (remaining <= -10_000) return null;
-  const done = remaining <= 0;
-  const secs = Math.max(0, Math.ceil(remaining / 1000));
-  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
-  const ss = String(secs % 60).padStart(2, "0");
-  return (
-    <div style={activityCardWrap} role="status" aria-label="Group activity">
-      <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={pollBadge}>⏱ Turn &amp; talk</span>
-        <button onClick={onHide} title="Hide" aria-label="Hide activity" style={recapDismissBtn}>
-          ✕
-        </button>
-      </div>
-      <div style={{ fontSize: 17, fontWeight: 500, color: "#262229", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
-        {activity.prompt}
-      </div>
-      <div style={activityTimer(done)} aria-live={done ? "assertive" : "off"}>
-        {done ? "Time's up — regroup!" : `${mm}:${ss}`}
-      </div>
-      {!done && activity.followUp === "poll" && (
-        <div style={activityNote}>Up next: a quick poll on this.</div>
-      )}
-      {!done && activity.followUp === "pinboard" && (
-        <div style={activityNote}>Up next: share your link on the pinboard.</div>
-      )}
-    </div>
-  );
-}
-
-// Larger than the recap card — during a turn-and-talk the activity IS the focus.
-const activityCardWrap: React.CSSProperties = {
-  width: "100%",
-  maxHeight: "min(60vh, 440px)",
-  overflowY: "auto",
-  display: "flex",
-  flexDirection: "column",
-  alignItems: "center",
-  textAlign: "center",
-  gap: 12,
-  padding: "18px 20px 22px",
-  borderRadius: 20,
-  background: "rgba(255,255,255,0.88)",
-  border: "1px solid rgba(255,255,255,0.9)",
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)",
-  boxShadow: "0 26px 65px -30px rgba(60,55,45,0.65)",
-  fontFamily: '"Outfit", system-ui, sans-serif',
-};
-
-function activityTimer(done: boolean): React.CSSProperties {
-  return {
-    fontVariantNumeric: "tabular-nums",
-    fontSize: done ? 21 : 44,
-    fontWeight: 600,
-    letterSpacing: done ? "0" : "0.03em",
-    lineHeight: 1.1,
-    color: done ? "#B5331F" : "#2C2A31",
-  };
-}
-
-const activityNote: React.CSSProperties = {
-  fontSize: 12,
-  fontWeight: 600,
-  color: "#4B5A16",
-  background: "rgba(191,224,72,0.2)",
-  border: "1px solid rgba(191,224,72,0.45)",
-  borderRadius: 9,
-  padding: "6px 10px",
-};
 
 function floatStyle(left: number): React.CSSProperties {
   return {
