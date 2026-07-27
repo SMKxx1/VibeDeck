@@ -12,8 +12,6 @@
 // it here, add it to the array. Commit + deploy = "saved", live forever at /d/<slug>.
 
 import type { Deck } from "../types";
-import { awsLodgeDemo } from "./aws-lodge-demo";
-import { slideSystemTour } from "./slide-system-tour";
 import { buildHostWebsite } from "./build-host-website";
 
-export const staticDecks: Deck[] = [buildHostWebsite, awsLodgeDemo, slideSystemTour];
+export const staticDecks: Deck[] = [buildHostWebsite];

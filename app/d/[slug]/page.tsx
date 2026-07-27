@@ -2,17 +2,15 @@ import { notFound } from "next/navigation";
 import { cookies } from "next/headers";
 import type { Metadata } from "next";
 import { getDeck } from "@/lib/decks";
-import { DeckViewer } from "@/components/DeckViewer";
 import { LiveDeck } from "@/components/LiveDeck";
 import { UploadedDeckFrame } from "@/components/UploadedDeckFrame";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { isDeckViewable, getPublishStatusMap } from "@/lib/publish-store";
 
-// Rendered on-demand (never statically baked): the live (embed) deck reads the
-// presenter session cookie to pick presenter-vs-viewer, a per-request dynamic
-// API. Since this route is shared with the hand-authored decks, the whole route
-// must be dynamic — otherwise Next statically optimizes it and the embed deck's
-// cookie read throws DYNAMIC_SERVER_USAGE (a 500) in production.
+// Rendered on-demand (never statically baked): this route reads the presenter
+// session cookie to pick presenter-vs-viewer, a per-request dynamic API — if
+// Next statically optimizes it, the cookie read throws DYNAMIC_SERVER_USAGE
+// (a 500) in production.
 export const dynamic = "force-dynamic";
 
 async function isPresenter(): Promise<boolean> {
@@ -75,5 +73,7 @@ export default async function DeckPage({
     return <LiveDeck slug={deck.slug} embedUrl={deck.embedUrl} role={role} title={deck.title} />;
   }
 
-  return <DeckViewer deck={deck} />;
+  // A registry deck with neither uploaded HTML nor an embedUrl has no renderer —
+  // the legacy slides-as-data viewer was removed with its demo decks.
+  notFound();
 }

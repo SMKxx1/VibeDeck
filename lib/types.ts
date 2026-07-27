@@ -13,14 +13,8 @@ export type SlideLayout =
   | "image"; // heading + image with caption
 
 export interface SlideImage {
-  /** A file in /public (raster or SVG). Optional if `inline` is set instead. */
+  /** A file in /public (raster or SVG). */
   src?: string;
-  /**
-   * Key into the inline-SVG diagram registry (components/diagrams). Renders the
-   * diagram as real DOM so its labels are selectable text, not baked into an
-   * image (slide-system-rules.md §§0.4, 8).
-   */
-  inline?: string;
   /** Required — every image has alt text (slide-system-rules.md §8). */
   alt: string;
   caption?: string;
@@ -50,12 +44,8 @@ export interface Slide {
   attribution?: string;
   /** For `image`. */
   image?: SlideImage;
-  /** If true, bullets/columns reveal one item per "next" press (click-reveal). */
-  reveal?: boolean;
   /** Speaker notes — presenter view only, never rendered in the main view. */
   notes?: string;
-  /** Optional accent token name, e.g. "teal" | "amber" — theme-driven, no raw colors. */
-  accent?: "amber" | "teal" | "violet" | "rose";
 }
 
 // ── Branch points (choose-your-own-path decks) ───────────────────────────────

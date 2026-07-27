@@ -1,55 +1,25 @@
 /* ============================================================================
-   THEME TOKENS — the single place colors, fonts, type scale, and spacing live
-   (slide-system-rules.md §2). No per-slide hardcoded colors or fonts anywhere.
-   Dark + high-contrast on purpose: assume a washed-out projector.
+   THEME TOKENS — the single place shared colors and fonts live
+   (slide-system-rules.md §2). The app shell is intentionally tiny: every live
+   surface (LiveDeck, UploadedDeckFrame, PresenterConsole, dashboard) styles
+   itself inline, and uploaded decks carry their own CSS on the deck origin —
+   only tokens with a live consumer are kept here.
    ========================================================================== */
 :root {
-  /* Surfaces (dark, projector-safe) */
-  --bg: #0b1020;
-  --bg-2: #0e1426;
-  --surface: #161f37;
-  --surface-2: #1e2a48;
-  --border: #2a3960;
-  --letterbox: #05070d;
+  /* Warm-light ("Solis") app-shell palette — the imported design's palette
+     (Deck Library.dc.html). */
+  --paper: #eceae3;
+  --ink: #26262b;
 
-  /* Text */
-  --fg: #f2f6fc;
-  --muted: #9fb0cc;
-  --faint: #6b7a9c;
-
-  /* Accents (referenced via tokens only) */
-  --amber: #f5a623;
+  /* Referenced by the not-found page and keyboard-focus outline. */
   --teal: #2dd4bf;
-  --violet: #a78bfa;
-  --rose: #fb7185;
-  --accent: var(--amber); /* default; slides override with .accent-* */
-  --text-on-accent: #1a1206; /* dark ink for text sitting on an accent fill */
+  --muted: #9fb0cc;
 
   /* Fonts — Outfit is the design's UI typeface (loaded self-hosted in layout). */
   --font-sans: var(--font-outfit), ui-sans-serif, system-ui, -apple-system,
     "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji",
     sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
-
-  /* Warm-light ("Solis") app-shell tokens — the imported design's palette
-     (Deck Library.dc.html). The dark slide canvas above keeps its own tokens. */
-  --paper: #eceae3;
-  --ink: #26262b;
-
-  /* Type scale — design px against the 1280×720 canvas (scaled by transform).
-     Body ≥ 24px so it reads from the back of the room (slide-system-rules.md §2). */
-  --fs-eyebrow: 22px;
-  --fs-title: 74px;
-  --fs-section: 88px;
-  --fs-statement: 62px;
-  --fs-heading: 38px;
-  --fs-body: 30px;
-  --fs-quote: 56px;
-  --fs-caption: 22px;
-
-  /* Safe margins ≥ 6% on every side (1280×720). */
-  --pad-x: 92px;
-  --pad-y: 62px;
 }
 
 * {
@@ -74,254 +44,6 @@ a {
 }
 
 /* ============================================================================
-   SCALE-TO-FIT CANVAS — render at a fixed 1280×720, then scale the whole thing
-   to fit the viewport, centered and letterboxed; content never reflows.
-   ========================================================================== */
-.stage-viewport {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--letterbox);
-}
-
-.slide-canvas {
-  width: 1280px;
-  height: 720px;
-  flex: 0 0 auto;
-  transform-origin: center center;
-  background: radial-gradient(120% 120% at 80% 0%, var(--bg-2) 0%, var(--bg) 60%);
-  overflow: hidden;
-  border-radius: 2px;
-}
-
-/* ============================================================================
-   SLIDE LAYOUTS — all text is real DOM text (slide-system-rules.md §§0.4, 8).
-   ========================================================================== */
-.slide {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  padding: var(--pad-y) var(--pad-x);
-  display: flex;
-  flex-direction: column;
-  animation: slideEnter 240ms ease both; /* one consistent transition, ≤300ms */
-}
-
-@keyframes slideEnter {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-/* Per-slide accent — set by a class, never a raw color on the slide. */
-.accent-amber {
-  --accent: var(--amber);
-}
-.accent-teal {
-  --accent: var(--teal);
-}
-.accent-violet {
-  --accent: var(--violet);
-}
-.accent-rose {
-  --accent: var(--rose);
-}
-
-.eyebrow {
-  font-size: var(--fs-eyebrow);
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin: 0 0 18px;
-}
-
-.slide-title {
-  font-size: var(--fs-title);
-  font-weight: 800;
-  line-height: 1.04;
-  letter-spacing: -0.02em;
-  margin: 0;
-  color: var(--fg);
-}
-
-.slide-subtitle {
-  font-size: var(--fs-heading);
-  font-weight: 400;
-  line-height: 1.25;
-  color: var(--muted);
-  margin: 26px 0 0;
-  max-width: 22ch;
-}
-
-/* title layout */
-.layout-title {
-  justify-content: center;
-}
-.layout-title .slide-title {
-  max-width: 18ch;
-}
-
-/* section divider */
-.layout-section {
-  justify-content: center;
-  align-items: flex-start;
-}
-.layout-section .slide-title {
-  font-size: var(--fs-section);
-}
-.layout-section .accent-rule {
-  width: 120px;
-  height: 8px;
-  border-radius: 4px;
-  background: var(--accent);
-  margin-top: 34px;
-}
-
-/* statement */
-.layout-statement {
-  justify-content: center;
-}
-.layout-statement .statement-body {
-  font-size: var(--fs-statement);
-  font-weight: 700;
-  line-height: 1.12;
-  letter-spacing: -0.015em;
-  margin: 0;
-  max-width: 20ch;
-}
-
-/* bullets */
-.slide-heading-row {
-  display: flex;
-  flex-direction: column;
-}
-.layout-bullets .bullet-list,
-.layout-two-col .col-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-.layout-bullets {
-  justify-content: center;
-}
-.layout-bullets .bullet-list {
-  margin-top: 40px;
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-}
-.bullet-list li,
-.col-list li {
-  position: relative;
-  padding-left: 42px;
-  font-size: var(--fs-body);
-  line-height: 1.3;
-  color: var(--fg);
-}
-.bullet-list li::before,
-.col-list li::before {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 0.62em;
-  width: 16px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--accent);
-}
-
-/* two-column */
-.layout-two-col .cols {
-  margin-top: 40px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 56px;
-  flex: 1;
-  align-content: start;
-}
-.col-heading {
-  font-size: var(--fs-heading);
-  font-weight: 700;
-  color: var(--accent);
-  margin: 0 0 22px;
-}
-.col-list {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-/* quote */
-.layout-quote {
-  justify-content: center;
-}
-.layout-quote .quote-mark {
-  font-size: 120px;
-  line-height: 0.5;
-  color: var(--accent);
-  height: 56px;
-  font-family: Georgia, "Times New Roman", serif;
-}
-.layout-quote blockquote {
-  font-size: var(--fs-quote);
-  font-weight: 600;
-  line-height: 1.18;
-  letter-spacing: -0.01em;
-  margin: 0;
-  max-width: 24ch;
-}
-.layout-quote .attribution {
-  font-size: var(--fs-heading);
-  color: var(--muted);
-  margin-top: 36px;
-}
-
-/* image */
-.layout-image .image-frame {
-  flex: 1;
-  margin-top: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 0;
-}
-.layout-image .image-frame img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-}
-.layout-image .caption {
-  font-size: var(--fs-caption);
-  color: var(--muted);
-  margin-top: 20px;
-  text-align: center;
-}
-
-/* ============================================================================
-   CLICK-REVEAL — hidden items keep their space so nothing reflows.
-   ========================================================================== */
-.reveal-hidden {
-  opacity: 0;
-  transform: translateY(8px);
-  transition: opacity 240ms ease, transform 240ms ease;
-}
-.reveal-shown {
-  opacity: 1;
-  transform: none;
-  transition: opacity 240ms ease, transform 240ms ease;
-}
-
-/* ============================================================================
    ACCESSIBILITY — honor reduced motion everywhere (slide-system-rules.md §§6,7).
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
@@ -340,16 +62,4 @@ a {
   outline: 3px solid var(--teal);
   outline-offset: 2px;
   border-radius: 4px;
-}
-
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
 }
