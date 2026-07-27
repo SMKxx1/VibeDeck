@@ -8,8 +8,8 @@
 // at reveal time so viewers can see it via the cheap session poll without every
 // request recomputing it; only the presenter reads the LIVE pre-reveal tally.
 
-import { randomBytes } from "crypto";
-import { getRedis, hasRedis, type RedisClient } from "./redis";
+import { getRedis, hasRedis } from "./redis";
+import { newId, requireRedis as requireSharedRedis } from "./redis-util";
 import {
   invalidateSessionCache,
   setPresenterIndexMemoryOnly,
@@ -251,10 +251,6 @@ const g = globalThis as unknown as {
 const pollMem = (g.__livePollMem ??= new Map<string, Poll>());
 const voteMem = (g.__livePollVotesMem ??= new Map<string, VoteBucket>());
 
-function newId(): string {
-  return randomBytes(9).toString("base64url");
-}
-
 function parsePoll(raw: unknown): Poll | null {
   let value = raw;
   if (typeof raw === "string") {
@@ -343,11 +339,8 @@ function sweepMemory(now = Date.now()): void {
   }
 }
 
-async function requireRedis(): Promise<RedisClient> {
-  const redis = await getRedis();
-  if (!redis) throw new Error("poll_store_unavailable");
-  return redis;
-}
+/** The shared store, or throw with THIS module's error code (lib/redis-util.ts). */
+const requireRedis = () => requireSharedRedis("poll_store_unavailable");
 
 async function readPoll(slug: string): Promise<Poll | null> {
   if (!hasRedis()) return memoryPoll(slug);

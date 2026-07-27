@@ -8,7 +8,8 @@
 // Viewers are anonymous (a self-chosen localStorage name) — presence is a live
 // "who's here" signal, deliberately NOT an identity or attendance-of-record.
 
-import { getRedis, hasRedis, type RedisClient } from "./redis";
+import { getRedis, hasRedis } from "./redis";
+import { requireRedis as requireSharedRedis } from "./redis-util";
 
 export interface Presence {
   name: string;
@@ -88,11 +89,8 @@ function sweepMemory(now: number): void {
   }
 }
 
-async function requireRedis(): Promise<RedisClient> {
-  const redis = await getRedis();
-  if (!redis) throw new Error("presence_store_unavailable");
-  return redis;
-}
+/** The shared store, or throw with THIS module's error code (lib/redis-util.ts). */
+const requireRedis = () => requireSharedRedis("presence_store_unavailable");
 
 export interface MarkPresentResult {
   status: "ok" | "full";

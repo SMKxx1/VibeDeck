@@ -116,121 +116,101 @@ export async function recordBudgetTokens(tokens: number): Promise<void> {
   }
 }
 
-// ---- "Explain differently" answer cache (#10) -------------------------------
-// The reframe chips (ELI5 / analogy / example / deeper) ask a FIXED question about
-// a specific (deck, slide) — so the answer is reusable across every viewer in the
-// room. Caching it means the 2nd..Nth tap is instant AND free (no model call, no
-// budget spend). Keyed by (slug, slideIndex, mode). Stored wrapped in an object so
-// a prose answer that happens to look like JSON round-trips as a string.
-const EXPLAIN_TTL = 60 * 60; // 1h — slide content is stable within a session
+// ---- AI answer caches -------------------------------------------------------
+// Four caches, one mechanism: a `<prefix>:<key>` Redis entry holding a WRAPPED
+// value, best-effort on both sides (a cache miss is never an error, and a store
+// blip just means we pay for the answer again). The wrapper is load-bearing, not
+// decoration: lib/redis.ts JSON-decodes on read, so a bare prose answer that
+// happens to look like JSON would come back as an object — wrapping it in
+// {a: "..."} makes it round-trip as a string. The prefix, the wrapper field name
+// and the TTL ARE the on-disk format; prod Redis holds live entries shaped
+// exactly this way, so none of them may change.
 
-export async function getExplainCache(key: string): Promise<string | null> {
-  const redis = await getRedis();
-  if (!redis) return null;
-  try {
-    const v = await redis.get<{ a?: string }>(`explain:${key}`);
+/** How a cached value is written to and recovered from its Redis wrapper. */
+interface CacheShape<T> {
+  wrap: (value: T) => unknown;
+  unwrap: (stored: unknown) => T | null;
+  /** Nothing worth caching — skip the write (an empty answer is not an answer). */
+  isEmpty: (value: T) => boolean;
+}
+
+const ANSWER: CacheShape<string> = {
+  wrap: (a) => ({ a }),
+  unwrap: (stored) => {
+    const v = stored as { a?: string } | null;
     return v && typeof v.a === "string" ? v.a : null;
-  } catch {
-    return null;
-  }
-}
+  },
+  isEmpty: (a) => !a,
+};
 
-export async function setExplainCache(key: string, answer: string): Promise<void> {
-  if (!answer) return;
-  const redis = await getRedis();
-  if (!redis) return;
-  try {
-    await redis.set(`explain:${key}`, { a: answer }, { ex: EXPLAIN_TTL });
-  } catch {
-    /* best-effort cache */
-  }
-}
-
-// ---- Catch-up recap cache -----------------------------------------------------
-// The "catch me up" card asks a FIXED question about a specific slide RANGE —
-// (viewer's slide, live slide] — so the answer is reusable by every viewer stuck
-// at the same slide. Keyed by (slug, from, to) where `to` is always the LIVE
-// slide, which keeps the key space bounded: one entry per (lagging slide, live
-// slide) pair, not per viewer. Same wrapped-string storage rationale as the
-// explain cache above.
-const CATCHUP_TTL = 60 * 60; // 1h — a session artifact, like the explain cache
-
-export async function getCatchupCache(key: string): Promise<string | null> {
-  const redis = await getRedis();
-  if (!redis) return null;
-  try {
-    const v = await redis.get<{ a?: string }>(`catchup:${key}`);
-    return v && typeof v.a === "string" ? v.a : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function setCatchupCache(key: string, answer: string): Promise<void> {
-  if (!answer) return;
-  const redis = await getRedis();
-  if (!redis) return;
-  try {
-    await redis.set(`catchup:${key}`, { a: answer }, { ex: CATCHUP_TTL });
-  } catch {
-    /* best-effort cache */
-  }
-}
-
-// ---- "Why that answer" poll-explanation cache (#3 reveal explainer) ----------
-// The post-reveal explanation of a poll's correct answer is generated ONCE per
-// poll and shared by the whole room (it rides the frozen poll record on the
-// session poll). This cache is the cross-instance dedupe: keyed by (slug,
-// pollId), so a double-reveal race or a second server instance never pays for a
-// second generation. Same wrapped-string storage rationale as the explain cache.
-const POLL_EXPLAIN_TTL = 60 * 60; // 1h — a session artifact, like the explain cache
-
-export async function getPollExplainCache(key: string): Promise<string | null> {
-  const redis = await getRedis();
-  if (!redis) return null;
-  try {
-    const v = await redis.get<{ a?: string }>(`poll-explain:${key}`);
-    return v && typeof v.a === "string" ? v.a : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function setPollExplainCache(key: string, answer: string): Promise<void> {
-  if (!answer) return;
-  const redis = await getRedis();
-  if (!redis) return;
-  try {
-    await redis.set(`poll-explain:${key}`, { a: answer }, { ex: POLL_EXPLAIN_TTL });
-  } catch {
-    /* best-effort cache */
-  }
-}
-
-// ---- Suggested-questions cache (#9) -----------------------------------------
-// The 2-3 grounded follow-up questions shown under a slide are the same for every
-// viewer on that (deck, slide), so cache them per (slug, slideIndex).
-export async function getSuggestCache(key: string): Promise<string[] | null> {
-  const redis = await getRedis();
-  if (!redis) return null;
-  try {
-    const v = await redis.get<{ q?: string[] }>(`suggest:${key}`);
+const QUESTIONS: CacheShape<string[]> = {
+  wrap: (q) => ({ q }),
+  unwrap: (stored) => {
+    const v = stored as { q?: string[] } | null;
     return v && Array.isArray(v.q) ? v.q : null;
-  } catch {
-    return null;
-  }
+  },
+  isEmpty: (q) => !q.length,
+};
+
+// 1h for all four: every one of them caches a SESSION artifact keyed to slide
+// content that is stable while the room is live.
+const CACHE_TTL = 60 * 60;
+
+function makeCache<T>(prefix: string, ttlSeconds: number, shape: CacheShape<T>) {
+  const get = async (key: string): Promise<T | null> => {
+    const redis = await getRedis();
+    if (!redis) return null;
+    try {
+      return shape.unwrap(await redis.get(`${prefix}:${key}`));
+    } catch {
+      return null;
+    }
+  };
+  const set = async (key: string, value: T): Promise<void> => {
+    if (shape.isEmpty(value)) return;
+    const redis = await getRedis();
+    if (!redis) return;
+    try {
+      await redis.set(`${prefix}:${key}`, shape.wrap(value), { ex: ttlSeconds });
+    } catch {
+      /* best-effort cache */
+    }
+  };
+  return { get, set };
 }
 
-export async function setSuggestCache(key: string, questions: string[]): Promise<void> {
-  if (!questions.length) return;
-  const redis = await getRedis();
-  if (!redis) return;
-  try {
-    await redis.set(`suggest:${key}`, { q: questions }, { ex: 60 * 60 });
-  } catch {
-    /* best-effort cache */
-  }
-}
+// "Explain differently" (#10). The reframe chips (ELI5 / analogy / example /
+// deeper) ask a FIXED question about a specific (deck, slide) — so the answer is
+// reusable across every viewer in the room. Caching it means the 2nd..Nth tap is
+// instant AND free (no model call, no budget spend). Keyed by (slug, slideIndex, mode).
+const explainCache = makeCache("explain", CACHE_TTL, ANSWER);
+export const getExplainCache = explainCache.get;
+export const setExplainCache = explainCache.set;
+
+// Catch-up recap. The "catch me up" card asks a FIXED question about a specific
+// slide RANGE — (viewer's slide, live slide] — so the answer is reusable by every
+// viewer stuck at the same slide. Keyed by (slug, from, to) where `to` is always
+// the LIVE slide, which keeps the key space bounded: one entry per (lagging
+// slide, live slide) pair, not per viewer.
+const catchupCache = makeCache("catchup", CACHE_TTL, ANSWER);
+export const getCatchupCache = catchupCache.get;
+export const setCatchupCache = catchupCache.set;
+
+// "Why that answer" (#3 reveal explainer). The post-reveal explanation of a
+// poll's correct answer is generated ONCE per poll and shared by the whole room
+// (it rides the frozen poll record on the session poll). This cache is the
+// cross-instance dedupe: keyed by (slug, pollId), so a double-reveal race or a
+// second server instance never pays for a second generation.
+const pollExplainCache = makeCache("poll-explain", CACHE_TTL, ANSWER);
+export const getPollExplainCache = pollExplainCache.get;
+export const setPollExplainCache = pollExplainCache.set;
+
+// Suggested questions (#9). The 2-3 grounded follow-up questions shown under a
+// slide are the same for every viewer on that (deck, slide), so cache them per
+// (slug, slideIndex).
+const suggestCache = makeCache("suggest", CACHE_TTL, QUESTIONS);
+export const getSuggestCache = suggestCache.get;
+export const setSuggestCache = suggestCache.set;
 
 const RATE_MAX = positiveInt(process.env.AI_RATE_LIMIT_MAX, 20, 10_000);
 const RATE_WINDOW = positiveInt(process.env.AI_RATE_LIMIT_WINDOW_SECONDS, 60, 86_400);

@@ -4,11 +4,12 @@
 // (lib/telegram.ts) or the admin view. This module is pure request-row CRUD;
 // the ONE place a request becomes an account is lib/provision.ts.
 //
-// House degrade rules: reads fail-open (null / []), writes surface errors.
-// Server-only — never import from a "use client" component.
+// House degrade rules: reads fail-open (null / []), writes surface errors. Both
+// postures — including their ensureSchema boot — come from lib/db.ts safeRead /
+// safeWrite. Server-only — never import from a "use client" component.
 
 import { query } from "./db";
-import { ensureSchema } from "./schema";
+import { safeRead, safeWrite } from "./schema";
 import { randomId } from "./users";
 
 export type RequestStatus = "pending" | "approved" | "rejected";
@@ -62,16 +63,13 @@ function rowToRequest(r: RequestRow): AccountRequest {
 
 /** Look up a request by id. null when absent / no DB. */
 export async function getRequest(id: string): Promise<AccountRequest | null> {
-  await ensureSchema();
-  try {
+  return safeRead<AccountRequest | null>(async () => {
     const res = await query<RequestRow>(
       `SELECT ${ROW_COLS} FROM account_requests WHERE id = $1`,
       [id],
     );
     return res.rows[0] ? rowToRequest(res.rows[0]) : null;
-  } catch {
-    return null;
-  }
+  }, null);
 }
 
 /** The still-open request for an external identity, if any. null otherwise / no DB. */
@@ -79,17 +77,14 @@ export async function getPendingByProvider(
   provider: string,
   providerId: string,
 ): Promise<AccountRequest | null> {
-  await ensureSchema();
-  try {
+  return safeRead<AccountRequest | null>(async () => {
     const res = await query<RequestRow>(
       `SELECT ${ROW_COLS} FROM account_requests
         WHERE provider = $1 AND provider_id = $2 AND status = 'pending'`,
       [provider, providerId],
     );
     return res.rows[0] ? rowToRequest(res.rows[0]) : null;
-  } catch {
-    return null;
-  }
+  }, null);
 }
 
 /**
@@ -105,8 +100,7 @@ export async function hasRecentRejection(
   providerId: string,
   withinDays: number,
 ): Promise<boolean> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query(
       `SELECT 1 FROM account_requests
         WHERE provider = $1 AND provider_id = $2 AND status = 'rejected'
@@ -115,9 +109,7 @@ export async function hasRecentRejection(
       [provider, providerId, withinDays],
     );
     return (res.rowCount ?? 0) > 0;
-  } catch {
-    return false;
-  }
+  }, false);
 }
 
 /**
@@ -135,30 +127,30 @@ export async function createRequest(params: {
   email: string;
   name?: string | null;
 }): Promise<{ ok: true; request: AccountRequest } | { ok: false; error: string }> {
-  await ensureSchema();
-  const id = randomId();
-  try {
-    const inserted = await query<RequestRow>(
-      `INSERT INTO account_requests (id, provider, provider_id, email, name)
+  return safeWrite<{ ok: true; request: AccountRequest } | { ok: false; error: string }>(
+    "[account-requests] createRequest",
+    async () => {
+      const id = randomId();
+      const inserted = await query<RequestRow>(
+        `INSERT INTO account_requests (id, provider, provider_id, email, name)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (provider, provider_id) WHERE status = 'pending' DO NOTHING
        RETURNING ${ROW_COLS}`,
-      [id, params.provider, params.providerId, params.email, params.name ?? null],
-    );
-    if (inserted.rows[0]) return { ok: true, request: rowToRequest(inserted.rows[0]) };
-    // Conflict: a pending request already exists — return that one.
-    const existing = await query<RequestRow>(
-      `SELECT ${ROW_COLS} FROM account_requests
+        [id, params.provider, params.providerId, params.email, params.name ?? null],
+      );
+      if (inserted.rows[0]) return { ok: true, request: rowToRequest(inserted.rows[0]) };
+      // Conflict: a pending request already exists — return that one.
+      const existing = await query<RequestRow>(
+        `SELECT ${ROW_COLS} FROM account_requests
         WHERE provider = $1 AND provider_id = $2 AND status = 'pending'`,
-      [params.provider, params.providerId],
-    );
-    if (existing.rows[0]) return { ok: true, request: rowToRequest(existing.rows[0]) };
-    // Vanishingly rare: the winner was decided between our INSERT and re-read.
-    return { ok: false, error: "conflict" };
-  } catch (err) {
-    console.error("[account-requests] createRequest failed:", err);
-    return { ok: false, error: "database_unavailable" };
-  }
+        [params.provider, params.providerId],
+      );
+      if (existing.rows[0]) return { ok: true, request: rowToRequest(existing.rows[0]) };
+      // Vanishingly rare: the winner was decided between our INSERT and re-read.
+      return { ok: false, error: "conflict" };
+    },
+    { ok: false, error: "database_unavailable" },
+  );
 }
 
 /**
@@ -175,19 +167,19 @@ export async function setDecision(
   status: "approved" | "rejected",
   decidedBy: string | null,
 ): Promise<boolean> {
-  await ensureSchema();
-  try {
-    const res = await query(
-      `UPDATE account_requests
+  return safeWrite(
+    "[account-requests] setDecision",
+    async () => {
+      const res = await query(
+        `UPDATE account_requests
           SET status = $2, decided_at = now(), decided_by = $3
         WHERE id = $1 AND status = 'pending'`,
-      [id, status, decidedBy],
-    );
-    return (res.rowCount ?? 0) > 0;
-  } catch (err) {
-    console.error("[account-requests] setDecision failed:", err);
-    return false;
-  }
+        [id, status, decidedBy],
+      );
+      return (res.rowCount ?? 0) > 0;
+    },
+    false,
+  );
 }
 
 /**
@@ -201,27 +193,25 @@ export async function setNotifyRefs(
   chatId: string,
   messageId: string,
 ): Promise<void> {
-  await ensureSchema();
-  try {
-    await query(
-      `UPDATE account_requests SET notify_chat_id = $2, notify_message_id = $3 WHERE id = $1`,
-      [id, chatId, messageId],
-    );
-  } catch (err) {
-    console.error("[account-requests] setNotifyRefs failed:", err);
-  }
+  return safeWrite<void>(
+    "[account-requests] setNotifyRefs",
+    async () => {
+      await query(
+        `UPDATE account_requests SET notify_chat_id = $2, notify_message_id = $3 WHERE id = $1`,
+        [id, chatId, messageId],
+      );
+    },
+    undefined,
+  );
 }
 
 /** Pending requests, oldest first (admin view). [] on any failure. */
 export async function listPending(): Promise<AccountRequest[]> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query<RequestRow>(
       `SELECT ${ROW_COLS} FROM account_requests
         WHERE status = 'pending' ORDER BY requested_at LIMIT 200`,
     );
     return res.rows.map(rowToRequest);
-  } catch {
-    return [];
-  }
+  }, []);
 }

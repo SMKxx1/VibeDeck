@@ -12,7 +12,7 @@
 
 import type { PoolClient } from "pg";
 import { getPool, isDbReachable, query } from "./db";
-import { ensureSchema, SEEDS } from "./schema";
+import { ensureSchema, SEEDS, safeRead, safeWrite } from "./schema";
 import type { DeckSlideMeta } from "./deck-validator";
 import { sanitizeBranches, type SlideBranch } from "./types";
 
@@ -38,11 +38,13 @@ function seedFor(slug: string) {
 }
 
 // ---- reads (never throw) ----------------------------------------------------
+// All of these take the READ posture from lib/db.ts safeRead: boot the schema,
+// query, and on any failure hand back the fallback in the signature — no DB /
+// query error means "caller uses static data", never an exception.
 
 /** Every slide's editable metadata, ordered by index. `[]` when no DB. */
 export async function getDeckSlides(slug: string): Promise<SlideMeta[]> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query<{
       slide_index: number;
       label: string | null;
@@ -65,9 +67,7 @@ export async function getDeckSlides(slug: string): Promise<SlideMeta[]> {
       // degrade to "not a branch slide", never to a crashing shape.
       branches: sanitizeBranches(r.branches),
     }));
-  } catch {
-    return []; // no DB / query error — caller falls back to static data
-  }
+  }, []);
 }
 
 /**
@@ -77,8 +77,7 @@ export async function getDeckSlides(slug: string): Promise<SlideMeta[]> {
  * to the static module.
  */
 export async function getFullContextText(slug: string): Promise<string | null> {
-  await ensureSchema();
-  try {
+  return safeRead<string | null>(async () => {
     const res = await query<{ slide_index: number; label: string | null; ai_context: string }>(
       `SELECT slide_index, label, ai_context
          FROM deck_slides
@@ -90,30 +89,23 @@ export async function getFullContextText(slug: string): Promise<string | null> {
     return res.rows
       .map((r) => `--- Slide ${r.slide_index + 1}: ${r.label ?? ""} ---\n${r.ai_context}`)
       .join("\n\n");
-  } catch {
-    return null;
-  }
+  }, null);
 }
 
 /** The AI grounding text for one slide. Null when unavailable / missing. */
 export async function getSlideContextText(slug: string, index: number): Promise<string | null> {
-  await ensureSchema();
-  try {
+  return safeRead<string | null>(async () => {
     const res = await query<{ ai_context: string }>(
       `SELECT ai_context FROM deck_slides WHERE deck_slug = $1 AND slide_index = $2`,
       [slug, index],
     );
-    if (res.rows.length === 0) return null;
-    return res.rows[0].ai_context;
-  } catch {
-    return null;
-  }
+    return res.rows.length === 0 ? null : res.rows[0].ai_context;
+  }, null);
 }
 
 /** index → speaker_notes map for the presenter console. `{}` when no DB. */
 export async function getSlideNotes(slug: string): Promise<Record<number, string>> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query<{ slide_index: number; speaker_notes: string }>(
       `SELECT slide_index, speaker_notes FROM deck_slides WHERE deck_slug = $1`,
       [slug],
@@ -121,30 +113,23 @@ export async function getSlideNotes(slug: string): Promise<Record<number, string
     const map: Record<number, string> = {};
     for (const r of res.rows) map[r.slide_index] = r.speaker_notes ?? "";
     return map;
-  } catch {
-    return {};
-  }
+  }, {});
 }
 
 /** One slide's branch point, or null (not a branch slide / unavailable). */
 export async function getSlideBranches(slug: string, index: number): Promise<SlideBranch[] | null> {
-  await ensureSchema();
-  try {
+  return safeRead<SlideBranch[] | null>(async () => {
     const res = await query<{ branches: unknown }>(
       `SELECT branches FROM deck_slides WHERE deck_slug = $1 AND slide_index = $2`,
       [slug, index],
     );
-    if (res.rows.length === 0) return null;
-    return sanitizeBranches(res.rows[0].branches);
-  } catch {
-    return null;
-  }
+    return res.rows.length === 0 ? null : sanitizeBranches(res.rows[0].branches);
+  }, null);
 }
 
 /** index → branches map for a deck's branch-point slides. `{}` when no DB. */
 export async function getDeckBranches(slug: string): Promise<Record<number, SlideBranch[]>> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query<{ slide_index: number; branches: unknown }>(
       `SELECT slide_index, branches FROM deck_slides
         WHERE deck_slug = $1 AND branches IS NOT NULL`,
@@ -156,9 +141,7 @@ export async function getDeckBranches(slug: string): Promise<Record<number, Slid
       if (b) map[r.slide_index] = b;
     }
     return map;
-  } catch {
-    return {};
-  }
+  }, {});
 }
 
 // ---- write ------------------------------------------------------------------
@@ -181,78 +164,78 @@ export async function updateSlideMeta(
   index: number,
   patch: SlideMetaPatch,
 ): Promise<{ ok: boolean; error?: string }> {
-  await ensureSchema();
-  if (!(await isDbReachable())) return { ok: false, error: "database_unavailable" };
+  return safeWrite<{ ok: boolean; error?: string }>(
+    "[slides-store] updateSlideMeta",
+    async () => {
+      if (!(await isDbReachable())) return { ok: false, error: "database_unavailable" };
 
-  const sets: string[] = [];
-  const values: unknown[] = [];
-  let n = 1;
-  if (patch.speakerNotes !== undefined) {
-    sets.push(`speaker_notes = $${n++}`);
-    values.push(patch.speakerNotes);
-  }
-  if (patch.aiContext !== undefined) {
-    sets.push(`ai_context = $${n++}`);
-    values.push(patch.aiContext);
-  }
-  if (patch.branches !== undefined) {
-    sets.push(`branches = $${n++}`);
-    // Stringify rather than passing the array: node-postgres would serialize a
-    // JS array as a Postgres ARRAY literal, not JSONB. PG casts the text for us.
-    values.push(patch.branches === null ? null : JSON.stringify(patch.branches));
-  }
-  if (sets.length === 0) return { ok: true }; // nothing to change
+      const sets: string[] = [];
+      const values: unknown[] = [];
+      let n = 1;
+      if (patch.speakerNotes !== undefined) {
+        sets.push(`speaker_notes = $${n++}`);
+        values.push(patch.speakerNotes);
+      }
+      if (patch.aiContext !== undefined) {
+        sets.push(`ai_context = $${n++}`);
+        values.push(patch.aiContext);
+      }
+      if (patch.branches !== undefined) {
+        sets.push(`branches = $${n++}`);
+        // Stringify rather than passing the array: node-postgres would serialize a
+        // JS array as a Postgres ARRAY literal, not JSONB. PG casts the text for us.
+        values.push(patch.branches === null ? null : JSON.stringify(patch.branches));
+      }
+      if (sets.length === 0) return { ok: true }; // nothing to change
 
-  sets.push(`updated_at = now()`);
-  const slugParam = `$${n++}`;
-  const indexParam = `$${n++}`;
-  values.push(slug, index);
+      sets.push(`updated_at = now()`);
+      const slugParam = `$${n++}`;
+      const indexParam = `$${n++}`;
+      values.push(slug, index);
 
-  try {
-    const res = await query(
-      `UPDATE deck_slides SET ${sets.join(", ")}
+      const res = await query(
+        `UPDATE deck_slides SET ${sets.join(", ")}
         WHERE deck_slug = ${slugParam} AND slide_index = ${indexParam}`,
-      values,
-    );
-    if (res.rowCount && res.rowCount > 0) return { ok: true };
+        values,
+      );
+      if (res.rowCount && res.rowCount > 0) return { ok: true };
 
-    // Row didn't exist — insert it so the edit takes effect. Pull the label from
-    // the seed when we know it (keeps the grounding header intact). On a
-    // concurrent insert (ON CONFLICT) only overwrite the column(s) THIS patch
-    // actually carries — otherwise a racing partial write of the other column
-    // would be silently blanked back to "" (a lost update). The VALUES defaults
-    // ("") only ever apply to a genuinely brand-new row.
-    const label = seedFor(slug)?.slides.find((s) => s.index === index)?.label ?? null;
-    const conflictSets: string[] = [];
-    if (patch.speakerNotes !== undefined) {
-      conflictSets.push("speaker_notes = EXCLUDED.speaker_notes");
-    }
-    if (patch.aiContext !== undefined) {
-      conflictSets.push("ai_context = EXCLUDED.ai_context");
-    }
-    if (patch.branches !== undefined) {
-      conflictSets.push("branches = EXCLUDED.branches");
-    }
-    conflictSets.push("updated_at = now()");
-    await query(
-      `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches, updated_at)
+      // Row didn't exist — insert it so the edit takes effect. Pull the label from
+      // the seed when we know it (keeps the grounding header intact). On a
+      // concurrent insert (ON CONFLICT) only overwrite the column(s) THIS patch
+      // actually carries — otherwise a racing partial write of the other column
+      // would be silently blanked back to "" (a lost update). The VALUES defaults
+      // ("") only ever apply to a genuinely brand-new row.
+      const label = seedFor(slug)?.slides.find((s) => s.index === index)?.label ?? null;
+      const conflictSets: string[] = [];
+      if (patch.speakerNotes !== undefined) {
+        conflictSets.push("speaker_notes = EXCLUDED.speaker_notes");
+      }
+      if (patch.aiContext !== undefined) {
+        conflictSets.push("ai_context = EXCLUDED.ai_context");
+      }
+      if (patch.branches !== undefined) {
+        conflictSets.push("branches = EXCLUDED.branches");
+      }
+      conflictSets.push("updated_at = now()");
+      await query(
+        `INSERT INTO deck_slides (deck_slug, slide_index, label, speaker_notes, ai_context, branches, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, now())
        ON CONFLICT (deck_slug, slide_index) DO UPDATE
          SET ${conflictSets.join(", ")}`,
-      [
-        slug,
-        index,
-        label,
-        patch.speakerNotes ?? "",
-        patch.aiContext ?? "",
-        patch.branches ? JSON.stringify(patch.branches) : null,
-      ],
-    );
-    return { ok: true };
-  } catch (err) {
-    console.error("[slides-store] updateSlideMeta failed:", err);
-    return { ok: false, error: "database_unavailable" };
-  }
+        [
+          slug,
+          index,
+          label,
+          patch.speakerNotes ?? "",
+          patch.aiContext ?? "",
+          patch.branches ? JSON.stringify(patch.branches) : null,
+        ],
+      );
+      return { ok: true };
+    },
+    { ok: false, error: "database_unavailable" },
+  );
 }
 
 /**

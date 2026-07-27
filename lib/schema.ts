@@ -154,3 +154,51 @@ export function ensureSchema(): Promise<void> {
   }
   return schemaPromise;
 }
+
+// ---- store postures ---------------------------------------------------------
+// These live HERE (not in lib/db.ts) so the dependency arrow stays one-way:
+// schema.ts already sits above db.ts, and every *-store file already imports
+// ensureSchema from here. Putting them in db.ts would create a db→schema→db
+// import cycle.
+// The *-store modules open their functions in one of exactly two ways, and the
+// shape was hand-copied into dozens of them before these wrappers existed:
+//
+//   READ  — boot the schema, run the query, degrade QUIETLY to a safe fallback on
+//           any failure (no DB configured, DB down, bad query). Silence is the
+//           point: the caller falls back to static data and the page still renders.
+//   WRITE — boot the schema, run the write, and on failure LOG it (a lost write is
+//           an incident, not a degraded read) before returning the caller's error
+//           result, which the API layer turns into a 503.
+//
+// ensureSchema() runs OUTSIDE the try in both, exactly as every hand-written copy
+// did: it is already non-throwing by contract (lib/schema.ts resolves even with no
+// DB), so wrapping it would only hide a genuine boot bug behind a fallback value.
+
+/** Read posture: `fallback` on any failure, no logging. See the note above. */
+export async function safeRead<T>(run: () => Promise<T>, fallback: T): Promise<T> {
+  await ensureSchema();
+  try {
+    return await run();
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Write posture: log the failure, then return `onError`. See the note above.
+ * `label` is the caller's `[module] operation` prefix, so the log line reads
+ * exactly like the hand-written ones it replaces.
+ */
+export async function safeWrite<T>(
+  label: string,
+  run: () => Promise<T>,
+  onError: T,
+): Promise<T> {
+  await ensureSchema();
+  try {
+    return await run();
+  } catch (err) {
+    console.error(`${label} failed:`, err);
+    return onError;
+  }
+}

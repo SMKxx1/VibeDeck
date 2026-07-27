@@ -8,8 +8,8 @@
 // The count is derived from the per-question voters hash (per-field atomic), so
 // concurrent upvotes converge without a lost-update read-modify-write on a count.
 
-import { randomBytes } from "crypto";
-import { getRedis, hasRedis, type RedisClient } from "./redis";
+import { getRedis, hasRedis } from "./redis";
+import { newId, requireRedis as requireSharedRedis } from "./redis-util";
 
 export interface Question {
   id: string;
@@ -81,9 +81,6 @@ const qMem = (g.__qnaMem ??= new Map<string, Map<string, QRecord>>());
 const vMem = (g.__qnaVotesMem ??= new Map<string, Map<string, Set<string>>>());
 const memAt = (g.__qnaMemAt ??= new Map<string, number>());
 
-function newId(): string {
-  return randomBytes(9).toString("base64url");
-}
 function cleanText(raw: string): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, MAX_TEXT);
 }
@@ -107,11 +104,8 @@ function sweepMemory(now: number): void {
   }
 }
 
-async function requireRedis(): Promise<RedisClient> {
-  const redis = await getRedis();
-  if (!redis) throw new Error("qna_store_unavailable");
-  return redis;
-}
+/** The shared store, or throw with THIS module's error code (lib/redis-util.ts). */
+const requireRedis = () => requireSharedRedis("qna_store_unavailable");
 
 /** Post a new question. Returns null when the queue is full. */
 export async function addQuestion(

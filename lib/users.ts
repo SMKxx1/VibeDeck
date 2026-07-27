@@ -5,7 +5,7 @@
 
 import { randomBytes } from "crypto";
 import { getPool, hasDb, query } from "./db";
-import { ensureSchema } from "./schema";
+import { ensureSchema, safeRead, safeWrite } from "./schema";
 import { verifyPassword } from "./password";
 import { getRedis, hasRedis } from "./redis";
 
@@ -38,7 +38,12 @@ function rowToUser(r: {
   return { id: r.id, email: r.email, passwordHash: r.password_hash, role: r.role as Role };
 }
 
-/** Look up a user by email (case-insensitive). null when absent / no DB. */
+/**
+ * Look up a user by email (case-insensitive). null when absent / no DB.
+ * Deliberately NOT the safeRead posture: this backs LOGIN, so a configured-but-
+ * failing DB must throw rather than degrade into "no such user" — a silent
+ * fallback there would read as a wrong password to everyone during an outage.
+ */
 export async function getUserByEmail(email: string): Promise<User | null> {
   await ensureSchema();
   try {
@@ -55,16 +60,13 @@ export async function getUserByEmail(email: string): Promise<User | null> {
 
 /** Look up a user by id. null when absent / no DB. */
 export async function getUserById(id: string): Promise<User | null> {
-  await ensureSchema();
-  try {
+  return safeRead<User | null>(async () => {
     const res = await query<{ id: string; email: string; password_hash: string; role: string }>(
       `SELECT id, email, password_hash, role FROM users WHERE id = $1`,
       [id],
     );
     return res.rows[0] ? rowToUser(res.rows[0]) : null;
-  } catch {
-    return null;
-  }
+  }, null);
 }
 
 // ---- login rate limit (dedicated + stricter than the AI limiter) ------------
@@ -136,26 +138,25 @@ export async function createInvite(
   email: string | null,
   createdBy: string | null,
 ): Promise<{ ok: boolean; token?: string; error?: string }> {
-  await ensureSchema();
-  const token = randomId(24);
-  const expires = new Date(Date.now() + INVITE_TTL_MS).toISOString();
-  try {
-    await query(
-      `INSERT INTO invites (token, email, role, created_by, expires_at)
+  return safeWrite<{ ok: boolean; token?: string; error?: string }>(
+    "[users] createInvite",
+    async () => {
+      const token = randomId(24);
+      const expires = new Date(Date.now() + INVITE_TTL_MS).toISOString();
+      await query(
+        `INSERT INTO invites (token, email, role, created_by, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
-      [token, email ? canonicalAccountIdentifier(email) : null, role, createdBy, expires],
-    );
-    return { ok: true, token };
-  } catch (err) {
-    console.error("[users] createInvite failed:", err);
-    return { ok: false, error: "database_unavailable" };
-  }
+        [token, email ? canonicalAccountIdentifier(email) : null, role, createdBy, expires],
+      );
+      return { ok: true, token };
+    },
+    { ok: false, error: "database_unavailable" },
+  );
 }
 
 /** List invites (admin view), newest first. */
 export async function listInvites(): Promise<Invite[]> {
-  await ensureSchema();
-  try {
+  return safeRead(async () => {
     const res = await query<{
       token: string;
       email: string | null;
@@ -175,20 +176,23 @@ export async function listInvites(): Promise<Invite[]> {
       createdAt: r.created_at,
       expiresAt: r.expires_at,
     }));
-  } catch {
-    return [];
-  }
+  }, []);
 }
 
-/** Revoke (delete) an UNUSED invite. A used invite is left as an audit record. */
+/**
+ * Revoke (delete) an UNUSED invite. A used invite is left as an audit record.
+ * Takes the QUIET posture (safeRead, not safeWrite) that this function has always
+ * had: its one caller, the admin invites route, already hands `error` straight
+ * back to the human who clicked, so a server-side incident log adds nothing.
+ */
 export async function revokeInvite(token: string): Promise<{ ok: boolean; error?: string }> {
-  await ensureSchema();
-  try {
-    const res = await query(`DELETE FROM invites WHERE token = $1 AND used_by IS NULL`, [token]);
-    return (res.rowCount ?? 0) > 0 ? { ok: true } : { ok: false, error: "not_found" };
-  } catch {
-    return { ok: false, error: "database_unavailable" };
-  }
+  return safeRead<{ ok: boolean; error?: string }>(
+    async () => {
+      const res = await query(`DELETE FROM invites WHERE token = $1 AND used_by IS NULL`, [token]);
+      return (res.rowCount ?? 0) > 0 ? { ok: true } : { ok: false, error: "not_found" };
+    },
+    { ok: false, error: "database_unavailable" },
+  );
 }
 
 /**
