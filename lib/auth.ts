@@ -7,6 +7,8 @@
 // PRESENTER_PASSWORD out of the client bundle (this module is server-only).
 
 import crypto from "crypto";
+import { cookies } from "next/headers";
+import { NextResponse } from "next/server";
 import { authSecretConfigError } from "./config";
 
 export const AUTH_COOKIE = "presenter_session";
@@ -160,6 +162,47 @@ export function canManageDeck(session: Session, ownerId: string | null): boolean
 }
 
 export const SESSION_MAX_AGE = MAX_AGE_SECONDS;
+
+// --- Request-scoped gates ---------------------------------------------------
+// Everything above is pure crypto over a token string and is callable anywhere.
+// The three helpers below read the request's cookie jar, so they only work inside
+// a Route Handler / Server Component — but that IS the shape ~30 handlers needed,
+// and each of them used to carry its own private copy. Keeping the copies in sync
+// by convention is exactly the kind of thing that eventually ships one route that
+// checks validity where it meant to check identity.
+//
+// Pick by what the route actually needs:
+//   isPresenterRequest() — a boolean gate ("is a presenter asking"): publish
+//     gates, presenter-only reads. Never for authorization against a specific deck.
+//   currentSession()     — identity: owner_id on create, the clicker holder,
+//     anything that then goes through canManageDeck / checkDeckManage.
+//   requireAdmin()       — the admin-only surfaces (invites, account requests).
+
+/** The session behind the request cookie, or null when absent/invalid/expired. */
+export async function currentSession(): Promise<Session | null> {
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  return getSession(token);
+}
+
+/** True iff this request carries a valid, unexpired presenter (or admin) cookie. */
+export async function isPresenterRequest(): Promise<boolean> {
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  return verifySessionToken(token);
+}
+
+/**
+ * Admin-only gate. Returns the admin session, OR a Response to send verbatim
+ * (401 unauthorized / 403 forbidden). The union is the contract — callers branch
+ * on `instanceof Response` — so a route can't accidentally treat the refusal as a
+ * session. Uses getSession().role, never the boolean gate, which any presenter passes.
+ */
+export async function requireAdmin(): Promise<Session | Response> {
+  const token = (await cookies()).get(AUTH_COOKIE)?.value;
+  const s = getSession(token);
+  if (!s) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (s.role !== "admin") return NextResponse.json({ error: "forbidden" }, { status: 403 });
+  return s;
+}
 
 // Preview tokens: a short-lived capability that lets a presenter view an
 // 'unpublished' uploaded deck on the isolated DECK_ORIGIN, where there is NO

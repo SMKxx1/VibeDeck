@@ -1,10 +1,16 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
-import { staticDecks } from "@/lib/decks/static";
-import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
+import { deckSlugExists } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
+import {
+  SLUG_RE,
+  allocateSlug,
+  collidesStatic,
+  slugifyTitle,
+  storeUploadedDeck,
+  todayIso,
+} from "@/lib/deck-create";
 
 // Presenter-gated deck UPLOAD — THE route that first lets new deck content enter
 // the system at runtime. Containment is NOT this route's job: the origin
@@ -20,57 +26,12 @@ export const dynamic = "force-dynamic";
 // migration 003 keeps html deliberately unconstrained on size. Enforced twice: on
 // the raw Content-Length header (before buffering) AND on the parsed html field.
 const MAX_BYTES = 2_000_000;
-// slug shape: lowercase alphanumeric words joined by single hyphens, no leading/
-// trailing/double hyphens. Length is bounded separately (1–64).
-const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-// The session behind the request cookie, or null. We need the SESSION (not the
-// boolean gate) here because a created deck's owner_id is set to the creator's
-// user id — so the person who uploads a deck can later manage it (Phase 4).
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
-
-// Static-slug collision, checked DIRECTLY against staticDecks (not via the merged
-// getDeck): a compiled registry deck may have no DB row for an ON CONFLICT to
-// trip, and static precedence means such a slug could never render as the uploaded
-// deck anyway — so it must be rejected here, not left to the DB.
-function collidesStatic(slug: string): boolean {
-  return staticDecks.some((d) => d.slug === slug);
-}
-
-// title → base slug: lowercase, every non-alphanumeric run → one hyphen, trim
-// hyphens, cap length leaving room for a numeric suffix. Empty (all-symbol title)
-// is handled by the caller's `|| "deck"` fallback.
-function slugifyTitle(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60)
-    .replace(/-+$/g, "");
-}
-
-// today as YYYY-MM-DD — the default upload date so a fresh deck sorts to the TOP
-// of the newest-first library instead of last (rowToDeck coalesces a null date to
-// "", which sorts last). A client-supplied date overrides this.
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-// Auto-suffix -2/-3/… until a slug collides NOTHING (static OR any DB row). The
-// bare base is tried first (no "-1"). Bounded so a pathological namespace can't
-// spin forever; the ON CONFLICT insert remains the final race guard regardless.
-// deckSlugExists throws on DB error — that propagates to the caller (→ 503) rather
-// than handing back a slug we couldn't prove is free.
-async function firstFreeSlug(base: string): Promise<string> {
-  for (let n = 1; n <= 1000; n++) {
-    const candidate = n === 1 ? base : `${base}-${n}`;
-    if (!collidesStatic(candidate) && !(await deckSlugExists(candidate))) return candidate;
-  }
-  return `${base}-${Date.now()}`.slice(0, 64); // astronomically unlikely to be reached
-}
+// Slug shape/collision/insert rules live in lib/deck-create.ts, shared verbatim
+// with the Markdown-import and duplicate routes — a fork must never be able to
+// mint a slug an upload would have rejected. currentSession (not the boolean gate)
+// because a created deck's owner_id is the creator's user id, so the person who
+// uploads a deck can later manage it (Phase 4).
 
 interface PostBody {
   title?: unknown;
@@ -160,33 +121,28 @@ export async function POST(req: Request) {
     }
   } else {
     const base = slugifyTitle(title) || "deck";
-    try {
-      slug = await firstFreeSlug(base);
-    } catch {
-      return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
+    const allocated = await allocateSlug(base);
+    if (!allocated.ok) {
+      return NextResponse.json({ error: allocated.error }, { status: allocated.status });
     }
+    slug = allocated.slug;
   }
 
-  // Insert with ON CONFLICT DO NOTHING: rowCount 0 means a slug that raced past the
-  // checks above (a concurrent upload of the same slug) — the DB is the final
-  // arbiter, so surface that as 409 rather than a 500.
-  let result: "ok" | "conflict";
-  try {
-    result = await insertUploadedDeck({
-      slug,
-      title,
-      date,
-      description,
-      html,
-      ownerId: session.userId, // null for a legacy admin cookie — an admin can manage anything anyway
-      slideCount: validation.slideCount,
-      slides: validation.slides,
-    });
-  } catch {
-    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
-  }
-  if (result === "conflict") {
-    return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
+  // storeUploadedDeck inserts with ON CONFLICT DO NOTHING: rowCount 0 means a slug
+  // that raced past the checks above (a concurrent upload of the same slug) — the
+  // DB is the final arbiter, so that surfaces as 409 rather than a 500.
+  const stored = await storeUploadedDeck({
+    slug,
+    title,
+    date,
+    description,
+    html,
+    ownerId: session.userId, // null for a legacy admin cookie — an admin can manage anything anyway
+    slideCount: validation.slideCount,
+    slides: validation.slides,
+  });
+  if (!stored.ok) {
+    return NextResponse.json({ error: stored.error }, { status: stored.status });
   }
 
   return NextResponse.json({ slug, warnings: validation.warnings }, { status: 201 });

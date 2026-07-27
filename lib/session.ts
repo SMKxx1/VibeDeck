@@ -11,6 +11,7 @@
 // a room of phones doesn't hammer Redis.
 
 import { getRedis, hasRedis, type RedisClient } from "./redis";
+import type { Session } from "./auth";
 
 export interface SessionState {
   index: number;
@@ -25,6 +26,17 @@ export interface SessionState {
    * polls, recaps, Q&A) until they takeClicker().
    */
   driverId?: string;
+}
+
+/**
+ * Co-host mode: the clicker is held per presenter IDENTITY, so every route that
+ * writes or reads `driverId` must derive it the same way. A legacy (v<2) cookie has
+ * no user row (userId null) but is one stable identity — the pre-accounts admin —
+ * so it maps to a sentinel that can hold and contest the clicker like anyone else.
+ * Shared by /api/session (drive, take, isDriver) and /api/poll (branch routing).
+ */
+export function driverIdFor(session: Session): string {
+  return session.userId ?? "legacy-admin";
 }
 
 // A session is "live" (presenter actively presenting → viewers locked/synced) if

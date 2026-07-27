@@ -8,13 +8,12 @@ import {
   verifyAiAccessToken,
   verifyAiClassPassword,
 } from "@/lib/ai-access";
+import { NO_STORE } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkPublicRateLimit } from "@/lib/request-security";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const NO_STORE = { "cache-control": "no-store" } as const;
 
 export async function GET() {
   const jar = await cookies();

@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { addSignal, getSignals, isSignalKind } from "@/lib/signals";
 import { getSession } from "@/lib/session";
 import { bumpPulse } from "@/lib/pulse";
 import { checkRateLimit } from "@/lib/kv";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { isPresenterRequest } from "@/lib/auth";
+import { NO_STORE, cleanName } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
@@ -20,25 +20,8 @@ import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const RECENT_MS = 30_000; // signals surfaced to the presenter
 const HELP_MS = 15_000; // window for the live "lost / slow-down" meter
-
-function cleanName(raw: unknown): string {
-  return (
-    (raw ?? "")
-      .toString()
-      .replace(/[^\p{L}\p{N} .,'-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 40) || "anonymous"
-  );
-}
-
-async function isPresenterReq(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
 
 interface PostBody {
   slug?: string;
@@ -63,7 +46,7 @@ export async function POST(req: Request) {
   }
   if (!isSignalKind(kind)) return NextResponse.json({ error: "bad_kind" }, { status: 400 });
 
-  if (!(await isDeckViewable(slug, await isPresenterReq()))) {
+  if (!(await isDeckViewable(slug, await isPresenterRequest()))) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
 
@@ -111,7 +94,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "bad_slug" }, { status: 400 });
   }
 
-  if (!(await isPresenterReq())) {
+  if (!(await isPresenterRequest())) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 

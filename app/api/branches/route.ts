@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { NO_STORE } from "@/lib/api-helpers";
 import { getDeckBranches } from "@/lib/slides-store";
 
 // Branch points, for the PRESENTER surfaces (console + uploaded-deck presenter
@@ -13,8 +14,6 @@ import { getDeckBranches } from "@/lib/slides-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const NO_STORE = { "cache-control": "no-store" } as const;
 
 export async function GET(req: Request) {
   const token = (await cookies()).get(AUTH_COOKIE)?.value;

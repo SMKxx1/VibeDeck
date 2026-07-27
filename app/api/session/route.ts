@@ -1,7 +1,16 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { getSession, setPresenterIndex, resetLock, heartbeat, takeClicker, isLive } from "@/lib/session";
-import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession, type Session } from "@/lib/auth";
+import {
+  driverIdFor,
+  getSession,
+  setPresenterIndex,
+  resetLock,
+  heartbeat,
+  takeClicker,
+  isLive,
+} from "@/lib/session";
+import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession } from "@/lib/auth";
+import { NO_STORE } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { getActivePoll, pollForViewer } from "@/lib/poll";
@@ -21,15 +30,6 @@ import { isValidDeckSlug } from "@/lib/request-security";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const NO_STORE = { "cache-control": "no-store" } as const;
-
-// Co-host mode: the clicker is held per presenter IDENTITY. A legacy (v<2) cookie
-// has no user row (userId null) but is one stable identity — the pre-accounts
-// admin — so map it to a sentinel that can hold/contest the clicker like anyone.
-function driverIdFor(session: Session): string {
-  return session.userId ?? "legacy-admin";
-}
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";

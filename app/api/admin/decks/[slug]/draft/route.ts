@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession, createPreviewToken, type Session } from "@/lib/auth";
+import { createPreviewToken, currentSession, type Session } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import {
@@ -43,11 +42,6 @@ const MAX_BYTES = 2_000_000;
 // Unset → previewUrl is null and the Workbench shows its "preview unavailable —
 // deck origin not configured" note instead of a broken frame.
 const DECK_ORIGIN = process.env.DECK_ORIGIN;
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 // Shared gate for all four methods: session → CSRF → ownership → uploaded-only.
 // Returns the failure response to send verbatim, or null to proceed.

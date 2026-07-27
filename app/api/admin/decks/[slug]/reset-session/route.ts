@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { clearDeckLiveState } from "@/lib/live-reset";
@@ -24,11 +23,6 @@ export const dynamic = "force-dynamic";
 // that can't be a real slug is a flat 400 before we touch the DB — a real deck's
 // slug always matches, so this leaks nothing about which slugs exist.
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 export async function POST(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   // CSRF first (cheap, fails fast), then the session cookie, then OWNERSHIP — a

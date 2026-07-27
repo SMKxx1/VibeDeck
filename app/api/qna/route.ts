@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { isPresenterRequest } from "@/lib/auth";
+import { NO_STORE, cleanName } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkRateLimit } from "@/lib/kv";
@@ -17,31 +17,14 @@ import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const LIVE_ID_RE = /^[A-Za-z0-9_-]{12}$/;
-
-function cleanName(raw: unknown): string {
-  return (
-    (raw ?? "")
-      .toString()
-      .replace(/[^\p{L}\p{N} .,'-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 40) || "anonymous"
-  );
-}
-
-async function isPresenterReq(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
 
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
   if (!isValidDeckSlug(slug)) {
     return NextResponse.json({ error: "bad_slug" }, { status: 400 });
   }
-  const isPresenter = await isPresenterReq();
+  const isPresenter = await isPresenterRequest();
   if (!(await isDeckViewable(slug, isPresenter))) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
@@ -75,7 +58,7 @@ export async function POST(req: Request) {
 
   // --- Presenter curation (answer / dismiss / undismiss) ---
   if (action === "answer" || action === "dismiss" || action === "undismiss") {
-    if (!(await isPresenterReq())) {
+    if (!(await isPresenterRequest())) {
       return NextResponse.json({ error: "forbidden" }, { status: 403 });
     }
     const qid = (body.qid ?? "").toString();
@@ -97,7 +80,7 @@ export async function POST(req: Request) {
   }
 
   // --- Viewer actions (ask / upvote): publish-gated + rate-limited ---
-  const isPresenter = await isPresenterReq();
+  const isPresenter = await isPresenterRequest();
   if (!(await isDeckViewable(slug, isPresenter))) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }

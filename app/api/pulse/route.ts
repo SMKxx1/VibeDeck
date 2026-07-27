@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { randomBytes } from "crypto";
-import { AUTH_COOKIE, getSession, verifySessionToken } from "@/lib/auth";
+import { currentSession, isPresenterRequest } from "@/lib/auth";
+import { NO_STORE } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getDeck } from "@/lib/decks";
@@ -28,22 +28,15 @@ import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
-
 // The debrief grounds the model on the WORST slides only: enough context for
 // concrete rework suggestions without blowing the prompt up with a whole deck.
 const MAX_STRUGGLE_SLIDES = 8;
 const MAX_SLIDE_TEXT = 700; // chars of grounding per struggling slide
 
-async function isPresenterReq(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
-
 export async function GET(req: Request) {
   const slug = new URL(req.url).searchParams.get("slug") ?? "";
   if (!slug) return NextResponse.json({ error: "missing_slug" }, { status: 400 });
-  if (!(await isPresenterReq())) {
+  if (!(await isPresenterRequest())) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   const pulse = await getPulse(slug);
@@ -71,7 +64,7 @@ export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  const session = getSession((await cookies()).get(AUTH_COOKIE)?.value);
+  const session = await currentSession();
   if (!session) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }

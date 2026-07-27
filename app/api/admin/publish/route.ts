@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getDeck } from "@/lib/decks";
@@ -17,11 +16,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const VALID: readonly PublishStatus[] = ["main", "normal", "unpublished"];
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 interface PostBody {
   slug?: string;

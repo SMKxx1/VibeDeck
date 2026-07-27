@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getUploadedDeck, getUploadedDeckHtml } from "@/lib/uploaded-decks";
@@ -36,7 +35,7 @@ export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  const session = getSession((await cookies()).get(AUTH_COOKIE)?.value);
+  const session = await currentSession();
   if (!session) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 
   let body: Body;

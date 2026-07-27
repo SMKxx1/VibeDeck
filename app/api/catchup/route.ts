@@ -5,6 +5,7 @@ import { slideToText } from "@/lib/deckUtils";
 import { checkTokenBudget, getCatchupCache, setCatchupCache } from "@/lib/kv";
 import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { clamp } from "@/lib/api-helpers";
 import { isDeckViewable } from "@/lib/publish-store";
 import { buildHostWebsiteContext, contextForSlide } from "@/lib/decks/build-host-website-context";
 import { getSlideContextText } from "@/lib/slides-store";
@@ -41,10 +42,6 @@ interface Body {
   password?: unknown;
 }
 
-function clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
-}
-
 export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
@@ -56,8 +53,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "bad_request" }, { status: 400 });
   }
 
-  // Same name sanitation as /api/ask — the name is rendered into the prompt, so
-  // strip anything that could forge the data/instruction boundary.
+  // Same charset rule as /api/ask — the name is rendered into the prompt, so
+  // strip anything that could forge the data/instruction boundary — but NOT
+  // lib/api-helpers cleanName: this route requires a STRING, so a non-string
+  // `name` becomes "anonymous" here where cleanName would coerce it ("42"). That
+  // picks a different rate-limit bucket for the same caller, so the divergence is
+  // left visible rather than silently unified.
   const name =
     (typeof body.name === "string" ? body.name : "")
       .replace(/[^\p{L}\p{N} .,'-]/gu, " ")

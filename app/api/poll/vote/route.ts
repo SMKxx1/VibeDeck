@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { NO_STORE, cleanName } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkRateLimit } from "@/lib/kv";
@@ -15,19 +16,7 @@ import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const LIVE_ID_RE = /^[A-Za-z0-9_-]{12}$/;
-
-function cleanName(raw: unknown): string {
-  return (
-    (raw ?? "")
-      .toString()
-      .replace(/[^\p{L}\p{N} .,'-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 40) || "anonymous"
-  );
-}
 
 interface PostBody {
   slug?: string;

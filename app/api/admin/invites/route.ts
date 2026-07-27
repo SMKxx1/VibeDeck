@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession, type Session } from "@/lib/auth";
+import { requireAdmin } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { createInvite, listInvites, revokeInvite, type Role } from "@/lib/users";
 
@@ -11,15 +10,6 @@ import { createInvite, listInvites, revokeInvite, type Role } from "@/lib/users"
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-// Returns the admin session, or a Response to send (401 unauth / 403 not-admin).
-async function requireAdmin(): Promise<Session | Response> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  const s = getSession(token);
-  if (!s) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  if (s.role !== "admin") return NextResponse.json({ error: "forbidden" }, { status: 403 });
-  return s;
-}
 
 export async function GET() {
   const admin = await requireAdmin();

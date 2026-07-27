@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import {
   MAX_PIN_NAME_LENGTH,
   addPin,
@@ -8,17 +7,11 @@ import {
   normalizeUrl,
 } from "@/lib/pinboard";
 import { checkRateLimit } from "@/lib/kv";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { isPresenterRequest } from "@/lib/auth";
+import { NO_STORE } from "@/lib/api-helpers";
 import { isDeckViewable } from "@/lib/publish-store";
 import { getDeck } from "@/lib/decks";
 import { checkPublicRateLimit } from "@/lib/request-security";
-
-// Resolve whether THIS request carries a valid presenter cookie — presenters can
-// reach an unpublished deck's pinboard, non-presenters cannot.
-async function isPresenterReq(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
 
 // The showcase pinboard. Viewers POST { name, url } from the input slide; anyone
 // GETs the current pins (polled by the pinboard slide). Public on purpose — this
@@ -27,15 +20,15 @@ async function isPresenterReq(): Promise<boolean> {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const MAX_POST_BYTES = 8 * 1024;
 
 async function deckIsAccessible(slug: string): Promise<boolean> {
   // isDeckViewable deliberately treats an unknown slug as a static deck. Pair it
   // with the merged registry lookup here so arbitrary attacker-chosen slugs can
-  // never allocate pinboard keys.
+  // never allocate pinboard keys. A presenter cookie reaches an unpublished deck's
+  // pinboard; a viewer does not.
   if (!(await getDeck(slug))) return false;
-  return isDeckViewable(slug, await isPresenterReq());
+  return isDeckViewable(slug, await isPresenterRequest());
 }
 
 export async function GET(req: Request) {

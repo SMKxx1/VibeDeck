@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { getDeck } from "@/lib/decks";
 import { deckToText } from "@/lib/deckUtils";
-import { AUTH_COOKIE, getSession, type Session } from "@/lib/auth";
+import { currentSession, type Session } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
@@ -59,7 +58,7 @@ export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
-  const session = getSession((await cookies()).get(AUTH_COOKIE)?.value);
+  const session = await currentSession();
   if (!session) return NextResponse.json({ error: "forbidden" }, { status: 403 });
 
   let body: Body;

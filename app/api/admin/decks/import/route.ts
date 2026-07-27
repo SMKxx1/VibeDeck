@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { assertSameOrigin } from "@/lib/csrf";
-import { staticDecks } from "@/lib/decks/static";
-import { deckSlugExists, insertUploadedDeck } from "@/lib/uploaded-decks";
 import { validateDeckHtml } from "@/lib/deck-validator";
 import { markdownToDeck, type DeckTheme } from "@/lib/markdown-deck";
+import {
+  SLUG_RE,
+  allocateSlug,
+  slugifyTitle,
+  storeUploadedDeck,
+  todayIso,
+} from "@/lib/deck-create";
 
 // Markdown → deck import (#21). Widens authoring to non-coders: paste Markdown, get
 // a themed, contract-valid VibeDeck deck with auto AI grounding. Server-side transform (one
@@ -18,35 +22,7 @@ export const dynamic = "force-dynamic";
 
 const MAX_BYTES = 400_000; // Markdown source cap (before rendering)
 const MAX_BODY = 500_000;
-const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const VALID_THEMES: DeckTheme[] = ["light", "dark", "warm"];
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
-
-function collidesStatic(slug: string): boolean {
-  return staticDecks.some((d) => d.slug === slug);
-}
-function slugifyTitle(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60)
-    .replace(/-+$/g, "");
-}
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-async function firstFreeSlug(base: string): Promise<string> {
-  for (let n = 1; n <= 1000; n++) {
-    const candidate = n === 1 ? base : `${base}-${n}`;
-    if (!collidesStatic(candidate) && !(await deckSlugExists(candidate))) return candidate;
-  }
-  return `${base}-${Date.now()}`.slice(0, 64);
-}
 
 interface Body {
   markdown?: unknown;
@@ -97,14 +73,13 @@ export async function POST(req: Request) {
     );
   }
 
-  let slug: string;
-  try {
-    let base = slugifyTitle(title) || "deck";
-    if (!SLUG_RE.test(base)) base = "deck";
-    slug = await firstFreeSlug(base);
-  } catch {
-    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
+  let base = slugifyTitle(title) || "deck";
+  if (!SLUG_RE.test(base)) base = "deck";
+  const allocated = await allocateSlug(base);
+  if (!allocated.ok) {
+    return NextResponse.json({ error: allocated.error }, { status: allocated.status });
   }
+  const slug = allocated.slug;
 
   // Attach branch directives before persistence: branches live in deck_slides,
   // not the generated HTML, and the whole bundle commits atomically below.
@@ -112,22 +87,17 @@ export async function POST(req: Request) {
     rendered.branches[s.index] ? { ...s, branches: rendered.branches[s.index] } : s,
   );
 
-  let result: "ok" | "conflict";
-  try {
-    result = await insertUploadedDeck({
-      slug,
-      title,
-      date: todayIso(),
-      description: null,
-      html: rendered.html,
-      ownerId: session.userId,
-      slideCount: validation.slideCount,
-      slides,
-    });
-  } catch {
-    return NextResponse.json({ error: "database_unavailable" }, { status: 503 });
-  }
-  if (result === "conflict") return NextResponse.json({ error: "slug_conflict" }, { status: 409 });
+  const stored = await storeUploadedDeck({
+    slug,
+    title,
+    date: todayIso(),
+    description: null,
+    html: rendered.html,
+    ownerId: session.userId,
+    slideCount: validation.slideCount,
+    slides,
+  });
+  if (!stored.ok) return NextResponse.json({ error: stored.error }, { status: stored.status });
 
   return NextResponse.json(
     { slug, slideCount: validation.slideCount, warnings: validation.warnings },

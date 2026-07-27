@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession, createPreviewToken } from "@/lib/auth";
+import { createPreviewToken, currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
 import { getUploadedDeck } from "@/lib/uploaded-decks";
@@ -20,11 +19,6 @@ export const dynamic = "force-dynamic";
 // Without it there is nowhere to point the preview, so we fail loudly rather than
 // hand back a broken URL.
 const DECK_ORIGIN = process.env.DECK_ORIGIN;
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 export async function GET(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   if (!assertSameOrigin(req)) {

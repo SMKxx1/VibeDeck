@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { getDeck } from "@/lib/decks";
 import { deckToText, slideToText } from "@/lib/deckUtils";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { clamp } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkRateLimit, checkTokenBudget, getExplainCache, setExplainCache } from "@/lib/kv";
 import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
@@ -35,10 +36,6 @@ interface Body {
   slug?: unknown;
   slideIndex?: unknown;
   mode?: unknown;
-}
-
-function clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
 }
 
 export async function POST(req: Request) {

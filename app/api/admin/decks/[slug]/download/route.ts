@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession } from "@/lib/auth";
+import { currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
@@ -17,11 +16,6 @@ import { getAsset, listAssets } from "@/lib/deck-assets";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 // Matches a src attribute pointing at THIS deck's vault: root-relative or
 // absolute (any origin prefix) /d-assets/<slug>/<64-hex-hash>. The slug is

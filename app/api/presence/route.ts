@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { markPresent, getRoster } from "@/lib/presence";
-import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { isPresenterRequest } from "@/lib/auth";
+import { NO_STORE, cleanName } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
 import { checkRateLimit } from "@/lib/kv";
@@ -19,24 +19,6 @@ import { checkPublicRateLimit, isValidDeckSlug } from "@/lib/request-security";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const NO_STORE = { "cache-control": "no-store" } as const;
-
-function cleanName(raw: unknown): string {
-  return (
-    (raw ?? "")
-      .toString()
-      .replace(/[^\p{L}\p{N} .,'-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 40) || "anonymous"
-  );
-}
-
-async function isPresenterReq(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
 
 interface PostBody {
   slug?: string;
@@ -62,7 +44,7 @@ export async function POST(req: Request) {
 
   // Publish gate: no presence on a deck the caller can't view (indistinguishable
   // 404, matching the other live routes).
-  if (!(await isDeckViewable(slug, await isPresenterReq()))) {
+  if (!(await isDeckViewable(slug, await isPresenterRequest()))) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
 
@@ -106,7 +88,7 @@ export async function GET(req: Request) {
   }
 
   // Presenter-only: the detailed roster (names + positions) is a presenter tool.
-  if (!(await isPresenterReq())) {
+  if (!(await isPresenterRequest())) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 

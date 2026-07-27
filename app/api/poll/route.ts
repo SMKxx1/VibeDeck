@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession, type Session } from "@/lib/auth";
+import { currentSession, isPresenterRequest } from "@/lib/auth";
+import { NO_STORE } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import {
   MAX_OPTION_LEN,
@@ -15,7 +15,7 @@ import {
 } from "@/lib/poll";
 import { generatePollExplanation } from "@/lib/poll-explain";
 import { getSlideBranches } from "@/lib/slides-store";
-import { getSession } from "@/lib/session";
+import { driverIdFor, getSession } from "@/lib/session";
 import { bumpPulse } from "@/lib/pulse";
 import { getDeck } from "@/lib/decks";
 import { isValidDeckSlug } from "@/lib/request-security";
@@ -33,20 +33,6 @@ import { isValidDeckSlug } from "@/lib/request-security";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const NO_STORE = { "cache-control": "no-store" } as const;
-
-async function isPresenter(): Promise<boolean> {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return verifySessionToken(token);
-}
-
-// Co-host mode: the clicker identity for the "route" jump — same sentinel rule as
-// app/api/session/route.ts driverIdFor (a legacy v<2 cookie is the pre-accounts
-// admin, one stable identity).
-function driverIdFor(session: Session): string {
-  return session.userId ?? "legacy-admin";
-}
 
 interface PostBody {
   slug?: string;
@@ -67,11 +53,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   // Identity, not just validity: the "route" action moves the shared slide index,
-  // which is clicker-gated per presenter userId (Co-host mode). getAuthSession
-  // runs the IDENTICAL signature/expiry/role checks as verifySessionToken — same
+  // which is clicker-gated per presenter userId (Co-host mode). currentSession
+  // runs the IDENTICAL signature/expiry/role checks as isPresenterRequest — same
   // gate as before, plus who is asking.
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  const auth = getAuthSession(token);
+  const auth = await currentSession();
   if (!auth) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
@@ -235,7 +220,7 @@ export async function POST(req: Request) {
 }
 
 export async function GET(req: Request) {
-  if (!(await isPresenter())) {
+  if (!(await isPresenterRequest())) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
   const slug = new URL(req.url).searchParams.get("slug") ?? "";

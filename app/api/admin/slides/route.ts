@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, getSession, canManageDeck } from "@/lib/auth";
+import { canManageDeck, currentSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getDeckOwner } from "@/lib/uploaded-decks";
 import { getDeck } from "@/lib/decks";
@@ -21,11 +20,6 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_FIELD = 8000;
-
-async function currentSession() {
-  const token = (await cookies()).get(AUTH_COOKIE)?.value;
-  return getSession(token);
-}
 
 export async function GET(req: Request) {
   const session = await currentSession();

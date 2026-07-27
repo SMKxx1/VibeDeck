@@ -10,6 +10,7 @@ import {
   setExplainCache,
 } from "@/lib/kv";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
+import { clamp, cleanName } from "@/lib/api-helpers";
 import { isDeckViewable } from "@/lib/publish-store";
 import { assertSameOrigin } from "@/lib/csrf";
 import { checkPublicRateLimit, isValidDeckSlug, safeHttpsUrl } from "@/lib/request-security";
@@ -57,10 +58,6 @@ interface Citation {
   title?: string;
 }
 
-function clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
-}
-
 export async function POST(req: Request) {
   if (!assertSameOrigin(req)) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
@@ -74,15 +71,10 @@ export async function POST(req: Request) {
 
   // Sanitize the display name before it ever touches the prompt: it's rendered
   // into the system message and the block headers, so stray quotes, newlines, or
-  // "=====" fences could otherwise forge the data/instruction boundary. Keep
-  // letters, numbers, spaces, and light punctuation only.
-  const name =
-    (body.name ?? "")
-      .toString()
-      .replace(/[^\p{L}\p{N} .,'-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 40) || "anonymous";
+  // "=====" fences could otherwise forge the data/instruction boundary. The rule
+  // itself lives in lib/api-helpers cleanName, shared with the live viewer routes
+  // so the name in a prompt and the name in a rate-limit key can never diverge.
+  const name = cleanName(body.name);
   const slug = (body.slug ?? "").toString();
   if (!isValidDeckSlug(slug)) {
     return NextResponse.json({ error: "unknown_deck" }, { status: 404 });
