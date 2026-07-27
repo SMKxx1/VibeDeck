@@ -19,17 +19,16 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# local env files — secrets stay out of git
-.env
-.env*.local
+# env: ignore every real env file, but keep the placeholder template tracked
+.env*
+!.env.example
 
 # vercel
 .vercel
 
-# typescript
+# typescript — next-env.d.ts is deliberately COMMITTED (Next's own guidance);
+# without it a fresh clone fails `npm run typecheck`.
 *.tsbuildinfo
-next-env.d.ts
 
-# env: ignore all real env files, but keep the placeholder template tracked
-.env*
-!.env.example
+# claude code — per-machine tool permissions are local; launch.json is shared
+.claude/settings.local.json

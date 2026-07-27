@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+# Presenter-only tooling and the isolated deck-origin content routes: nothing
+# here is useful in a search index, and /d-content + /d-assets only ever answer
+# on DECK_HOST anyway.
+Disallow: /dashboard
+Disallow: /d-content/
+Disallow: /d-assets/

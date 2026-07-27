@@ -67,18 +67,3 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "access_unavailable" }, { status: 503, headers: NO_STORE });
   }
 }
-
-export async function DELETE(req: Request) {
-  if (!assertSameOrigin(req)) {
-    return NextResponse.json({ error: "forbidden" }, { status: 403, headers: NO_STORE });
-  }
-  const response = NextResponse.json({ ok: true }, { headers: NO_STORE });
-  response.cookies.set(AI_ACCESS_COOKIE, "", {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "strict",
-    path: "/",
-    maxAge: 0,
-  });
-  return response;
-}

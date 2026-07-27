@@ -8,6 +8,14 @@ const nextConfig = {
   // Pin file-tracing to this project. A stray lockfile in the home directory
   // otherwise makes Next infer the wrong workspace root.
   outputFileTracingRoot: import.meta.dirname,
+  // Two routes deliberately read files off disk at request time; tracing cannot
+  // see a runtime readFile, so name them here. Railway runs `next start` from
+  // the full checkout so both are present today — this keeps a tracing-based
+  // deploy (standalone output) safe too.
+  outputFileTracingIncludes: {
+    "/build": ["./VIBEDECK_PROMPT.md"],
+    "/d-content/[id]": ["./runtime/vibedeck-v1.js"],
+  },
   // Keep the global bundle lean. Heavy animation/WebGL libraries (GSAP, PixiJS,
   // Three.js, Vanta) must be lazy-loaded per slide as islands — never imported
   // globally — per slide-system-rules.md §7.

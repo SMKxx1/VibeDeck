@@ -13,11 +13,11 @@ const outfit = Outfit({
 
 export const metadata: Metadata = {
   title: {
-    default: "Class Presentations",
-    template: "%s · Class Presentations",
+    default: "VibeDeck",
+    template: "%s · VibeDeck",
   },
   description:
-    "A library of class presentations with a presenter view and an AI sidebar grounded in the slides.",
+    "Live workshop decks with a presenter view, real-time rooms, and an AI tutor grounded in the slides.",
 };
 
 export const viewport: Viewport = {

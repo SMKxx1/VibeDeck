@@ -1,4 +1,5 @@
-/* VibeDeck platform runtime v1 — <deck-stage> engine + live bridge, concatenated from deck-stage.js + bridge.js. Inline-injected into served uploaded decks. */
+/* VibeDeck platform runtime v1 — <deck-stage> engine + live bridge. Inline-injected into served uploaded decks.
+ * GENERATED from public/decks/build-host-website/{deck-stage,bridge}.js — do not hand-edit; rebuild with `npm run build:runtime`. */
 // @ds-adherence-ignore -- omelette starter scaffold (raw elements/hex/px by design)
 /* ═══ THIS PROJECT USES DESIGN COMPONENTS (.dc.html) ═══
  * Reference this stage from your <x-dc> template as an import — NEVER as a
