@@ -2,6 +2,7 @@
   "name": "vibedeck",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "VibeDeck — live workshop presentation platform: AI-authored decks served from an isolated origin, live rooms (polls, Q&A, pulse, recap), and a grounded AI tutor. Runs on Railway.",
   "scripts": {
     "dev": "next dev",
