@@ -6,7 +6,7 @@ import { AUTH_COOKIE, getSession } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { isDbReachable } from "@/lib/db";
 import { getDeckSlides } from "@/lib/slides-store";
-import { listRecapsForDeck } from "@/lib/study-guide-store";
+import { listStudyGuidesForDeck } from "@/lib/study-guide-store";
 import { SlideMetaEditor } from "@/components/SlideMetaEditor";
 import { DeckWorkbench } from "@/components/DeckWorkbench";
 
@@ -57,7 +57,7 @@ export default async function EditDeckPage({
   const slides = dbAvailable ? await getDeckSlides(slug) : [];
   // Previously published study-guide handouts for this deck's panel. A read that
   // fails open to [] — with no DB the panel just shows none (and disables Publish).
-  const studyGuides = dbAvailable ? await listRecapsForDeck(slug) : [];
+  const studyGuides = dbAvailable ? await listStudyGuidesForDeck(slug) : [];
 
   return (
     <SlideMetaEditor

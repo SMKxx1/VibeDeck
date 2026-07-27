@@ -258,7 +258,7 @@ async function mutate(
 }
 
 /** Cached read — what viewers poll. */
-export async function getSession(slug: string): Promise<SessionState> {
+export async function getLiveSession(slug: string): Promise<SessionState> {
   const now = Date.now();
   const c = cache.get(slug);
   if (c && now - c.at < CACHE_MS) return c.state;

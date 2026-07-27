@@ -17,7 +17,7 @@ import { randomBytes } from "crypto";
 import { isDbReachable, query } from "./db";
 import { ensureSchema } from "./schema";
 
-// Caps enforced on the way IN (createRecap) and re-applied on the way OUT so a
+// Caps enforced on the way IN (createStudyGuide) and re-applied on the way OUT so a
 // hand-edited row can never balloon a response. The markdown cap comfortably
 // fits a long handout while keeping a row far below any Postgres/page limit.
 export const MAX_GUIDE_TITLE = 160;
@@ -56,7 +56,7 @@ function cleanTitle(raw: unknown): string {
  * surfaces failure for the API to 503 — silently dropping a handout the
  * presenter just reviewed would lose their curation work.
  */
-export async function createRecap(input: {
+export async function createStudyGuide(input: {
   deckSlug: string;
   title: string;
   markdown: string;
@@ -77,7 +77,7 @@ export async function createRecap(input: {
     );
     return { ok: true, token };
   } catch (err) {
-    console.error("[study-guide] createRecap failed:", err);
+    console.error("[study-guide] createStudyGuide failed:", err);
     return { ok: false, error: "database_unavailable" };
   }
 }
@@ -87,7 +87,7 @@ export async function createRecap(input: {
  * a read, so it fails open and the public page renders a plain 404 either way;
  * an attacker can't distinguish "no such guide" from "DB down").
  */
-export async function getRecap(token: string): Promise<StudyGuide | null> {
+export async function getStudyGuide(token: string): Promise<StudyGuide | null> {
   // Cheap shape gate before touching the DB: real tokens are 32-char base64url.
   if (!token || token.length > 64 || !/^[A-Za-z0-9_-]+$/.test(token)) return null;
   await ensureSchema();
@@ -122,7 +122,7 @@ export async function getRecap(token: string): Promise<StudyGuide | null> {
  * A deck's published guides, newest first (bounded) — for the edit-page panel.
  * `[]` when the DB is unavailable, like every other store read.
  */
-export async function listRecapsForDeck(deckSlug: string, limit = 20): Promise<StudyGuideSummary[]> {
+export async function listStudyGuidesForDeck(deckSlug: string, limit = 20): Promise<StudyGuideSummary[]> {
   await ensureSchema();
   try {
     const res = await query<{ token: string; title: string | null; created_at: Date }>(

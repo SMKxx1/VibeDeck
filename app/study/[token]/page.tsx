@@ -1,6 +1,6 @@
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
-import { getRecap } from "@/lib/study-guide-store";
+import { getStudyGuide } from "@/lib/study-guide-store";
 import { renderMarkdownFragment } from "@/lib/markdown-deck";
 
 // Public study-guide handout page. The unguessable token IS the capability —
@@ -18,7 +18,7 @@ export async function generateMetadata({
   params: Promise<{ token: string }>;
 }): Promise<Metadata> {
   const { token } = await params;
-  const guide = await getRecap(token);
+  const guide = await getStudyGuide(token);
   // Don't leak existence in metadata beyond what the page itself shows.
   return { title: guide ? guide.title || "Study guide" : "Study guide", robots: { index: false } };
 }
@@ -29,7 +29,7 @@ export default async function StudyGuidePage({
   params: Promise<{ token: string }>;
 }) {
   const { token } = await params;
-  const guide = await getRecap(token);
+  const guide = await getStudyGuide(token);
   if (!guide) notFound();
 
   const html = renderMarkdownFragment(guide.markdown);

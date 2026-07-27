@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { authSecretConfigError } from "./config";
+import type { Role } from "./users";
 
 export const AUTH_COOKIE = "presenter_session";
 const MAX_AGE_SECONDS = 60 * 60 * 12; // a session lasts a workday
@@ -59,7 +60,13 @@ export function sign(payload: string): string {
 // access with no forced re-login. The signature is HMAC over the whole payload,
 // so a tampered role/userId or a version downgrade fails without AUTH_SECRET.
 
-export type Role = "admin" | "presenter";
+// Role is declared ONCE, in lib/users.ts (the store that owns the users.role
+// column), and re-exported here so auth-side importers keep working. The import
+// (at the top of this file) is TYPE-ONLY, so it is erased at compile time —
+// auth.ts gains no runtime dependency on users.ts (which pulls in pg/redis) and
+// no import cycle.
+export type { Role };
+
 export interface Session {
   // null only for a legacy (v<2) cookie mapped to the admin — it has no user row.
   userId: string | null;

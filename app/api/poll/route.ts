@@ -15,7 +15,7 @@ import {
 } from "@/lib/poll";
 import { generatePollExplanation } from "@/lib/poll-explain";
 import { getSlideBranches } from "@/lib/slides-store";
-import { driverIdFor, getSession } from "@/lib/session";
+import { driverIdFor, getLiveSession } from "@/lib/session";
 import { bumpPulse } from "@/lib/pulse";
 import { getDeck } from "@/lib/decks";
 import { isValidDeckSlug } from "@/lib/request-security";
@@ -146,7 +146,7 @@ export async function POST(req: Request) {
       const wrong = Math.max(0, (poll.total ?? 0) - (poll.tally[poll.correctIndex] ?? 0));
       if (wrong > 0) {
         void (async () => {
-          const s = await getSession(slug);
+          const s = await getLiveSession(slug);
           await bumpPulse(slug, s.index, "poll_wrong", wrong);
         })().catch(() => {});
       }

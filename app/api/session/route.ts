@@ -2,14 +2,14 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import {
   driverIdFor,
-  getSession,
+  getLiveSession,
   setPresenterIndex,
   resetLock,
   heartbeat,
   takeClicker,
   isLive,
 } from "@/lib/session";
-import { AUTH_COOKIE, verifySessionToken, getSession as getAuthSession } from "@/lib/auth";
+import { AUTH_COOKIE, verifySessionToken, getSession } from "@/lib/auth";
 import { NO_STORE } from "@/lib/api-helpers";
 import { assertSameOrigin } from "@/lib/csrf";
 import { isDeckViewable } from "@/lib/publish-store";
@@ -52,7 +52,7 @@ export async function GET(req: Request) {
   // paid four sequential RTTs per viewer tick. Promise.all lets ioredis pipeline
   // them over the single connection.
   const [state, activePoll, recap, activity] = await Promise.all([
-    getSession(slug),
+    getLiveSession(slug),
     // The current live poll on the SAME poll viewers already run (#3) — no new
     // viewer request. Viewer-safe projection below: no correct answer/tally pre-reveal.
     getActivePoll(slug),
@@ -69,7 +69,7 @@ export async function GET(req: Request) {
   // caller instead gets `isDriver` for THEIR identity (an unclaimed session counts
   // as driving, so a solo console never shows a handoff button).
   const { driverId, ...pub } = state;
-  const auth = isPresenter ? getAuthSession(token) : null;
+  const auth = isPresenter ? getSession(token) : null;
   const extra = auth ? { isDriver: !driverId || driverId === driverIdFor(auth) } : {};
   return NextResponse.json(
     { ...pub, live: isLive(state), poll, recap, activity, ...extra },
@@ -94,9 +94,9 @@ export async function POST(req: Request) {
   }
   const token = (await cookies()).get(AUTH_COOKIE)?.value;
   // Identity, not just validity: the clicker is held per presenter userId.
-  // getAuthSession runs the IDENTICAL signature/expiry/role checks as
+  // getSession runs the IDENTICAL signature/expiry/role checks as
   // verifySessionToken, so this is the same gate — plus who is asking.
-  const auth = getAuthSession(token);
+  const auth = getSession(token);
   if (!auth) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }

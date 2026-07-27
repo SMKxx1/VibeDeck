@@ -11,7 +11,7 @@ import { getFullContextText, getSlideNotes } from "@/lib/slides-store";
 import { getActivePoll } from "@/lib/poll";
 import { getQuestions } from "@/lib/qna";
 import {
-  createRecap,
+  createStudyGuide,
   MAX_GUIDE_MARKDOWN,
   MAX_GUIDE_TITLE,
 } from "@/lib/study-guide-store";
@@ -236,7 +236,7 @@ async function publish(req: Request, session: Session, slug: string, body: Body)
     return NextResponse.json({ error: "too_long" }, { status: 400 });
   }
 
-  const created = await createRecap({
+  const created = await createStudyGuide({
     deckSlug: slug,
     title: rawTitle,
     markdown,

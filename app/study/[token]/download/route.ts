@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getRecap, type StudyGuide } from "@/lib/study-guide-store";
+import { getStudyGuide, type StudyGuide } from "@/lib/study-guide-store";
 import { renderMarkdownFragment } from "@/lib/markdown-deck";
 
 // Offline handout download: the same token-gated guide as /study/<token>, but
@@ -92,7 +92,7 @@ export async function GET(
   { params }: { params: Promise<{ token: string }> },
 ) {
   const { token } = await params;
-  const guide = await getRecap(token);
+  const guide = await getStudyGuide(token);
   if (!guide) return new NextResponse(null, { status: 404 });
   return new NextResponse(standaloneHtml(guide), {
     status: 200,

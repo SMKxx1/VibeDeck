@@ -15,7 +15,7 @@ import { slideToText } from "./deckUtils";
 import { getSlideContextText } from "./slides-store";
 import { getUploadedDeckHtml } from "./uploaded-decks";
 import { extractSlideTexts } from "./deck-validator";
-import { getSession } from "./session";
+import { getLiveSession } from "./session";
 import {
   checkRateLimit,
   checkTokenBudget,
@@ -61,7 +61,7 @@ export async function generatePollExplanation(slug: string, poll: Poll): Promise
     // Ground on the slide the room is on at reveal time — the poll record doesn't
     // carry a slide, and the presenter reveals where the question was asked. Same
     // per-slide assembly as /api/poll/draft: authored context, else raw slide text.
-    const index = (await getSession(slug)).index;
+    const index = (await getLiveSession(slug)).index;
     let slideText = (await getSlideContextText(slug, index)) ?? "";
     if (!slideText.trim()) {
       if (deck.kind === "uploaded") {
