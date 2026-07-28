@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getStudyGuide, type StudyGuide } from "@/lib/study-guide-store";
 import { renderMarkdownFragment } from "@/lib/markdown-deck";
+import { studyBodyCss } from "../study-css";
 
 // Offline handout download: the same token-gated guide as /study/<token>, but
 // packaged as ONE self-contained .html file — inline CSS, zero external
@@ -31,17 +32,12 @@ function filenameFor(guide: StudyGuide): string {
   return `${base || "study-guide"}.html`;
 }
 
-function standaloneHtml(guide: StudyGuide): string {
-  const title = escapeHtml(guide.title || "Study guide");
-  const published = new Date(guide.createdAt).toISOString().slice(0, 10);
-  const body = renderMarkdownFragment(guide.markdown);
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${title}</title>
-<style>
+// The FILE-only half of the handout CSS — the standalone page chrome the
+// on-screen page renders with React inline styles instead (body, card, header
+// lines, footer), the slightly smaller headings an offline/printed page uses,
+// and the print rules. Everything shared with the page lives in ../study-css,
+// emitted under the same `main` scope.
+const FILE_CSS = `
   body { margin: 0; padding: 40px 20px 80px; background: #ECEAE3; color: #2C2A31;
          font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
          font-size: 15.5px; line-height: 1.65; }
@@ -55,24 +51,22 @@ function standaloneHtml(guide: StudyGuide): string {
   main h1 { font-size: 24px; font-weight: 600; line-height: 1.2; margin: 1.4em 0 0.5em; }
   main h2 { font-size: 20px; font-weight: 600; line-height: 1.25; margin: 1.5em 0 0.5em;
             padding-bottom: 6px; border-bottom: 1px solid rgba(60,55,45,0.12); }
-  main h3 { font-size: 17px; font-weight: 600; margin: 1.3em 0 0.4em; }
-  main h4, main h5, main h6 { font-size: 15.5px; font-weight: 600; margin: 1.2em 0 0.4em; }
-  main p { margin: 0 0 0.85em; }
-  main ul, main ol { margin: 0.2em 0 0.9em; padding-left: 1.4em; }
-  main li { margin: 0.3em 0; }
-  main strong { font-weight: 650; }
-  main a { color: #55701C; }
-  main code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.88em;
-              background: rgba(60,55,45,0.07); padding: 0.12em 0.4em; border-radius: 5px; }
-  main pre { background: #26241F; color: #EDEAE1; border-radius: 12px; padding: 16px 20px;
-             overflow-x: auto; font-size: 13.5px; line-height: 1.55; margin: 0.4em 0 1em; }
-  main pre code { background: none; color: inherit; padding: 0; }
-  main blockquote { margin: 0.4em 0 0.9em; padding: 2px 0 2px 16px;
-                    border-left: 3px solid rgba(140,170,40,0.85); color: #57534A; font-style: italic; }
   footer { max-width: 720px; margin: 18px auto 0; text-align: center;
            font-size: 12px; color: #9A958A; }
   @media print { body { background: #fff; padding: 0; } main { box-shadow: none; padding: 0; } }
-</style>
+`;
+
+function standaloneHtml(guide: StudyGuide): string {
+  const title = escapeHtml(guide.title || "Study guide");
+  const published = new Date(guide.createdAt).toISOString().slice(0, 10);
+  const body = renderMarkdownFragment(guide.markdown);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<style>${studyBodyCss("main")}${FILE_CSS}</style>
 </head>
 <body>
 <main>

@@ -2,13 +2,13 @@ import { NextResponse } from "next/server";
 import { createPreviewToken, currentSession, type Session } from "@/lib/auth";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { assertSameOrigin } from "@/lib/csrf";
+import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
 import {
   getDraftHtml,
-  getUploadedDeckHtml,
   saveDraftHtml,
   publishDraft,
   discardDraft,
-} from "@/lib/uploaded-decks";
+} from "@/lib/deck-drafts";
 import { validateDeckHtml } from "@/lib/deck-validator";
 
 // VDML Workbench: the owner-gated draft lifecycle for an UPLOADED deck's HTML.

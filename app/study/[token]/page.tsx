@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { getStudyGuide } from "@/lib/study-guide-store";
 import { renderMarkdownFragment } from "@/lib/markdown-deck";
+import { studyBodyCss } from "./study-css";
 
 // Public study-guide handout page. The unguessable token IS the capability —
 // anyone holding the link may read it; a missing/unknown token is a plain 404.
@@ -11,6 +12,19 @@ import { renderMarkdownFragment } from "@/lib/markdown-deck";
 // no cookies read — safe to share with anyone.
 
 export const dynamic = "force-dynamic";
+
+// The SCREEN-only half of the handout CSS — the rules the downloadable file
+// deliberately renders differently: bigger headings (they sit inside a wider
+// card here), underlined links, and the first/last-child margin reset the
+// card's own padding needs. Everything shared with the file lives in
+// ./study-css, emitted under the same .sg-body scope.
+const SCREEN_CSS = `
+.sg-body > :first-child { margin-top: 0; }
+.sg-body > :last-child { margin-bottom: 0; }
+.sg-body h1 { font-size: 26px; font-weight: 600; line-height: 1.2; letter-spacing: -0.01em; margin: 1.4em 0 0.5em; }
+.sg-body h2 { font-size: 21px; font-weight: 600; line-height: 1.25; margin: 1.5em 0 0.5em; padding-bottom: 6px; border-bottom: 1px solid rgba(60,55,45,0.12); }
+.sg-body a { text-decoration: underline; }
+`;
 
 export async function generateMetadata({
   params,
@@ -136,23 +150,7 @@ export default async function StudyGuidePage({
         </p>
       </div>
 
-      <style>{`
-        .sg-body > :first-child { margin-top: 0; }
-        .sg-body > :last-child { margin-bottom: 0; }
-        .sg-body h1 { font-size: 26px; font-weight: 600; line-height: 1.2; letter-spacing: -0.01em; margin: 1.4em 0 0.5em; }
-        .sg-body h2 { font-size: 21px; font-weight: 600; line-height: 1.25; margin: 1.5em 0 0.5em; padding-bottom: 6px; border-bottom: 1px solid rgba(60,55,45,0.12); }
-        .sg-body h3 { font-size: 17px; font-weight: 600; margin: 1.3em 0 0.4em; }
-        .sg-body h4, .sg-body h5, .sg-body h6 { font-size: 15.5px; font-weight: 600; margin: 1.2em 0 0.4em; }
-        .sg-body p { margin: 0 0 0.85em; }
-        .sg-body ul, .sg-body ol { margin: 0.2em 0 0.9em; padding-left: 1.4em; }
-        .sg-body li { margin: 0.3em 0; }
-        .sg-body strong { font-weight: 650; }
-        .sg-body a { color: #55701C; text-decoration: underline; }
-        .sg-body code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.88em; background: rgba(60,55,45,0.07); padding: 0.12em 0.4em; border-radius: 5px; }
-        .sg-body pre { background: #26241F; color: #EDEAE1; border-radius: 12px; padding: 16px 20px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; margin: 0.4em 0 1em; }
-        .sg-body pre code { background: none; color: inherit; padding: 0; }
-        .sg-body blockquote { margin: 0.4em 0 0.9em; padding: 2px 0 2px 16px; border-left: 3px solid rgba(140,170,40,0.85); color: #57534A; font-style: italic; }
-      `}</style>
+      <style>{studyBodyCss(".sg-body") + SCREEN_CSS}</style>
     </div>
   );
 }

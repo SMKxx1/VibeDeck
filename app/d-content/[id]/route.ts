@@ -1,4 +1,5 @@
-import { getUploadedDeckHtml, getDraftServeHtml } from "@/lib/uploaded-decks";
+import { getUploadedDeckHtml } from "@/lib/uploaded-decks";
+import { getDraftServeHtml } from "@/lib/deck-drafts";
 import { verifyPreviewToken } from "@/lib/auth";
 import { renderUploadedDeckHtml } from "@/lib/deck-runtime";
 
