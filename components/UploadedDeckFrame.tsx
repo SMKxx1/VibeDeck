@@ -93,6 +93,25 @@ import { ActivityCard } from "./live/ActivityCard";
 import { RecapCard } from "./live/RecapCard";
 import { CatchUpCard, centerCardStack } from "./live/CatchUpCard";
 
+// Presenter-side pieces shared VERBATIM with PresenterConsole (the dark embed-deck
+// console) — types, error maps and the pure helpers. The presenter PANELS below stay
+// forked on purpose: they are light-glass adaptations of the console's dark ones.
+import {
+  ACTIVITY_PRESETS,
+  floatStyle,
+  mapAskError,
+  mapDraftError,
+  mapRecapError,
+  qnaStateTag,
+  winningIndex,
+  type ActivityFollowUp,
+  type AiAnswerState,
+  type Poll,
+  type Signal,
+  type SlideBranch,
+  type Viewer,
+} from "./live/presenter/shared";
+
 // Presenter live-room tick (roster + reactions + poll + Q&A on ONE ~4s timer, with
 // hidden-tab backoff — mirrors PresenterConsole).
 const PRESENCE_POLL_MS = 4_000;
@@ -124,45 +143,6 @@ interface DeckState {
   index: number;
   total: number;
   label: string;
-}
-
-// A presenter-broadcast Turn & Talk activity: a discussion/exercise prompt + a
-// synchronized countdown, delivered on the same session read. Everyone counts
-// down CLIENT-SIDE from `endsAt` (no per-second server traffic); "Regroup"
-// clears it everywhere at once. Rendered ONLY in parent app-chrome — never
-// posted into the sandboxed deck frame.
-type ActivityFollowUp = "poll" | "pinboard";
-// A branch-point path (lib/types.ts SlideBranch) — 0-based inclusive range.
-interface SlideBranch {
-  label: string;
-  from: number;
-  to: number;
-}
-
-// Presenter-side records (full poll incl. correct answer/tally; roster; signals).
-interface Poll {
-  id: string;
-  kind?: "poll" | "branch"; // absent = regular poll
-  question: string;
-  options: string[];
-  correctIndex: number | null;
-  revealed: boolean;
-  tally: number[] | null;
-  total: number | null;
-  explanation?: string; // "why that answer" — attached after reveal
-  branches?: SlideBranch[]; // kind "branch": option i routes to branches[i]
-  takenIndex?: number; // kind "branch": the routed option (post-reveal)
-  at: number;
-}
-interface Viewer {
-  name: string;
-  index: number;
-  follow: boolean;
-}
-interface Signal {
-  name: string;
-  kind: SignalKind;
-  at: number;
 }
 
 // `role` defaults to "viewer" so the two untouched callers (the public home page
@@ -1736,21 +1716,6 @@ function checkBtn(muted: boolean): React.CSSProperties {
   };
 }
 
-function mapRecapError(code?: string): string {
-  switch (code) {
-    case "ai_budget_exceeded":
-      return "AI is at today's usage limit.";
-    case "rate_limited":
-      return "Slow down a moment.";
-    case "no_content":
-      return "This slide has no text to recap.";
-    case "ai_not_configured":
-      return "AI isn't configured.";
-    default:
-      return "Couldn't send — try again.";
-  }
-}
-
 // Map an /api/catchup error code to a friendly line for the card body.
 function mapCatchUpError(code?: string): string {
   switch (code) {
@@ -1769,19 +1734,6 @@ function mapCatchUpError(code?: string): string {
   }
 }
 
-function floatStyle(left: number): React.CSSProperties {
-  return {
-    position: "absolute",
-    bottom: 20,
-    left: `${left}%`,
-    fontSize: 30,
-    lineHeight: 1,
-    animation: "vibedeck-rise 2s ease-out forwards",
-    willChange: "transform, opacity",
-    userSelect: "none",
-  };
-}
-
 const reactionBadge: React.CSSProperties = {
   position: "absolute",
   top: 12,
@@ -1795,15 +1747,6 @@ const reactionBadge: React.CSSProperties = {
 };
 
 // ---- presenter poll panel (#3/#4) — light adaptation of PresenterConsole ------
-
-// The tally's winning option (first wins a tie) — the branch the room chose.
-function winningIndex(tally: number[], optionCount: number): number {
-  let win = 0;
-  for (let i = 1; i < optionCount; i++) {
-    if ((tally[i] ?? 0) > (tally[win] ?? 0)) win = i;
-  }
-  return win;
-}
 
 function PresenterPollPanel({
   poll,
@@ -2127,13 +2070,6 @@ function PresenterPollPanel({
 
 // ---- presenter Turn & Talk panel — light adaptation of PresenterConsole -------
 
-// Turn & Talk duration presets — synchronized countdowns, so no free-form input.
-const ACTIVITY_PRESETS: { label: string; sec: number }[] = [
-  { label: "2 min", sec: 120 },
-  { label: "5 min", sec: 300 },
-  { label: "10 min", sec: 600 },
-];
-
 // No active activity → the compose form (prompt + duration presets + optional
 // follow-up). Active → the prompt, a live MM:SS countdown (client-side from
 // endsAt) and the Regroup button, which ends the activity on every screen at
@@ -2312,13 +2248,6 @@ function activityChoice(on: boolean): React.CSSProperties {
 }
 
 // ---- presenter Q&A panel (#5) — light adaptation of PresenterConsole ----------
-
-interface AiAnswerState {
-  loading: boolean;
-  open: boolean;
-  answer?: string;
-  error?: string;
-}
 
 function PresenterQnaPanel({
   questions,
@@ -2699,10 +2628,6 @@ const qnaVotes: React.CSSProperties = {
   background: "rgba(60,55,45,0.06)",
 };
 
-function qnaStateTag(color: string): React.CSSProperties {
-  return { fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color, whiteSpace: "nowrap", flex: "0 0 auto" };
-}
-
 const qnaActionBtn: React.CSSProperties = {
   height: 28,
   padding: "0 10px",
@@ -2739,31 +2664,3 @@ const qnaAiBlock: React.CSSProperties = {
   background: "rgba(60,55,45,0.05)",
   border: "1px solid rgba(60,55,45,0.1)",
 };
-
-function mapDraftError(code?: string): string {
-  switch (code) {
-    case "ai_budget_exceeded":
-      return "AI is at today's usage limit.";
-    case "rate_limited":
-      return "Slow down a moment.";
-    case "no_content":
-      return "This slide has no text to quiz on.";
-    case "ai_not_configured":
-      return "AI isn't configured.";
-    default:
-      return "Couldn't draft — try again.";
-  }
-}
-
-function mapAskError(code?: string): string {
-  switch (code) {
-    case "ai_budget_exceeded":
-      return "AI is at today's usage limit.";
-    case "rate_limited":
-      return "Slow down a moment.";
-    case "unknown_deck":
-      return "This deck isn't available.";
-    default:
-      return "Couldn't draft an answer — try again.";
-  }
-}

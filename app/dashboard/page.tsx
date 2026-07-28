@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { listDecks } from "@/lib/decks";
-import { DeckLibrary } from "@/components/DeckLibrary";
+import { DeckLibrary } from "@/components/library/DeckLibrary";
 import { AUTH_COOKIE, getSession, canManageDeck } from "@/lib/auth";
 import { getPublishStatusMap } from "@/lib/publish-store";
 import { getAllDeckOwners } from "@/lib/uploaded-decks";
