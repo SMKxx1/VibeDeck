@@ -1,175 +1,180 @@
-# Class Presentation App
+# VibeDeck
 
-A web-native replacement for PowerPoint: a **library of slide decks** you present
-from in class (projector + a separate presenter view on your laptop), with an **AI
-sidebar** students can ask questions — grounded in the slides themselves.
+**A live workshop presentation platform** — AI-authored decks, real-time rooms, and a grounded AI tutor, self-hosted on Railway.
 
-Built as a **custom slide system** (Next.js App Router + React, plain CSS design
-tokens) to the rules in [`Guideline/slide-system-rules.md`](./Guideline/slide-system-rules.md)
-and the plan in [`Guideline/presentation-webapp-plan.md`](./Guideline/presentation-webapp-plan.md).
-No Slidev, no second framework, no heavy animation libraries in the bundle.
+You present a deck; the room follows along on their phones. Polls, quizzes, Q&A, reactions, and an AI tutor grounded in the slides all run live. Uploaded decks are untrusted HTML, so they're validated on upload and served from an **isolated origin** (`decks.wss-lodge.com`) in sandboxed iframes — the app origin never executes deck code.
 
----
+![System overview](docs/diagrams/system-overview.svg)
 
-## What it does
+## Feature tour
 
-| | |
+### For viewers (no account, nothing to install)
+
+| Feature | What it does |
 |---|---|
-| **Library home** (`/`) | Lists every deck (title · date · slide count), newest first, searchable. |
-| **Main view** (`/d/<slug>`) | The projector view. Scale-to-fit 16:9 canvas, arrow-key nav, `F` fullscreen, AI sidebar, touch nav. |
-| **Presenter view** (`/d/<slug>/presenter`) | Your laptop view: current slide, next slide, speaker notes, and a start/pause/reset timer. |
-| **Cross-tab sync** | Main ↔ presenter stay in lock-step via `BroadcastChannel` — same browser, **no server**. |
-| **AI sidebar** | Calls a serverless function → OpenRouter, grounded in the deck. Stores only token counts, never prompts. |
+| Live following | The deck on your phone tracks the presenter's slide; toggle off to browse freely |
+| AI tutor | Ask about the current slide — streamed answers grounded in the deck (`/api/ask`, SSE) |
+| Suggested questions | 2–3 AI-suggested starter questions per slide |
+| Explain differently | One-tap reframes (ELI5, analogy, example, deeper) cached room-wide |
+| Catch me up | Late joiners get an AI recap of the slides they missed |
+| Polls & quizzes | Vote, see revealed tallies, read the AI "why that answer" explainer |
+| Branch points | Vote on where the deck goes next (choose-your-own-path decks) |
+| Q&A queue | Ask and upvote questions; see what's been answered |
+| Reactions | 👍 🎉 🐢 🙋 and an "I'm lost" signal straight to the presenter |
+| Turn & Talk | On-screen countdown for discussion breaks |
+| Pinboard | Share your work-in-progress link to the class gallery |
+| Study guide | A share-token handout page (`/study/<token>`) with download |
+| Portfolio Builder | The workshop's hands-on slide: an AI interview that generates a complete single-file portfolio site |
 
-Deep links work: `/d/<slug>#/<n>` opens slide `n`; refresh keeps your place.
+### For the presenter
 
----
+| Feature | What it does |
+|---|---|
+| Presenter console | Drive slides with a driver lock, timer, and presence roster |
+| Insight Pulse | Per-slide confusion heat strip (questions, reframes, "I'm lost", wrong votes) + AI teaching debrief |
+| Poll drafting | One click turns the current slide into a reviewed multiple-choice check |
+| Q&A digest | AI clusters open questions into the top confusions |
+| Room recap | Broadcast an AI recap overlay when the room gets lost |
+| Deck upload / import | Upload validated deck HTML or import Markdown; decks live in Postgres |
+| VDML Workbench | In-browser CodeMirror editor with draft/preview/publish lifecycle |
+| Asset Vault | Images re-encoded to WebP (`sharp`) and stored in Postgres, served by content hash |
+| AI grounding editor | Per-slide tutor context + speaker notes, with one-click AI drafting (review-before-save) |
+| Study-guide generator | AI-drafted, presenter-curated, published to a share token |
+| Session reset | One button wipes all live room state for a deck |
+| `/build` | The canonical deck-authoring prompt (paste into any AI chat) |
 
-## Quick start
+### For the admin
+
+| Feature | What it does |
+|---|---|
+| Password sign-in | scrypt-hashed accounts; the first admin is seeded from env |
+| Google sign-in | OIDC; new emails become approval requests |
+| Telegram approval | The admin gets an [Allow]/[Reject] ping for new account requests (works without Telegram too) |
+| Invites | Mint single-use invite links with a fixed role |
+| Publish control | `main` (the deck at `/`), `normal`, or `unpublished` per deck |
+| AI budget | A daily token ceiling across every AI feature, with per-name and per-IP rate limits |
+
+## Architecture
+
+One Next.js 15 (App Router) service on Railway. Postgres and Redis attached; OpenRouter for all AI calls. No websockets — everything is short-poll REST except a single SSE stream for tutor answers.
+
+- **Postgres** — decks + per-slide metadata, users/invites/identities/account requests, study guides, session reports, deck drafts, and the Asset Vault (WebP bytes as BYTEA). Forward-only migrations run **in-process** on first store access; there is no separate migrate step.
+- **Redis (ioredis)** — the live layer: room index + driver lock, presence, polls + votes (Lua tallies), Q&A, reactions, confusion pulse, recap/activity slots, rate limits, and the AI budget + room caches. Every store degrades to an in-memory fallback when `REDIS_URL` is unset (single instance only).
+- **OpenRouter** — one client ([lib/openrouter.ts](lib/openrouter.ts)) carries the headers, 45s abort bound, reasoning retry, and token accounting for all eleven AI features; routes keep their own gate ordering.
+- **Two origins, one deployment** — [middleware.ts](middleware.ts) routes by Host header: the deck host answers *only* `/d-content/*` and `/d-assets/*` (everything else 404s by construction), and the app host refuses those paths. Uploaded decks render in sandboxed iframes with a strict CSP whose `frame-ancestors` points back at the app origin.
+
+![Live room flow](docs/diagrams/live-room-flow.svg)
+
+![Deck lifecycle](docs/diagrams/deck-lifecycle.svg)
+
+## Quick start (local dev)
+
+Prereqs: Node (see [.nvmrc](.nvmrc)), npm.
 
 ```bash
 npm install
-npm run dev        # http://localhost:3000
+npm run dev
 ```
 
-Build & run the production server:
+The app is designed to boot with **nothing configured** and light up feature-by-feature:
+
+| Unset | What still works | What you lose |
+|---|---|---|
+| `DATABASE_URL` | The built-in deck, live rooms, AI with static grounding | Uploads, Workbench, accounts beyond the seed, editing |
+| `REDIS_URL` | Everything, via in-memory fallback | Multi-instance rooms; state survives restarts |
+| `OPENROUTER_API_KEY` | All non-AI features | Every AI feature (endpoints report `ai_not_configured`) |
+| `DECK_HOST` / `DECK_ORIGIN` | The built-in embed deck | Uploaded decks list but are flagged unavailable (fail closed) |
+| `AUTH_SECRET` | Local dev (dev-only default) | **Required in prod — the app fails closed with 503s** |
+
+`cp .env.example .env.local` and fill in what you need — [.env.example](.env.example) documents every variable. Pre-push gate:
 
 ```bash
-npm run build
-npm start
+npm run check
 ```
 
-The slides work with **zero configuration**. The AI sidebar is optional — without
-an OpenRouter key it simply reports that AI isn't configured; everything else works.
-
----
+Two files are read from disk at request time — [VIBEDECK_PROMPT.md](VIBEDECK_PROMPT.md) (served at `/build`) and `runtime/vibedeck-v1.js` (injected into uploaded decks). The runtime file is **generated**: edit `public/decks/build-host-website/{deck-stage,bridge}.js` and run `npm run build:runtime` (the build does this automatically, and a test fails if the committed file drifts).
 
 ## Environment variables
 
-Copy [`.env.example`](./.env.example) to `.env.local` and fill in what you need.
-All of these are **server-side only** — none are exposed to the browser.
+Grouped exactly like [.env.example](.env.example) — see it for full per-variable notes. ★ = required in production. Only the two `NEXT_PUBLIC_*` values reach the browser.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `OPENROUTER_API_KEY` | for AI | OpenRouter key. **Use a key with a hard spend cap.** |
-| `OPENROUTER_MODEL` | no | Model id (default `openai/gpt-4o-mini`). |
-| `OPENROUTER_SITE_URL` / `OPENROUTER_SITE_NAME` | no | Sent to OpenRouter for analytics. |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | no | Token-count store + rate limiting. If unset, tracking is skipped. |
-| `AI_RATE_LIMIT_MAX` / `AI_RATE_LIMIT_WINDOW_SECONDS` | no | Per-name rate limit (default 20 / 60s). |
-| `AI_CLASS_PASSWORD` | no | Shared password gate for the AI endpoint (the "public link = open wallet" guard). |
-
-> **Privacy:** the serverless function persists **only** `{ name, timestamp, token_count }`.
-> It never logs or stores the prompt or the answer — not in the KV store, not in
-> console/error logs. To keep prompts private *upstream too*, set OpenRouter's data
-> policy to no-logging / non-retaining providers.
-
----
-
-## Deploy to Vercel
-
-1. Push this repo to GitHub.
-2. Import it in Vercel (it auto-detects Next.js — no config needed).
-3. Add the env vars above in **Project → Settings → Environment Variables**.
-4. Deploy. Each deck lives permanently at `/d/<slug>`.
-
-"Saving" a deck = commit + deploy. A deck you deployed last term still works at its
-URL next term.
-
-### Dual-screen workflow (the standard case)
-
-One laptop drives two displays. Open the **main view**, drag it to the projector
-(extended display), and press `F` to fullscreen it. Open the **presenter view** in a
-second tab on your laptop screen. They sync through the same browser — clicking
-forward in either advances both. No sync server required.
-
----
-
-## Add a deck (one step)
-
-1. Create `lib/decks/<your-deck>.ts` that exports a `Deck` (copy an existing one):
-
-   ```ts
-   import type { Deck } from "../types";
-
-   export const myDeck: Deck = {
-     slug: "my-deck",            // permanent, URL-safe
-     title: "My Lecture",
-     date: "2026-09-01",
-     description: "One-line summary for the library card.",
-     slides: [
-       { id: "cover", layout: "title", title: "My Lecture",
-         subtitle: "Week 1", notes: "Say hello." },
-       { id: "points", layout: "bullets", title: "Today",
-         bullets: ["First", "Second"], reveal: true,
-         notes: "Reveal one at a time." },
-     ],
-   };
-   ```
-
-2. Register it in [`lib/decks/index.ts`](./lib/decks/index.ts):
-
-   ```ts
-   import { myDeck } from "./my-deck";
-   export const decks: Deck[] = [awsLodgeDemo, slideSystemTour, myDeck];
-   ```
-
-3. Commit + deploy. It appears on the home page and lives at `/d/my-deck`.
-
-### Slide layouts
-
-One canonical shape, picked by `layout`: `title` · `section` · `statement` ·
-`bullets` · `two-col` · `quote` · `image`. Keep it to **one idea per slide**
-(≤6 bullets, ≤~40 words). Set `reveal: true` to reveal bullets/columns one click at
-a time. Put speaker notes in `notes` — they show only in the presenter view.
-All `image` slides require `alt` text.
-
-> **Animation:** the deck ships with one fast slide transition and CSS click-reveals
-> only. Heavier effects (GSAP, tsParticles, PixiJS, Vanta, Three.js) are allowed per
-> the rules but must be **lazy-loaded per slide as background layers / islands** —
-> never imported into the global bundle and never used to render slide text.
-
----
-
-## Keyboard
-
-| Key | Action |
+| Group | Variables |
 |---|---|
-| `→` `↓` `Space` `PageDown` | Next (reveals the next bullet first, then advances) |
-| `←` `↑` `PageUp` | Previous |
-| `Home` / `End` | First / last slide |
-| `F` | Toggle fullscreen (main view) |
-| `S` | Toggle the AI sidebar · `Esc` closes it |
+| Origins & hosts | `DECK_HOST`, `DECK_ORIGIN`, `APP_ORIGIN` |
+| Auth & accounts | `AUTH_SECRET`★, `PRESENTER_USERNAME`, `PRESENTER_PASSWORD`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` |
+| Telegram approval | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`, `TELEGRAM_ADMIN_USER_ID`, `TELEGRAM_WEBHOOK_SECRET` |
+| Postgres | `DATABASE_URL`, `DATABASE_PUBLIC_URL` (reference only), `DATABASE_CA_CERT`, `DATABASE_POOL_MAX` |
+| Redis & live session | `REDIS_URL`, `NEXT_PUBLIC_SESSION_POLL_MS`, `NEXT_PUBLIC_LIVE_DECK_SLUG` |
+| AI / OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_PORTFOLIO_MODEL`, `OPENROUTER_WEB_SEARCH`, `OPENROUTER_WEB_MAX_RESULTS`, `OPENROUTER_SITE_URL`, `OPENROUTER_SITE_NAME`, `AI_CLASS_PASSWORD`, `AI_RATE_LIMIT_MAX`, `AI_RATE_LIMIT_WINDOW_SECONDS`, `AI_DAILY_TOKEN_BUDGET`, `AI_TOKEN_RESERVATION` |
 
-Typing in the sidebar (or any text field) never moves the slides.
+## Deploying on Railway
 
----
+One service running `next start` from the full checkout, with Railway Postgres and Redis attached:
+
+1. **Databases**: attach Postgres (use the private `postgres.railway.internal` URL in `DATABASE_URL`) and Redis (the public TCP proxy URL in `REDIS_URL`). Migrations run themselves.
+2. **The deck origin**: add a second custom domain to the *same* service (e.g. `decks.wss-lodge.com` via a CNAME), then set `DECK_HOST` (bare hostname), `DECK_ORIGIN` (absolute URL), and `APP_ORIGIN` (the app origin(s) allowed to frame deck content, space-separated). Unset = uploaded decks fail closed.
+3. **Google sign-in** (optional): register `https://<app-host>/api/auth/google/callback` as a redirect URI.
+4. **Telegram approval** (optional): create a bot, set the four `TELEGRAM_*` vars, and register the webhook with `secret_token=TELEGRAM_WEBHOOK_SECRET`.
+
+> **Why not Vercel?** Two request-time disk reads (`VIBEDECK_PROMPT.md`, `runtime/vibedeck-v1.js`) and the single-instance in-memory fallbacks assume one long-lived Node process. `outputFileTracingIncludes` covers the disk reads for tracing-based deploys, but Railway's full-checkout model is what the app is built for.
 
 ## Project structure
 
 ```
-app/
-  layout.tsx              root layout + theme
-  globals.css             THE design tokens + slide layouts (one place)
-  page.tsx                library home
-  d/[slug]/page.tsx       main view
-  d/[slug]/presenter/     presenter view
-  api/ask/route.ts        AI serverless function (holds the key)
-components/                SlideView, SlideStage, DeckViewer, PresenterView, Sidebar, …
-lib/
-  types.ts                Deck / Slide model
-  decks/                  the deck registry (source of truth) + deck files
-  useSlideNav.ts          navigation: state ⇄ URL hash ⇄ BroadcastChannel
-  useScaleToFit.ts        the 1280×720 scale-to-fit canvas
-  kv.ts                   token tracking + rate limiting (server-only)
-public/
-  diagram-architecture.svg
+app/                  Routes: / (live deck), /d/[slug] (+/presenter), /dashboard/*,
+                      /login /signup, /build, /study/[token], /d-content + /d-assets
+                      (deck origin), api/* (~40 route handlers)
+components/
+  live/               Shared live-room UI used by both deck hosts (poll card, Q&A,
+                      reactions, recap/activity/catch-up cards) + presenter panels
+  library/            Dashboard: deck grid, upload + Markdown import, boot check
+  LiveDeck.tsx        Viewer/presenter host for the built-in embed deck
+  UploadedDeckFrame   Sandboxed host for uploaded decks (viewer + presenter overlay)
+  PresenterConsole    The embed deck's presenter console shell
+lib/                  Domain modules: db/schema/migrations, redis + live stores
+                      (poll, qna, presence, signals, pulse, recap, activity),
+                      openrouter, auth/users/identities, uploaded-decks +
+                      deck-drafts/deck-validator/deck-runtime/deck-create,
+                      deck-assets + image-normalize, kv (budget + limits +
+                      caches), markdown-deck
+runtime/              vibedeck-v1.js — GENERATED (npm run build:runtime)
+public/decks/         The built-in workshop deck + its deck-stage/bridge sources
+docs/diagrams/        Architecture diagrams (exported from Figma — see its README)
+Guideline/            Canonical rule docs (see Docs index)
+middleware.ts         Host allowlist (two origins) + body-size ceiling
+scripts/              build-runtime.mjs
+tests/                node:test suites run by `npm test`
 ```
 
----
+## Security model
 
-## Not in scope (yet)
+- **Untrusted deck HTML**: validated on upload (one `<deck-stage>`, no `<script src>`, size caps, context-manifest schema), stored inert, served only on the isolated origin with a strict CSP (`default-src 'none'`, sandboxed frames, `frame-ancestors` = app origin), runtime injected server-side at serve time.
+- **Default-deny host routing**: the deck host serves exactly two path prefixes; unknown paths 404 on both origins by construction.
+- **Sessions & CSRF**: HMAC-signed cookies (`AUTH_SECRET` fails closed in prod), Origin-vs-Host checks on every write, uniform 404s that never confirm hidden deck slugs.
+- **Abuse limits**: middleware body-size ceiling, per-IP + per-name rate limits, and a global daily AI token budget with reserve-then-reconcile accounting.
+- **Privacy**: AI endpoints persist only `{ name, timestamp, token_count }` — never prompts, answers, or transcripts (slide-system-rules.md §9).
 
-- **RAG over course materials** — slides-only grounding until usage proves it out.
-- **PPTX importer** — a content-extractor script, built last if ever.
-- **Separate-computer projector sync** — only needed if a *different* machine runs
-  the projector; the same-laptop setup needs no server.
+![Auth flows](docs/diagrams/auth-flows.svg)
+
+## Docs index
+
+- [VIBEDECK_PROMPT.md](VIBEDECK_PROMPT.md) — the deck-authoring prompt (also served at `/build`; the page reads this file at runtime)
+- [Guideline/slide-system-rules.md](Guideline/slide-system-rules.md) — canonical slide-system rules (code comments cite its § numbers)
+- [Guideline/portfolio-builder-rules.md](Guideline/portfolio-builder-rules.md) — the Portfolio Builder endpoint contract
+- [Guideline/archive/](Guideline/archive/) — historical planning docs (superseded)
+- [docs/diagrams/README.md](docs/diagrams/README.md) — diagram sources + the Figma board link
+
+## Scripts
+
+| Script | What it does |
+|---|---|
+| `npm run dev` | Dev server |
+| `npm run build` | Regenerates the deck runtime, then `next build` |
+| `npm start` | Production server |
+| `npm run lint` / `typecheck` / `test` | Individual gates |
+| `npm run check` | All gates + build — the pre-push gate |
+| `npm run build:runtime` | Rebuild `runtime/vibedeck-v1.js` from its sources |
+
+## License
+
+[MIT](LICENSE) © 2026 Shahad Mustafa Khan
