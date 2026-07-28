@@ -2,7 +2,13 @@
 
 Paste this into your AI coding tool (Cursor `.cursorrules`, `AGENTS.md`, or a system prompt). These are the **non-negotiable rules** any agent must follow when building or extending this presentation app and its decks.
 
-**Reference stack:** React + Next.js (App Router) on Vercel. One framework only — never mix React and Vue. You may swap the framework, but every rule below still applies.
+**Reference stack:** React + Next.js (App Router) on Railway. One framework only — never mix React and Vue. You may swap the framework, but every rule below still applies.
+> **Platform note (July 2026):** the app now runs on **Railway** with Postgres +
+> Redis (ioredis), has presenter accounts, and serves runtime-uploaded decks
+> from an isolated origin. §§ below that reference Vercel, "no accounts", or
+> deploy-to-save predate that move — the *slide-system* rules themselves (and
+> their § numbers, which code comments cite) are unchanged and still govern.
+
 
 **Reference implementation:** [Slidev](https://github.com/slidevjs/slidev) is **MIT-licensed**. Read its source for the hard parts — navigation, scale-to-fit, presenter mode, cross-tab sync. Use it as a reference, **not** a dependency. See the Appendix for what to study and the licensing rule.
 
@@ -36,7 +42,7 @@ If a request conflicts with these, follow the rule and flag the conflict.
 - Clicking a card opens that deck.
 - Each deck has its **own permanent URL** (`/d/<slug>`) — bookmark it and return any term. Its presenter view is `/d/<slug>/presenter`; a deep link to a slide is `/d/<slug>#/<n>`.
 
-**Persistence:** decks are defined in the project and **saved by deploying** (git push → Vercel) — consistent with authoring outside the app. There is no in-app *Save* button; *save* = commit + deploy. A deck you deployed last term still works at its URL next term.
+**Persistence:** the built-in embed deck ships in the repo and is saved by deploying (git push → Railway). Uploaded decks live in Postgres and are saved/drafted/published in-app (the VDML Workbench). Either way, a deck you published last term still works at its URL next term.
 
 ---
 
@@ -135,9 +141,9 @@ If a request conflicts with these, follow the rule and flag the conflict.
 
 ## 10. Tech & deployment
 
-- One framework (reference: React + Next.js App Router). Deploy on **Vercel**.
-- AI endpoint = a Vercel serverless function in the same project.
-- Token counts = **Vercel KV / Upstash Redis** (increment per name).
+- One framework (reference: React + Next.js App Router). Deploy on **Railway**.
+- AI endpoints = Node route handlers in the same project (one OpenRouter client, lib/openrouter.ts).
+- Token counts = **Redis via ioredis** (increment per name; in-memory fallback when unset).
 - All secrets stay server-side.
 
 ---

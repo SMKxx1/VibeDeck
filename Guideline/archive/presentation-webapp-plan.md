@@ -1,3 +1,8 @@
+> **Historical planning document (June 2026) — superseded.** The platform
+> shipped far past this plan: accounts + invites + Google sign-in, uploaded
+> decks on an isolated origin, Redis live rooms, and a dozen AI features, all
+> running on Railway (not Vercel). Kept for context; nothing here is normative.
+
 # Class Presentation Web App — Build Plan
 
 A web-based replacement for PowerPoint, hosted on Vercel, for **your own teaching**: you present from it in class (projector + a separate presenter view on your laptop), students open a link, set a name, and page through the slides with an AI sidebar that answers their questions — grounded first in the slides, later in your course materials. The app is a **library of presentations** you build up over time — not a single deck — so you add new ones and return to past ones.
