@@ -4,7 +4,38 @@
 
 You present a deck; the room follows along on their phones. Polls, quizzes, Q&A, reactions, and an AI tutor grounded in the slides all run live. Uploaded decks are untrusted HTML, so they're validated on upload and served from an **isolated origin** (`decks.wss-lodge.com`) in sandboxed iframes — the app origin never executes deck code.
 
-![System overview](docs/diagrams/system-overview.svg)
+```mermaid
+flowchart LR
+    subgraph clients["Browsers"]
+        viewer["Viewer and presenter browser"]
+        iframe["Sandboxed uploaded-deck iframe"]
+    end
+    subgraph railway["Next.js 15 app on Railway — one service"]
+        mw["middleware: Host allowlist"]
+        appR["App origin: pages + 40 API routes"]
+        deckR["Deck origin: d-content + d-assets only"]
+    end
+    subgraph data["Data"]
+        pg[("PostgreSQL")]
+        redis[("Redis")]
+    end
+    subgraph ext["External"]
+        or["OpenRouter"]
+        goog["Google OIDC"]
+        tg["Telegram Bot API"]
+    end
+
+    viewer -->|"wss-lodge.com"| mw
+    iframe -->|"decks.wss-lodge.com"| mw
+    mw --> appR
+    mw -->|"deck content only"| deckR
+    appR -->|"decks, users, guides"| pg
+    appR -->|"live rooms, limits, budget"| redis
+    deckR -->|"deck HTML, assets"| pg
+    appR -.->|"AI calls"| or
+    appR -.->|"sign-in"| goog
+    appR -.->|"approvals"| tg
+```
 
 ## Feature tour
 
@@ -63,9 +94,61 @@ One Next.js 15 (App Router) service on Railway. Postgres and Redis attached; Ope
 - **OpenRouter** — one client ([lib/openrouter.ts](lib/openrouter.ts)) carries the headers, 45s abort bound, reasoning retry, and token accounting for all eleven AI features; routes keep their own gate ordering.
 - **Two origins, one deployment** — [middleware.ts](middleware.ts) routes by Host header: the deck host answers *only* `/d-content/*` and `/d-assets/*` (everything else 404s by construction), and the app host refuses those paths. Uploaded decks render in sandboxed iframes with a strict CSP whose `frame-ancestors` points back at the app origin.
 
-![Live room flow](docs/diagrams/live-room-flow.svg)
+```mermaid
+sequenceDiagram
+    participant Presenter
+    participant Viewer
+    participant App as Next.js app
+    participant Redis
+    participant OpenRouter
 
-![Deck lifecycle](docs/diagrams/deck-lifecycle.svg)
+    Presenter->>App: POST /api/session (slide tick)
+    App->>Redis: write room index + driver lock
+    Viewer->>App: GET /api/session (poll ~2s while live)
+    App-->>Viewer: index, poll, recap, activity
+    Viewer->>App: POST vote / question / reaction / presence
+    App->>Redis: write live room state
+    Presenter->>App: GET presence, Q&A, pulse
+    App-->>Presenter: roster, tallies, heat strip
+    Viewer->>App: POST /api/ask (stream)
+    App->>OpenRouter: grounded prompt (after gates)
+    OpenRouter-->>App: token stream + usage
+    App-->>Viewer: SSE deltas, then done frame
+```
+
+```mermaid
+flowchart LR
+    author["AI-authored deck HTML (the /build prompt)"]
+    workbench["VDML Workbench drafts"]
+    upload["Upload or Markdown import"]
+    validator{"Valid deck?"}
+    reject["422 with issues"]
+    vault[("Asset Vault — WebP in Postgres")]
+    pg[("decks table")]
+    publish["Publish"]
+
+    subgraph deckorigin["decks.wss-lodge.com — isolated origin"]
+        serve["Serve /d-content: runtime injected, strict CSP"]
+        iframe["Sandboxed viewer iframe"]
+    end
+
+    bridge["postMessage live bridge to app origin"]
+
+    author --> upload
+    workbench -.->|"draft / publish"| validator
+    upload --> validator
+    validator -->|"No"| reject
+    validator -->|"Yes"| pg
+    workbench -.->|"insert image"| vault
+    pg --> publish
+    publish --> serve
+    vault -.->|"/d-assets by content hash"| serve
+    serve --> iframe
+    iframe --> bridge
+
+    style reject fill:#FFCDC2,stroke:#FF7556
+    style publish fill:#CDF4D3,stroke:#66D575
+```
 
 ## Quick start (local dev)
 
@@ -154,7 +237,44 @@ tests/                node:test suites run by `npm test`
 - **Abuse limits**: middleware body-size ceiling, per-IP + per-name rate limits, and a global daily AI token budget with reserve-then-reconcile accounting.
 - **Privacy**: AI endpoints persist only `{ name, timestamp, token_count }` — never prompts, answers, or transcripts (slide-system-rules.md §9).
 
-![Auth flows](docs/diagrams/auth-flows.svg)
+```mermaid
+flowchart LR
+    subgraph pw["Password sign-in"]
+        loginForm["Login form"]
+        loginApi["POST /api/login"]
+        users[("users table — scrypt hashes")]
+    end
+
+    subgraph goog["Google sign-in"]
+        gStart["GET /api/auth/google/start"]
+        consent["Google OIDC consent"]
+        callback["Callback verifies id_token"]
+        known{"Known identity or email?"}
+        request["Account request"]
+        tg["Telegram ping to admin"]
+        adminUi["Invites Manager approval"]
+        decide{"Admin decision"}
+        provision["Provision presenter account"]
+        denied["Request rejected"]
+    end
+
+    cookie(["HMAC session cookie"])
+
+    loginForm --> loginApi
+    loginApi -->|"verify"| users
+    loginApi --> cookie
+    gStart --> consent --> callback --> known
+    known -->|"Yes"| cookie
+    known -->|"No"| request
+    request --> tg --> decide
+    request -.->|"without Telegram"| adminUi -.-> decide
+    decide -->|"Allow"| provision
+    decide -->|"Reject"| denied
+    provision -->|"next sign-in succeeds"| cookie
+
+    style denied fill:#FFCDC2,stroke:#FF7556
+    style provision fill:#CDF4D3,stroke:#66D575
+```
 
 ## Docs index
 

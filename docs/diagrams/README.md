@@ -1,6 +1,8 @@
 # Architecture diagrams
 
-Authored in FigJam — the Figma board is the single source of truth:
+The main README embeds **Mermaid** versions of these diagrams (rendered natively
+by GitHub). The SVGs here are the high-fidelity Figma exports of the same four
+views, authored in FigJam — the Figma board is their source of truth:
 https://www.figma.com/board/zJNwrFsZEoK1gQK9TyOvtz
 
 Rule: **edit in Figma, re-export, commit — never edit the exports.** Each frame
