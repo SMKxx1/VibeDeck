@@ -10,9 +10,10 @@ import { UploadedDeckFrame } from "@/components/UploadedDeckFrame";
 // app/d/[slug]/page.tsx). This is a real change from the old static behavior.
 export const dynamic = "force-dynamic";
 
-// The env fallback deck — today's exact behavior — used when no deck is marked
-// main yet OR the DB is unreachable (getMainDeckSlug returns null for both).
-const FALLBACK_SLUG = process.env.NEXT_PUBLIC_LIVE_DECK_SLUG || "build-host-website";
+// The env fallback deck, used when no deck is marked main yet OR the DB is
+// unreachable (getMainDeckSlug returns null for both). Empty = no fallback:
+// the neutral "nothing is live" state below renders.
+const FALLBACK_SLUG = process.env.NEXT_PUBLIC_LIVE_DECK_SLUG || "";
 
 export default async function HomePage() {
   const mainSlug = (await getMainDeckSlug()) ?? FALLBACK_SLUG;
