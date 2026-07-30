@@ -16,10 +16,10 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { checkPublicRateLimit, isValidDeckSlug, safeHttpsUrl } from "@/lib/request-security";
 import { EXPLAIN_PROMPTS, type ExplainMode } from "@/lib/explain-prompts";
 import {
-  buildHostWebsiteContext,
+  embedContext,
   contextForSlide,
   fullContextText,
-} from "@/lib/decks/build-host-website-context";
+} from "@/lib/decks/content";
 import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
 import { bumpPulse } from "@/lib/pulse";
 import { AI_ACCESS_COOKIE, verifyAiAccessToken, verifyAiClassPassword } from "@/lib/ai-access";
@@ -161,7 +161,7 @@ export async function POST(req: Request) {
   let fullText: string;
   if (deck.kind === "uploaded") {
     // Uploaded decks ground ONLY on their OWN deck_slides rows — there is NO
-    // fallback to buildHostWebsiteContext/fullContextText(). That static context
+    // fallback to embedContext/fullContextText(). That static context
     // is the one workshop deck's material and would silently contaminate an
     // uploaded deck's answers. Empty grounding text is the correct state for a
     // freshly-uploaded deck with no AI context authored yet: the model just
@@ -171,7 +171,7 @@ export async function POST(req: Request) {
     currentText = (await getSlideContextText(slug, idx)) ?? "";
     fullText = (await getFullContextText(slug)) ?? "";
   } else if (deck.embedUrl) {
-    total = deck.slideCount ?? buildHostWebsiteContext.length;
+    total = deck.slideCount ?? embedContext.length;
     const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
     const cur = contextForSlide(idx);
     // DB-first grounding: prefer the presenter-edited context in Postgres, fall

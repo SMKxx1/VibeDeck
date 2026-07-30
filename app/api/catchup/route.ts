@@ -7,7 +7,7 @@ import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { AUTH_COOKIE, verifySessionToken } from "@/lib/auth";
 import { clamp } from "@/lib/api-helpers";
 import { isDeckViewable } from "@/lib/publish-store";
-import { buildHostWebsiteContext, contextForSlide } from "@/lib/decks/build-host-website-context";
+import { embedContext, contextForSlide } from "@/lib/decks/content";
 import { getSlideContextText } from "@/lib/slides-store";
 import { bumpPulse } from "@/lib/pulse";
 import { assertSameOrigin } from "@/lib/csrf";
@@ -107,7 +107,7 @@ export async function POST(req: Request) {
     deck.kind === "uploaded"
       ? deck.slideCount ?? 0
       : deck.embedUrl
-        ? deck.slideCount ?? buildHostWebsiteContext.length
+        ? deck.slideCount ?? embedContext.length
         : deck.slides.length;
   if (total <= 0) return NextResponse.json({ error: "no_content" }, { status: 422 });
 

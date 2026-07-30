@@ -6,7 +6,7 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { getDeck } from "@/lib/decks";
 import { slideToText } from "@/lib/deckUtils";
-import { contextForSlide } from "@/lib/decks/build-host-website-context";
+import { contextForSlide } from "@/lib/decks/content";
 import { getSlideContextText } from "@/lib/slides-store";
 import { getPulse, clearPulse, type PulseSlide } from "@/lib/pulse";
 import { saveReport, listReports } from "@/lib/session-reports";

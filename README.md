@@ -175,7 +175,9 @@ The app is designed to boot with **nothing configured** and light up feature-by-
 npm run check
 ```
 
-Two files are read from disk at request time — [VIBEDECK_PROMPT.md](VIBEDECK_PROMPT.md) (served at `/build`) and `runtime/vibedeck-v1.js` (injected into uploaded decks). The runtime file is **generated**: edit `public/decks/build-host-website/{deck-stage,bridge}.js` and run `npm run build:runtime` (the build does this automatically, and a test fails if the committed file drifts).
+Two files are read from disk at request time — [VIBEDECK_PROMPT.md](VIBEDECK_PROMPT.md) (served at `/build`) and `runtime/vibedeck-v1.js` (injected into uploaded decks). The runtime file is **generated**: edit `public/deck-engine/{deck-stage,bridge}.js` and run `npm run build:runtime` (the build does this automatically, and a test fails if the committed file drifts).
+
+This public repo ships with **no bundled decks** — [lib/decks/content.ts](lib/decks/content.ts) is an empty content seam, and presenters upload their own decks. (A private content build fills that seam with a bundled workshop deck; everything else is identical.)
 
 ## Environment variables
 
@@ -221,7 +223,7 @@ lib/                  Domain modules: db/schema/migrations, redis + live stores
                       deck-assets + image-normalize, kv (budget + limits +
                       caches), markdown-deck
 runtime/              vibedeck-v1.js — GENERATED (npm run build:runtime)
-public/decks/         The built-in workshop deck + its deck-stage/bridge sources
+public/deck-engine/   deck-stage.js + bridge.js — the embed/runtime engine sources
 docs/diagrams/        Architecture diagrams (exported from Figma — see its README)
 Guideline/            Canonical rule docs (see Docs index)
 middleware.ts         Host allowlist (two origins) + body-size ceiling

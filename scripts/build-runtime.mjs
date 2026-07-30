@@ -2,11 +2,11 @@
 // lib/deck-runtime.ts inline-injects into every served uploaded deck.
 //
 // The runtime is not authored: it is the SAME <deck-stage> engine and live
-// bridge the first-party build-host-website deck loads as separate <script>
-// tags, concatenated so uploaded decks get one inlineable body. Keeping it a
-// generated artifact means the two paths can never drift — fix the engine once
-// in public/decks/build-host-website/ and both the static deck and every
-// uploaded deck pick it up.
+// bridge a first-party embed deck loads as separate <script> tags (served from
+// /deck-engine/), concatenated so uploaded decks get one inlineable body.
+// Keeping it a generated artifact means the two paths can never drift — fix the
+// engine once in public/deck-engine/ and both the embed path and every uploaded
+// deck pick it up.
 //
 // The output file stays COMMITTED (tests/runtime-generated.test.ts asserts it
 // matches this script's output) because deck-runtime.ts reads it off disk at
@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 
 const MODULE_PATH = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(MODULE_PATH), "..");
-const SOURCE_DIR = path.join(REPO_ROOT, "public", "decks", "build-host-website");
+const SOURCE_DIR = path.join(REPO_ROOT, "public", "deck-engine");
 
 // Order matters: deck-stage defines the <deck-stage> custom element the bridge
 // then attaches its host-messaging listeners to.

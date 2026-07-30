@@ -4,7 +4,7 @@
 // GRACEFUL DEGRADATION (mirrors lib/redis.ts in spirit): every read returns a
 // safe fallback ([] / {} / null) and NEVER throws when `DATABASE_URL` is unset
 // or the DB is unreachable, so callers transparently fall back to the static
-// slide context (lib/decks/build-host-website-context.ts) and the embed deck's
+// slide context (lib/decks/content.ts) and the embed deck's
 // own bridge notes. The build succeeds with no DB.
 //
 // Seeding is insert-only (ON CONFLICT DO NOTHING) so a redeploy never clobbers a

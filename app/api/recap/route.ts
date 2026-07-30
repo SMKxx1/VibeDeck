@@ -9,10 +9,10 @@ import { checkRateLimit, checkTokenBudget, getExplainCache, setExplainCache } fr
 import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
 import { EXPLAIN_PROMPTS, type ExplainMode, isExplainMode } from "@/lib/explain-prompts";
 import {
-  buildHostWebsiteContext,
+  embedContext,
   contextForSlide,
   fullContextText,
-} from "@/lib/decks/build-host-website-context";
+} from "@/lib/decks/content";
 import { getFullContextText, getSlideContextText } from "@/lib/slides-store";
 import { setRecap, clearRecap } from "@/lib/recap";
 import { bumpPulse } from "@/lib/pulse";
@@ -104,7 +104,7 @@ export async function POST(req: Request) {
     currentText = (await getSlideContextText(slug, idx)) ?? "";
     fullText = (await getFullContextText(slug)) ?? "";
   } else if (deck.embedUrl) {
-    total = deck.slideCount ?? buildHostWebsiteContext.length;
+    total = deck.slideCount ?? embedContext.length;
     const idx = clamp(slideIndex, 0, Math.max(0, total - 1));
     const cur = contextForSlide(idx);
     const slideText = (await getSlideContextText(slug, idx)) ?? (cur?.text ?? "");

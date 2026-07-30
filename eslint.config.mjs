@@ -9,6 +9,7 @@ export default defineConfig([
     ".next/**",
     "node_modules/**",
     "public/decks/**",
+    "public/deck-engine/**",
     "runtime/**",
     "next-env.d.ts",
   ]),

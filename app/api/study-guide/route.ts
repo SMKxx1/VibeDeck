@@ -6,7 +6,7 @@ import { assertSameOrigin } from "@/lib/csrf";
 import { checkDeckManage } from "@/lib/deck-authz";
 import { checkRateLimit, checkTokenBudget } from "@/lib/kv";
 import { callModel, DEFAULT_MODEL } from "@/lib/openrouter";
-import { fullContextText } from "@/lib/decks/build-host-website-context";
+import { fullContextText } from "@/lib/decks/content";
 import { getFullContextText, getSlideNotes } from "@/lib/slides-store";
 import { getActivePoll } from "@/lib/poll";
 import { getQuestions } from "@/lib/qna";

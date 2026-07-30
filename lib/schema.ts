@@ -17,13 +17,14 @@ import type { Pool } from "pg";
 import { getPool } from "./db";
 import { runMigrations } from "./migrations";
 import { hashPassword } from "./password";
-import { buildHostWebsiteSeed, type DeckSeed } from "./decks/build-host-website-seed";
+import { contentSeeds } from "./decks/content";
+import type { DeckSeed } from "./decks/content-types";
 import { staticDecks } from "./decks/static";
 
 // Every deck we know how to seed with rich per-slide authored content. Today that's
 // just the embed workshop deck. Exported so slides-store can look up a slide's seed
 // label without redefining the list (it stays the single source of seed truth).
-export const SEEDS: DeckSeed[] = [buildHostWebsiteSeed];
+export const SEEDS: DeckSeed[] = contentSeeds;
 
 let schemaPromise: Promise<void> | null = null;
 
