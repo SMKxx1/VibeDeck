@@ -38,7 +38,9 @@ let poolPromise: Promise<Pool | null> | null = null;
 // Railway's private network host speaks plaintext inside the project. Every
 // public connection must authenticate the server certificate; DATABASE_CA_CERT
 // supports providers using a private CA (literal PEM or base64-encoded PEM).
-function sslFor(url: string): false | { rejectUnauthorized: true; ca?: string } {
+function sslFor(
+  url: string,
+): false | { rejectUnauthorized: true; ca?: string; checkServerIdentity?: () => undefined } {
   try {
     const host = new URL(url).hostname;
     if (host.endsWith(".railway.internal")) return false;
@@ -50,7 +52,12 @@ function sslFor(url: string): false | { rejectUnauthorized: true; ca?: string } 
   const ca = configuredCa.includes("BEGIN CERTIFICATE")
     ? configuredCa.replace(/\\n/g, "\n")
     : Buffer.from(configuredCa, "base64").toString("utf8");
-  return { rejectUnauthorized: true, ca };
+  // verify-ca, not verify-full: with a pinned private CA, the chain of trust IS
+  // the identity assertion. Railway's TCP proxy forwards raw bytes and the DB
+  // container's leaf certificate names "localhost", so hostname verification
+  // can never pass through the proxy — without this override, DATABASE_CA_CERT
+  // could never work at all (verified empirically: Node rejects on altnames).
+  return { rejectUnauthorized: true, ca, checkServerIdentity: () => undefined };
 }
 
 function poolSize(): number {
