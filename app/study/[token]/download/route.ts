@@ -24,10 +24,18 @@ function escapeHtml(s: string): string {
 // ASCII-safe attachment filename derived from the title (header values must not
 // carry arbitrary bytes). Falls back to a generic name.
 function filenameFor(guide: StudyGuide): string {
+  // Trimmed the same way as slugifyTitle in lib/deck-create.ts, for the same
+  // reason: collapsing non-alphanumeric runs to ONE hyphen makes two adjacent
+  // hyphens impossible, so a single `-` is an exact trim while the `-+` it
+  // replaces backtracks quadratically (CodeQL js/polynomial-redos). Keep the two
+  // copies in step — a fix applied to only one is the drift that reopens this.
+  // (Unlike slugifyTitle this deliberately keeps NO trim after the slice, so a
+  // 60-char cut landing on the separator still yields the filename it always has.)
   const base = (guide.title || "study-guide")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    .replace(/^-/, "")
+    .replace(/-$/, "")
     .slice(0, 60);
   return `${base || "study-guide"}.html`;
 }
