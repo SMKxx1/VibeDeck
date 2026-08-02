@@ -38,12 +38,16 @@ export function collidesStatic(slug: string): boolean {
  * yields "" — callers supply their own `|| "deck"` fallback.
  */
 export function slugifyTitle(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60)
-    .replace(/-+$/g, "");
+  // Collapsing every maximal non-alphanumeric run to ONE hyphen means two hyphens
+  // can never end up adjacent — a doubled hyphen would require two adjacent runs,
+  // which by maximality is one run. So each trim below only ever has a single "-"
+  // to remove, and `-` is exact where `-+` used to be. Same output for every input;
+  // the difference is that `/^-+|-+$/` backtracks quadratically on a long run of
+  // hyphens (CodeQL js/polynomial-redos) while an unquantified `-` cannot backtrack
+  // at all. The trailing trim runs again after the slice because the 60-char cut
+  // can land right after a hyphen.
+  const collapsed = title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  return collapsed.replace(/^-/, "").replace(/-$/, "").slice(0, 60).replace(/-$/, "");
 }
 
 /**

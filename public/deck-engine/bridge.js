@@ -92,14 +92,31 @@
     });
   }
 
+  // A pin URL is the only attacker-authored string this bridge puts anywhere near
+  // an href, and `javascript:` in an href is script execution on click — so parse
+  // it and allow ONLY absolute http(s). The server enforces the same rule twice
+  // (normalizeUrl on write and again on read in cleanStoredPin); re-checking at
+  // the sink means the guarantee holds even if a pin ever reaches renderPins by
+  // some other route. Returns the parsed URL so the caller reuses the same
+  // canonical value it validated, never the raw input.
+  function httpUrl(raw) {
+    try {
+      var u = new URL(raw);
+      if (u.protocol === "http:" || u.protocol === "https:") return u;
+    } catch (e) {}
+    return null;
+  }
+
   function renderPins(pins) {
     var board = document.querySelector("[data-pinboard]");
     if (!board) return;
     board.innerHTML = "";
     (pins || []).forEach(function (p, i) {
       if (!p || !p.url) return;
+      var u = httpUrl(p.url);
+      if (!u) return; // not an absolute http(s) link — never rendered at all
       var a = document.createElement("a");
-      a.href = p.url;
+      a.href = u.href;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       a.style.cssText =
@@ -113,11 +130,7 @@
       nm.textContent = p.name || "Someone";
       nm.style.cssText = "font-size:16px;font-weight:600;color:#2A2730;margin-bottom:6px;";
       var host = document.createElement("div");
-      try {
-        host.textContent = new URL(p.url).hostname.replace(/^www\./, "");
-      } catch (e) {
-        host.textContent = p.url;
-      }
+      host.textContent = u.hostname.replace(/^www\./, "");
       host.style.cssText = "font-size:14px;font-weight:400;color:#2A6FDB;word-break:break-all;";
       a.appendChild(pin);
       a.appendChild(nm);
@@ -170,6 +183,19 @@
   window.addEventListener("message", function (e) {
     var d = e.data;
     if (!d || d.source === "deck") return;
+    // IDENTITY, not origin — the mirror of the guard the app already applies in
+    // the other direction (LiveDeck/UploadedDeckFrame/PresenterConsole all accept
+    // only `e.source === iframe.contentWindow`). Origin is unusable as the general
+    // check here: an uploaded deck is served from the separate DECK origin and
+    // framed under `sandbox="allow-scripts"` with no allow-same-origin, so its
+    // document is opaque (self.origin is "null") while its location.origin is the
+    // deck host — never the embedder's. Either way an origin comparison there
+    // rejects every legitimate message. Object identity holds in both contexts.
+    // Every sender in the app posts through `<iframe>.contentWindow`, so a real
+    // message is always from `parent`; and for a deck opened as a top-level window
+    // `parent === window`, so a hostile opener — which frame-ancestors does NOT
+    // stop, and no COOP covers this static path — is rejected too.
+    if (e.source !== parent) return;
     if (d.type === "deck:role") {
       if (typeof d.role === "string") role = d.role;
       if (typeof d.max === "number") maxAllowed = d.max;
@@ -197,6 +223,16 @@
         report();
       }
     } else if (d.type === "deck:pins") {
+      // Same-origin ON TOP of the identity check, for this branch only: pins are
+      // the one message carrying viewer-authored data into a DOM sink.
+      // This RELIES on an invariant: only LiveDeck sends pins, and LiveDeck frames
+      // the first-party deck from a RELATIVE embedUrl, so parent and deck share the
+      // app's origin. Uploaded decks (cross-origin, opaque) go through
+      // UploadedDeckFrame, which posts navigation messages only and never pins — so
+      // failing this check costs that path nothing. Give a registry deck an absolute
+      // cross-origin embedUrl and the wall would silently stop rendering, which is
+      // why tests/deck-create.test.ts asserts the embedUrl stays relative.
+      if (e.origin !== location.origin) return;
       wireShowcase(); // ensure the input is ours before pins start flowing
       renderPins(d.pins);
     }
